@@ -1,0 +1,261 @@
+{
+  "id": "delivery",
+  "name": "需求交付流水线（七阶段+）",
+  "description": "从需求目标到上线交付：项目初始化→调研→需求澄清→方案→实现→测试→交付→上线准备",
+  "session_preset": "clarify-design",
+  "git_delivery": {
+    "enabled": true,
+    "branch": "gdd/delivery"
+  },
+  "nodes": [
+    {
+      "id": "project_init",
+      "clarify": true,
+      "name": "项目初始化",
+      "description": "把原始一句话需求整理为结构化需求文档",
+      "subject": {
+        "goal": "读取原始需求（.gdd/input.md），整理为 docs/requirement.md：包含「## 需求背景」「## 需求描述」「## 待澄清问题」（如无歧义则写「无」）。只做整理与澄清提问，不做方案设计。",
+        "instructions": "若需求存在明显歧义或缺失关键信息，逐条列入「待澄清问题」，不要自行假设。"
+      },
+      "entry": {
+        "goal": "工作区与原始需求输入就绪。",
+        "commands": [
+          "test -d .gdd"
+        ]
+      },
+      "exit": {
+        "goal": "需求文档产出且结构完整。",
+        "artifacts": [
+          {
+            "path": "docs/requirement.md",
+            "must_contain": "## 需求描述"
+          }
+        ],
+        "ai_check": "检查待澄清问题是否已被妥善处理：若列有问题，问题应清晰可回答且不包含自行假设的答案。"
+      }
+    },
+    {
+      "id": "survey",
+      "clarify": true,
+      "name": "调研现状",
+      "description": "调研现状代码/数据/调用链，输出现状分析",
+      "subject": {
+        "goal": "基于 docs/requirement.md 调研本仓库（及周边可及信息）现状，输出 docs/survey.md：包含「## 现状分析」「## 影响面」「## 风险与未知项」。结论必须有代码/文件证据（给出文件与行号），未知项明确列出，禁止凭经验推断。"
+      },
+      "entry": {
+        "goal": "需求文档已就绪。",
+        "artifacts": [
+          {
+            "path": "docs/requirement.md",
+            "must_contain": "## 需求描述"
+          }
+        ]
+      },
+      "exit": {
+        "goal": "现状分析产出且含影响面与风险。",
+        "artifacts": [
+          {
+            "path": "docs/survey.md",
+            "must_contain": "## 影响面"
+          },
+          {
+            "path": "docs/survey.md",
+            "must_contain": "## 风险与未知项"
+          }
+        ],
+        "ai_check": "抽查 survey.md 中的关键结论是否有文件路径/代码位置佐证；无佐证的结论应标注为推断。"
+      }
+    },
+    {
+      "id": "clarify",
+      "clarify": true,
+      "name": "需求澄清",
+      "description": "产出可验证的 DoD（目标与验收标准）",
+      "subject": {
+        "goal": "基于 requirement + survey 产出 docs/goal.md：包含「## 目标」「## 验收标准（DoD）」，每条 DoD 标注验证层级（e2e/integration/unit/static）与可验证判据。验收数据必须可重新制造，不得把某条具体测试数据写死进 DoD。",
+        "instructions": "DoD 反模式自查：e2e 过多/全 P0/无法独立完成/一条验收捆多功能——发现则在文档中列出拆分或降级建议。"
+      },
+      "entry": {
+        "goal": "调研报告已就绪。",
+        "artifacts": [
+          {
+            "path": "docs/survey.md",
+            "must_contain": "## 影响面"
+          }
+        ]
+      },
+      "exit": {
+        "goal": "DoD 产出且每条验收可验证。",
+        "artifacts": [
+          {
+            "path": "docs/goal.md",
+            "must_contain": "## 验收标准"
+          }
+        ],
+        "ai_check": "逐条检查 DoD：是否有验证层级标注、是否可独立验证、是否可重新制造数据。不合格条目按 fail 处理并在 feedback 中指明。"
+      },
+      "approval": {
+        "required": true,
+        "prompt": "请确认 DoD（验收标准）是否正确、完整、无歧义——这是后续所有验证的唯一依据。"
+      }
+    },
+    {
+      "id": "plan",
+      "clarify": true,
+      "name": "方案设计",
+      "description": "产出实现计划与关键技术决定（ADR）",
+      "subject": {
+        "goal": "基于 docs/goal.md 产出 docs/plan.md：包含「## 实现步骤」（分步、每步可验证）与「## ADR」（关键决定的选项、取舍与原因）。方案须与 survey 的现状证据一致，克制过度设计。"
+      },
+      "entry": {
+        "goal": "DoD 已确认就绪。",
+        "artifacts": [
+          {
+            "path": "docs/goal.md",
+            "must_contain": "## 验收标准"
+          }
+        ]
+      },
+      "exit": {
+        "goal": "实现计划与 ADR 产出。",
+        "artifacts": [
+          {
+            "path": "docs/plan.md",
+            "must_contain": "## 实现步骤"
+          },
+          {
+            "path": "docs/plan.md",
+            "must_contain": "## ADR"
+          }
+        ],
+        "ai_check": "检查实现步骤是否覆盖全部 DoD、每步是否有对应验证方式；ADR 是否说明了取舍原因。"
+      },
+      "approval": {
+        "required": true,
+        "prompt": "请确认技术方案与实现步骤——批准后将按此实施。"
+      }
+    },
+    {
+      "id": "implement",
+      "clarify": true,
+      "session_group": "impl_standalone",
+      "name": "开发实现",
+      "description": "按计划实现代码，逐项核销台账",
+      "baseline_marker": true,
+      "subject": {
+        "goal": "按 docs/plan.md 实现，并维护 docs/impl-ledger.md「## 核销台账」：每项包含「ID｜处理结果｜代码位置（文件+行号）｜证据（命令/输出）｜待办」。「已修改」不等于「已验证」，未验证项如实标注。",
+        "instructions": "只实现已批准范围内的内容；发现计划外必需改动时记入台账待办并说明，不要静默扩大范围。"
+      },
+      "entry": {
+        "goal": "实现计划已就绪。",
+        "artifacts": [
+          {
+            "path": "docs/plan.md",
+            "must_contain": "## 实现步骤"
+          }
+        ]
+      },
+      "exit": {
+        "goal": "实现完成且台账逐项核销。",
+        "artifacts": [
+          {
+            "path": "docs/impl-ledger.md",
+            "must_contain": "## 核销台账"
+          }
+        ],
+        "ai_check": "抽查台账中至少 3 项：代码位置是否真实存在（用 Read/Grep 核实）、证据是否可信；「待办」中不得混入本应完成的必做项。"
+      }
+    },
+    {
+      "id": "test",
+      "name": "测试验证",
+      "description": "按 DoD 执行分层验证（单测+集成/e2e），AI 门禁基于改动补充验证",
+      "subject": {
+        "goal": "按 docs/goal.md 的 DoD 逐条执行验证，输出 docs/test-report.md「## 验证结果」：每条 DoD 的验证层级（e2e/integration/unit/static）、执行方式、实际结果与证据。除单测外至少完成一条集成级以上验证：优先在本机直接启动服务/进程完成端到端验证（如启动服务后真实调用接口、启动脚本跑完整链路）；仅当本机确实无法启动（需外部中间件/对方服务/专用环境）时才降级为单测+静态验证，且必须在报告中逐条标注「未验证」及具体阻碍原因，不得以单测通过代替。",
+        "instructions": "集成验证优先级：本机可启动的端到端 > 部署到测试环境机器验证 > 本机可模拟的组件级集成 > 单测。不要把「需要部署到测试环境机器」当作默认借口——先判断本机能否启动（读启动脚本/README/Makefile 确认）；能启动就在本机跑真实链路。报告中每条未验证项必须写清：差什么环境、谁提供、建议的验证方式。"
+      },
+      "entry": {
+        "goal": "实现台账已产出。",
+        "artifacts": [
+          {
+            "path": "docs/impl-ledger.md",
+            "must_contain": "## 核销台账"
+          }
+        ]
+      },
+      "exit": {
+        "goal": "验证报告产出，DoD 逐条有结果与证据；集成级以上验证至少一条或逐条说明阻碍。",
+        "artifacts": [
+          {
+            "path": "docs/test-report.md",
+            "must_contain": "## 验证结果"
+          }
+        ],
+        "ai_check": "逐条比对 DoD 与 test-report：1) 未验证项是否如实标注且写明具体阻碍（环境/依赖/谁提供）；2) 宣称通过的项是否有可复核证据（命令、输出摘要）；3) 集成级以上验证至少一条真实执行（本机或测试环境机器启动服务/进程跑通链路），或每条 e2e/integration 级 DoD 均有明确阻碍说明——只跑单测不得放行；4) 不得把「需部署到测试环境机器」当作未验证理由而不先验证本机可启动性。",
+        "change_aware": true
+      },
+      "approval": {
+        "required": true,
+        "prompt": "请确认测试验证结论——批准后进入交付收尾与上线准备。"
+      }
+    },
+    {
+      "id": "delivery",
+      "name": "收尾交付",
+      "description": "DoD 总体达成比对与验收证据汇总",
+      "subject": {
+        "goal": "汇总验收证据，输出 docs/delivery.md「## 验收证据」：DoD 逐条终态（通过/未通过/降级+原因）、关键证据引用（指向 test-report 或复验命令）。整体未达成时如实说明缺口。"
+      },
+      "entry": {
+        "goal": "测试验证报告已产出。",
+        "artifacts": [
+          {
+            "path": "docs/test-report.md",
+            "must_contain": "## 验证结果"
+          }
+        ]
+      },
+      "exit": {
+        "goal": "交付证据汇总产出。",
+        "artifacts": [
+          {
+            "path": "docs/delivery.md",
+            "must_contain": "## 验收证据"
+          }
+        ],
+        "ai_check": "核对 delivery.md 与 goal.md：每条 DoD 都有终态且与 test-report 一致；不得把未通过记为通过。"
+      }
+    },
+    {
+      "id": "release_checklist",
+      "name": "上线准备",
+      "description": "产出四段式上线检查单",
+      "subject": {
+        "goal": "输出 RELEASE-CHECKLIST.md，包含四段：「## 发布前确认」「## 本次变更」「## 上线步骤」（含回滚步骤）「## 异常处理」。依赖项排序，未确认项标注待确认与影响，不猜填。"
+      },
+      "entry": {
+        "goal": "交付证据已汇总。",
+        "artifacts": [
+          {
+            "path": "docs/delivery.md",
+            "must_contain": "## 验收证据"
+          }
+        ]
+      },
+      "exit": {
+        "goal": "四段式检查单产出。",
+        "artifacts": [
+          {
+            "path": "RELEASE-CHECKLIST.md",
+            "must_contain": "## 上线步骤"
+          },
+          {
+            "path": "RELEASE-CHECKLIST.md",
+            "must_contain": "## 异常处理"
+          }
+        ],
+        "ai_check": "检查四段齐全、含回滚步骤、待确认项均有影响说明；上线步骤顺序合理。"
+      }
+    }
+  ]
+}

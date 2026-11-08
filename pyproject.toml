@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gdd-harness"
+version = "0.1.0"
+description = "GDD — Goal Driven Development harness（节点编排 + entry/exit 双门禁 + 人工准入）"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+[project.scripts]
+gdd = "gdd.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["gdd*"]
+
+[tool.setuptools.package-data]
+gdd = ["templates/*.json"]
