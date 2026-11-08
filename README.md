@@ -28,6 +28,7 @@ gdd status       # 查看节点进度
 gdd approve --yes                        # 批准进入下一阶段
 gdd approve --reject --feedback "..."    # 打回当前节点主体
 gdd retry        # blocked 后人工重试：指回责任节点并清零计数，重跑其主体（门禁故障型仅重跑门禁）
+gdd steer "…"    # working 期间另开终端补充信息（不占锁，下一次工具返回后送达）
 gdd abort / gdd reset --yes
 ```
 
@@ -120,6 +121,8 @@ PYTHONPATH=/path/to/GDD python3 -m gdd.ui --root .   # 打开 http://127.0.0.1:8
 | `GDD_CHECK_TIMEOUT` | 600 | 机器检查命令超时秒数 |
 | `GDD_SUBJECT_RESUME` | on | 打回重跑是否复用主体会话（`--resume`）；`off` 强制全新会话 |
 | `GDD_SUBJECT_AUTO_CONTINUES_MAX` | 4 | 主体会话 turns 打满（error_max_turns）后自动 `--resume` 续跑的轮数上限（每轮继续配满 max_turns；超限转 gate_error → blocked 人工裁决） |
+| `GDD_STEER` | on | working 期间补充信息。`off` 不挂 PostToolUse、会话结束也不补送 |
+| `GDD_STEER_HOME` | `~/.gdd/steer` | 补充队列与 hook 配置目录（在项目仓库外） |
 
 > 存量实例兼容：升级后 NodeSpec 新增字段（如 `clarify`）会改变流水线指纹，`run` 时自动识别 legacy 实例（剔除新增键后指纹匹配）并重写实例刷新指纹；其他任何指纹不一致仍 fail-closed blocked。
 
@@ -146,6 +149,7 @@ python3 tests/test_e2e.py
 
 python3 tests/test_ui.py     # 图形控制台（含 CSRF/穿越/并发写防护回归）
 python3 tests/test_clarify.py # 主体会话 resume / 要点澄清通道 / legacy 指纹迁移
+python3 tests/test_steer.py   # working 补充：hook 消费 / 不占锁 / 结束补送一次
 ```
 
 stub agent（`tests/stub_agent.py` + `GDD_STUB_SCRIPT`）可无模型跑全链路。
@@ -156,6 +160,7 @@ stub agent（`tests/stub_agent.py` + `GDD_STUB_SCRIPT`）可无模型跑全链�
 gdd/
   models.py        # Pipeline/Node/Gate/Approval/Subject 数据模型（零依赖 JSON）
   runner.py        # 本地 Agent 适配器（claude -p headless，会话级隔离）
+  steer.py         # working 补充队列与 PostToolUse hook（仓库外，不占 .gdd/lock）
   gates.py         # entry/exit 门禁：机器检查 + 独立 AI 验证 + verdict 解析（fail-closed）
   approval.py      # request_approval：交互确认 / 非交互挂起
   orchestrator.py  # 编排引擎：相位状态机、打回、审批、澄清、blocked/retry、状态持久化

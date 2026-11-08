@@ -1375,14 +1375,9 @@ class Orchestrator:
                 prompt = (f"[[GDD-ROLE:subject node:{node.id}]]\n"
                           f"上轮会话中断，请继续完成本节点工作（产物与报告路径不变）。")
             stream_cb = _subject_stream_cb()
-            skw = {"on_stream": stream_cb} if stream_cb is not None else {}
-            session = runner.run(
-                prompt, allowed_tools=gates.SUBJECT_TOOLS,
-                max_turns=node.subject.max_turns,
-                log_path=self._log_path(node, "subject_resume"),
-                resume_sid=resume_sid,
-                **skw,
-            )
+            session = self._subject_run(
+                runner, prompt, node, "subject_resume",
+                resume_sid=resume_sid, stream_cb=stream_cb)
             if not session.ok and not session.turns_exhausted:
                 # resume 失效（会话过期等，非打满）：清存档回退全新会话重试一次，不计故障。
                 # turns 打满时会话仍存活：不 pop——保留 sid，由下方自动续跑块接管
@@ -1394,13 +1389,14 @@ class Orchestrator:
         if not resume_sid:
             prompt = gates.build_subject_prompt(node, self.pipeline, upstream, feedback, raw_req)
             stream_cb = _subject_stream_cb()  # 与 resume 轮隔离：截断额度重新起算
-            skw = {"on_stream": stream_cb} if stream_cb is not None else {}
-            session = runner.run(
-                prompt, allowed_tools=gates.SUBJECT_TOOLS,
-                max_turns=node.subject.max_turns,
-                log_path=self._log_path(node, "subject"),
-                **skw,
-            )
+            session = self._subject_run(
+                runner, prompt, node, "subject", stream_cb=stream_cb)
+        # 补送发生在退出之前。先把已成功的 sid 落盘：补送被中断时，
+        # 下一轮 run 能续上这一次，而不是丢掉刚完成的主体会话。
+        if session.session_id and session.ok:
+            sessions["subject"] = session.session_id
+            self._save()
+        session = self._steer_fallback(node, runner, session, _subject_stream_cb)
         if session.session_id and session.ok:
             # 仅成功会话才存档 sid（同 chat 路径防线）：失败会话的 sid 可能已死，
             # 存档会让组查找/下轮 resume 命中死会话，浪费一次注定失败的 resume
@@ -1495,6 +1491,70 @@ class Orchestrator:
         # 而非上一轮通过（甚至上一节点）的陈旧证据
         self.state["last_exit_evidence"] = verdict.evidence
         return self._bounce_current(node, verdict)
+
+    def _subject_run(self, runner: AgentRunner, prompt: str, node: NodeSpec, kind: str,
+                     resume_sid: str = "", stream_cb=None):
+        """主体会话。用属性而不是新关键字打开 steer，避免测试替身的 run 签名被撑破。
+
+        同一 runner 随后还要跑 exit 门禁，属性必须在返回前清掉。
+        """
+        from . import steer as steer_mod
+        prev = getattr(runner, "steer_subject", False)
+        runner.steer_subject = True
+        steer_mod.mark_subject(self.root, True)
+        try:
+            kw = {}
+            if resume_sid:
+                kw["resume_sid"] = resume_sid
+            if stream_cb is not None:
+                kw["on_stream"] = stream_cb
+            return runner.run(
+                prompt, allowed_tools=gates.SUBJECT_TOOLS,
+                max_turns=node.subject.max_turns,
+                log_path=self._log_path(node, kind),
+                **kw,
+            )
+        finally:
+            runner.steer_subject = prev
+            steer_mod.mark_subject(self.root, False)
+
+    def _steer_fallback(self, node: NodeSpec, runner: AgentRunner, session,
+                        stream_factory) -> "SessionResult":
+        """本轮主体已成功、但补充还在队列里：说明没有后续工具调用吃掉它。
+
+        只补送一次。补送会话失败则把原文放回队列，不推翻已经成功的主体结果。
+        门禁会话不走这里。
+        """
+        from . import steer as steer_mod
+        if not steer_mod.enabled():
+            return session
+        if not session.ok or not session.session_id:
+            return session
+        if os.environ.get("GDD_SUBJECT_RESUME", "on") == "off":
+            return session
+        body = steer_mod.drain(self.root)
+        if not body:
+            return session
+        prompt = (f"[[GDD-ROLE:subject node:{node.id}]]\n"
+                  + steer_mod.format_context(body))
+        try:
+            self._record("steer_fallback", node=node.id, chars=len(body))
+            try:
+                stream_cb = stream_factory()
+            except Exception:
+                stream_cb = None
+            follow = self._subject_run(
+                runner, prompt, node, "subject_steer",
+                resume_sid=session.session_id, stream_cb=stream_cb)
+        except BaseException:
+            steer_mod.restore(self.root, body)
+            raise
+        if not follow.ok:
+            steer_mod.restore(self.root, body)
+            self._record("steer_fallback_fail", node=node.id,
+                         error=(follow.error or "")[:200])
+            return session
+        return follow
 
     def _phase_exit_retry(self, node: NodeSpec, ns: Dict, runner: AgentRunner) -> bool:
         """门禁自身故障后的重试：直接重跑 exit 门禁（主体产物保持不变）。"""

@@ -185,7 +185,8 @@ class AgentRunner:
             self.timeout = 7200
 
     def _build_cmd(self, allowed_tools: List[str], max_turns: int,
-                   resume_sid: str = "", *, stream: bool = False) -> List[str]:
+                   resume_sid: str = "", *, stream: bool = False,
+                   steer: bool = False) -> List[str]:
         cmd = [self.bin]
         pre = os.environ.get("GDD_AGENT_PRE_ARGS", "")
         if pre:
@@ -205,6 +206,17 @@ class AgentRunner:
         extra = os.environ.get("GDD_AGENT_EXTRA_ARGS", "")
         if extra:
             cmd += shlex.split(extra)
+        # 主体会话才挂。Claude 用 --settings 追加 hook，不替换用户自己的配置层；
+        # Codex 的进程参数不是这套 -p 命令行，只把 hooks.json 写到仓库外供同一脚本使用。
+        if steer or getattr(self, "steer_subject", False):
+            from . import steer as steer_mod
+            if steer_mod.enabled():
+                try:
+                    steer_mod.prepare(self.root)
+                except OSError:
+                    return cmd
+                if steer_mod.agent_family(self.bin) == "claude":
+                    cmd += ["--settings", steer_mod.claude_settings_path(self.root)]
         return cmd
 
     def run(
@@ -216,11 +228,12 @@ class AgentRunner:
         log_path: Optional[str] = None,
         resume_sid: str = "",
         on_stream: Optional[Callable[[Dict[str, Any]], None]] = None,
+        steer: bool = False,
     ) -> SessionResult:
         stream = on_stream is not None
         try:
             cmd = self._build_cmd(allowed_tools, max_turns, resume_sid=resume_sid,
-                                  stream=stream)
+                                  stream=stream, steer=steer)
         except ValueError as e:
             # GDD_AGENT_PRE_ARGS/EXTRA_ARGS 引号不合法等：会话失败而非引擎崩溃
             res = SessionResult(ok=False, error=f"Agent 参数解析失败: {e}（检查 GDD_AGENT_PRE_ARGS/EXTRA_ARGS）")

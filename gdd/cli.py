@@ -192,6 +192,16 @@ def _print_status(o: Orchestrator) -> None:
         reason = st.get("git_delivery_disabled_reason") or "未知原因"
         print(f"⚠ git 交付已停用：{reason}。")
         print("  如需启用：修复上述原因后 gdd reset 重开。")
+    from gdd import steer as steer_mod
+    try:
+        queued = steer_mod.pending(o.root) if steer_mod.enabled() else ""
+    except OSError:
+        queued = ""
+    if queued:
+        print("-" * 56)
+        n = steer_mod.queued_count(o.root)
+        print(f"✉ 有未送达的补充（{n} 条）。"
+              "主体下一次工具返回时送入；本轮不再调用工具则会话结束时补送一次。")
     if _verbose():
         print("-" * 56)
         # GDD_VERBOSE 兑现“完整 history”承诺：全量打印（含超过 500 条封顶被截的老事件）
@@ -375,6 +385,40 @@ def _print_chat_reply(r: dict) -> None:
         print(f"AI> {r.get('reply', '')}")
 
 
+def cmd_steer(args) -> int:
+    """working 期间补充信息。不拿 .gdd/lock，可在另一个终端执行。"""
+    from gdd import steer as steer_mod
+    text = " ".join(args.message or []).strip()
+    if not text and not sys.stdin.isatty():
+        text = sys.stdin.read().strip()
+    if not steer_mod.enabled():
+        print("GDD_STEER=off，未入队。")
+        return 1
+    if not text:
+        print('用法: gdd steer "补充内容"（另开终端，不必停止正在跑的 gdd run / gdd go）')
+        return 1
+    if len(text) > steer_mod.MAX_CHARS:
+        print(f"消息过长（≤{steer_mod.MAX_CHARS} 字符），请拆分发送")
+        return 1
+    try:
+        steer_mod.append(os.path.abspath(args.root), text)
+    except ValueError as e:
+        print(f"⛔ {e}")
+        return 1
+    if steer_mod.subject_active(args.root):
+        tail = "主体会话下一次工具返回时送入模型"
+        if os.environ.get("GDD_SUBJECT_RESUME", "on") == "off":
+            tail += "。当前 GDD_SUBJECT_RESUME=off，本轮若不再调用工具则不会在会话结束时补送"
+        else:
+            tail += "；若本轮不再调用工具，会话结束时补送一次"
+        print(f"已排队。{tail}。")
+    else:
+        hint = steer_mod.phase_hint(args.root)
+        where = f"（当前 {hint}）" if hint else ""
+        print(f"已排队{where}。主体会话此刻不在运行，将在下一次主体会话送达。")
+    return 0
+
+
 def cmd_chat(args) -> int:
     """要点澄清终端对话：与节点的澄清会话逐轮交互，/done 结束。"""
     from gdd.approval import is_interactive
@@ -496,6 +540,8 @@ _EVENT_LINES = {
     "git_push": "  ✔ 已推送交付分支",
     "notify_print": "  ✔ done，可以上线",
     "session_resume_fail": "  ⚠ 会话续用失败（已回退全新会话）",
+    "steer_fallback": "  ✉ 补充信息未赶上工具返回，已补送一轮",
+    "steer_fallback_fail": "  ⚠ 补充信息补送失败（已放回队列）",
 }
 
 
@@ -916,6 +962,11 @@ def main(argv=None) -> int:
     p = sub.add_parser("acknowledge", help="人工确认滞留警示已处置（清除 stray_delivery，刷新快照基线）")
     p.add_argument("--root", default=".")
     p.set_defaults(func=cmd_acknowledge)
+
+    p = sub.add_parser("steer", help="working 期间补充信息（不占锁，下一次工具返回后送达）")
+    p.add_argument("message", nargs="*", help="补充内容；省略且 stdin 非终端时从 stdin 读取")
+    p.add_argument("--root", default=".")
+    p.set_defaults(func=cmd_steer)
 
     p = sub.add_parser("chat", help="要点澄清终端对话（clarify: true 节点）")
     p.add_argument("--node", default=None, help="节点 id（默认当前节点）")
