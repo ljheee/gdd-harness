@@ -150,6 +150,7 @@ python3 tests/test_e2e.py
 python3 tests/test_ui.py     # 图形控制台（含 CSRF/穿越/并发写防护回归）
 python3 tests/test_clarify.py # 主体会话 resume / 要点澄清通道 / legacy 指纹迁移
 python3 tests/test_steer.py   # working 补充：hook 消费 / 不占锁 / 结束补送一次
+python3 tests/test_node_ext.py # 节点多个 MCP/skill：只挂主体，门禁不继承
 ```
 
 stub agent（`tests/stub_agent.py` + `GDD_STUB_SCRIPT`）可无模型跑全链路。
@@ -160,6 +161,7 @@ stub agent（`tests/stub_agent.py` + `GDD_STUB_SCRIPT`）可无模型跑全链�
 gdd/
   models.py        # Pipeline/Node/Gate/Approval/Subject 数据模型（零依赖 JSON）
   runner.py        # 本地 Agent 适配器（claude -p headless，会话级隔离）
+  node_ext.py      # 节点 MCP/skill：生成仓库外配置，只挂主体会话
   steer.py         # working 补充队列与 PostToolUse hook（仓库外，不占 .gdd/lock）
   gates.py         # entry/exit 门禁：机器检查 + 独立 AI 验证 + verdict 解析（fail-closed）
   approval.py      # request_approval：交互确认 / 非交互挂起

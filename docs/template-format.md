@@ -52,6 +52,8 @@ gdd init --pipeline my-delivery.yaml      # YAML 亦可（需 pip3 install pyyam
 | `session_group` | string | `""` | 主体会话复用组（§4.2；空 = 独立） |
 | `max_bounces` | int | `3` | 打回上限：exit/审批打回计入本节点，entry 打回计入**前**节点 |
 | `baseline_marker` | bool | `false` | 进入主体工作时记录 git 基线，供 `change_aware` exit 使用 |
+| `mcp` | list | 空 | 仅主体会话追加的 MCP（多个）。见 §3.7 |
+| `skills` | list | 空 | 仅主体会话追加的 skill / 插件目录（多个）。见 §3.7 |
 
 节点推进语义（状态机）：`pending →（entry 门禁）→ working（主体）→（exit 门禁）→（可选审批挂起）→ done → 下一节点`。exit 门禁 fail 打回**主体**重做（不重跑 exit 门禁本身、不耗 gate_error/exit_retry 故障预算，但**计入 bounces**）；连续 fail 达 `max_bounces` → `blocked`（人工 `gdd retry` 清零重试或 `gdd abort`）。`exit_retry` 是门禁自身故障（如执行命令异常）的内部重试态，不在正常推进链路上。
 
@@ -111,6 +113,36 @@ gdd init --pipeline my-delivery.yaml      # YAML 亦可（需 pip3 install pyyam
 | `enabled` | `true` | 每节点 exit 通过后自动 commit 并推送（harness 执行，非 LLM） |
 | `branch` | `"gdd/delivery"` | 开发交付分支 |
 | `remote` | `""` | 空 = 自动探测首个 remote；无 remote 则仅本地提交 |
+
+### 3.7 mcp / skills（仅主体会话）
+
+节点可以给**主体会话**追加多个 MCP 和 skill。entry/exit 门禁和 `gdd chat` 不继承，避免门禁和澄清会话用上主体的外部工具。
+
+```yaml
+mcp:
+  - name: fs
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    env:
+      TOKEN: "..."          # 值里不要换行
+  - name: remote
+    url: https://example.com/mcp
+    headers:
+      Authorization: "Bearer ..."
+  - mcp/extra.json          # 文件内容是 {"mcpServers": { ... }}，相对项目根
+skills:
+  - skills/review           # 目录里要有 SKILL.md
+  - path: skills/test
+    name: tester            # 可选；缺省用目录名
+  - /abs/path/to/plugin     # 含 .claude-plugin/plugin.json 时按插件目录原样加载
+```
+
+- 相对路径不能含 `..`。绝对路径可以，用来指向仓库外的共用 skill。
+- 名字字母或数字开头，只含字母数字、`_`、`-`。同一节点里 MCP 名字不能重复。
+- 主体进程启动时，gdd 在仓库外生成一份 `mcp.json`，并给 Claude 追加 `--mcp-config`。多个 skill 目录打进一个临时插件，追加 `--plugin-dir`。这是**追加**：用户自己已经配的 MCP / skill 仍然在。
+- 目录不存在或 skill 缺少 `SKILL.md` 时，这一轮主体会话失败，不静默跳过。
+- Codex 执行端不使用这两条 Claude 参数。
+- 没声明 mcp/skills 的节点不写这两个键，已有流水线的指纹不变。
 
 ## 4. 两个横切配置
 

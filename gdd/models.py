@@ -4,6 +4,7 @@ Pipeline 定义采用零依赖 JSON（不引入 PyYAML），字段见 README。
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -293,6 +294,152 @@ class GitDeliverySpec:
 
 
 @dataclass
+class McpSpec:
+    """节点主体会话额外加载的一个 MCP server，或一份 mcpServers JSON 文件。"""
+
+    name: str = ""
+    command: str = ""
+    args: List[str] = field(default_factory=list)
+    env: Dict[str, str] = field(default_factory=dict)
+    url: str = ""
+    headers: Dict[str, str] = field(default_factory=dict)
+    path: str = ""  # 相对项目根或绝对路径的 mcpServers JSON
+
+    def to_dict(self) -> Any:
+        if self.path and not self.name:
+            return self.path
+        d: Dict[str, Any] = {}
+        if self.path:
+            d["path"] = self.path
+            return d
+        d["name"] = self.name
+        if self.command:
+            d["command"] = self.command
+            if self.args:
+                d["args"] = list(self.args)
+            if self.env:
+                d["env"] = dict(self.env)
+        if self.url:
+            d["url"] = self.url
+            if self.headers:
+                d["headers"] = dict(self.headers)
+        return d
+
+
+@dataclass
+class SkillSpec:
+    """节点主体会话额外加载的一个 skill 目录（内含 SKILL.md）或插件目录。"""
+
+    path: str
+    name: str = ""
+
+    def to_dict(self) -> Any:
+        if not self.name:
+            return self.path
+        return {"path": self.path, "name": self.name}
+
+
+_MCP_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+
+
+def _no_inject(value: str, what: str) -> str:
+    text = str(value or "")
+    if not text or any(c in text for c in "\n\r\x00") or text.startswith("-"):
+        raise ValueError(f"非法{what}: {value!r}（不能为空、不能换行、不能以 - 开头）")
+    return text
+
+
+def _under_root_or_abs(raw: Any, what: str) -> str:
+    """相对路径不得含 .. 逃出项目根；绝对路径允许（共用 skill/MCP 常在仓库外）。"""
+    text = _no_inject(raw, what)
+    if os.path.isabs(text):
+        return text
+    norm = os.path.normpath(text)
+    if norm == ".." or norm.startswith("../"):
+        raise ValueError(f"{what}不能逃出项目根: {raw!r}")
+    return text
+
+
+def _str_map(raw: Any, what: str) -> Dict[str, str]:
+    if not raw:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"MCP {what} 必须是字符串映射")
+    out: Dict[str, str] = {}
+    for k, v in raw.items():
+        key = _no_inject(k, f"{what} 键")
+        if not isinstance(v, str) or any(c in v for c in "\n\r\x00"):
+            raise ValueError(f"MCP {what}[{key}] 必须是字符串")
+        out[key] = v
+    return out
+
+
+def _mcp_list(raw: Any) -> List[McpSpec]:
+    if not raw:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("mcp 必须是列表")
+    seen = set()
+    out: List[McpSpec] = []
+    for item in raw:
+        if isinstance(item, str):
+            out.append(McpSpec(path=_under_root_or_abs(item, "mcp 文件")))
+            continue
+        if not isinstance(item, dict):
+            raise ValueError(f"非法 mcp 条目: {item!r}")
+        path = str(item.get("path") or "")
+        command = str(item.get("command") or "")
+        url = str(item.get("url") or "")
+        if path and (command or url or item.get("name")):
+            raise ValueError("mcp 条目写了 path 就不能再写 name/command/url")
+        if path:
+            out.append(McpSpec(path=_under_root_or_abs(path, "mcp 文件")))
+            continue
+        name = str(item.get("name") or "")
+        if not _MCP_NAME_RE.fullmatch(name):
+            raise ValueError(
+                f"非法 MCP 名字: {name!r}（字母或数字开头，仅字母数字_-，且不能以 - 开头）")
+        if name in seen:
+            raise ValueError(f"MCP 名字重复: {name}")
+        seen.add(name)
+        if bool(command) == bool(url):
+            raise ValueError(f"MCP {name} 必须且只能指定 command 或 url")
+        if command:
+            command = _no_inject(command, "mcp command")
+        if url and not (url.startswith("https://") or url.startswith("http://")):
+            raise ValueError(f"MCP {name} 的 url 只接受 http(s): {url!r}")
+        args = item.get("args") or []
+        if not isinstance(args, list) or any(
+                not isinstance(a, str) or "\n" in a or "\r" in a or "\x00" in a for a in args):
+            raise ValueError(f"MCP {name} 的 args 必须是不含换行的字符串列表")
+        out.append(McpSpec(
+            name=name, command=command, args=list(args),
+            env=_str_map(item.get("env"), "env"),
+            url=url, headers=_str_map(item.get("headers"), "headers"),
+        ))
+    return out
+
+
+def _skill_list(raw: Any) -> List[SkillSpec]:
+    if not raw:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("skills 必须是列表")
+    out: List[SkillSpec] = []
+    for item in raw:
+        if isinstance(item, str):
+            out.append(SkillSpec(path=_under_root_or_abs(item, "skill 路径")))
+            continue
+        if not isinstance(item, dict) or not item.get("path"):
+            raise ValueError(f"非法 skill 条目: {item!r}")
+        name = str(item.get("name") or "")
+        if name and not _MCP_NAME_RE.fullmatch(name):
+            raise ValueError(f"非法 skill 名字: {name!r}")
+        out.append(SkillSpec(path=_under_root_or_abs(item.get("path"), "skill 路径"), name=name))
+    return out
+
+
+@dataclass
 class NodeSpec:
     id: str
     name: str = ""
@@ -306,6 +453,8 @@ class NodeSpec:
     clarify: bool = False  # 允许交互式要点澄清（人工对话对齐，不消耗打回预算，结论必须固化 artifact）
     session_group: str = ""  # 主体会话复用组（空=独立，组名仅字母数字_；设计见 docs/design-session-group.md）
     preset_group: bool = False  # 该组名由 session_preset 展开产生（非用户手写；不序列化：磁盘始终存 preset 形态）
+    mcp: List[McpSpec] = field(default_factory=list)  # 仅主体会话追加的 MCP，门禁不继承
+    skills: List[SkillSpec] = field(default_factory=list)  # 仅主体会话追加的 skill/插件目录
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "NodeSpec":
@@ -322,6 +471,8 @@ class NodeSpec:
             baseline_marker=_parse_bool(d.get("baseline_marker", False)),
             clarify=_parse_bool(d.get("clarify", False)),
             session_group=str(d.get("session_group", "") or ""),
+            mcp=_mcp_list(d.get("mcp")),
+            skills=_skill_list(d.get("skills")),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -342,6 +493,10 @@ class NodeSpec:
             # 否则磁盘展开值在重放中被当手写保留字拒绝（P1-4 砖化形态）；
             # 手写组照存（手写即拒的校验在 from_dict 内执行，存下来的必然合法）
             d["session_group"] = self.session_group
+        if self.mcp:
+            d["mcp"] = [m.to_dict() for m in self.mcp]
+        if self.skills:
+            d["skills"] = [s.to_dict() for s in self.skills]
         return d
 
 

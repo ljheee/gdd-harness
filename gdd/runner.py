@@ -214,9 +214,20 @@ class AgentRunner:
                 try:
                     steer_mod.prepare(self.root)
                 except OSError:
-                    return cmd
-                if steer_mod.agent_family(self.bin) == "claude":
-                    cmd += ["--settings", steer_mod.claude_settings_path(self.root)]
+                    pass
+                else:
+                    if steer_mod.agent_family(self.bin) == "claude":
+                        cmd += ["--settings", steer_mod.claude_settings_path(self.root)]
+        ext = getattr(self, "node_extensions", None)
+        # Codex 不吃 --mcp-config / --plugin-dir。其他 bin（含测试 stub）照挂，
+        # 这样节点声明在命令审计日志里可见；真正执行仍以 Claude 为准。
+        if ext is not None:
+            from .steer import agent_family
+            if agent_family(self.bin) != "codex":
+                if getattr(ext, "mcp_config", ""):
+                    cmd += ["--mcp-config", ext.mcp_config]
+                for plugin in getattr(ext, "plugin_dirs", []) or []:
+                    cmd += ["--plugin-dir", plugin]
         return cmd
 
     def run(

@@ -1499,10 +1499,17 @@ class Orchestrator:
         同一 runner 随后还要跑 exit 门禁，属性必须在返回前清掉。
         """
         from . import steer as steer_mod
+        from .node_ext import prepare
+        from .runner import SessionResult
         prev = getattr(runner, "steer_subject", False)
         runner.steer_subject = True
+        runner.node_extensions = None
         steer_mod.mark_subject(self.root, True)
         try:
+            try:
+                runner.node_extensions = prepare(self.root, node)
+            except (ValueError, OSError) as e:
+                return SessionResult(ok=False, error=f"节点 MCP/skill 无法加载: {e}")
             kw = {}
             if resume_sid:
                 kw["resume_sid"] = resume_sid
@@ -1516,6 +1523,7 @@ class Orchestrator:
             )
         finally:
             runner.steer_subject = prev
+            runner.node_extensions = None
             steer_mod.mark_subject(self.root, False)
 
     def _steer_fallback(self, node: NodeSpec, runner: AgentRunner, session,
