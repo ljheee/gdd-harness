@@ -12,7 +12,7 @@ import shutil
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from .models import McpSpec, NodeSpec, SkillSpec
+from .models import McpSpec, NodeSpec, SkillSpec, _MCP_NAME_RE, _no_inject, _str_map
 
 
 @dataclass
@@ -31,10 +31,47 @@ def _project_key(root: str) -> str:
     return hashlib.sha256(real.encode("utf-8")).hexdigest()[:16]
 
 
+def _within_root(root_real: str, resolved: str) -> bool:
+    try:
+        return os.path.commonpath([root_real, resolved]) == root_real
+    except ValueError:
+        return False
+
+
 def _resolve(root: str, raw: str) -> str:
+    """绝对路径原样解析。相对路径解析符号链接后必须仍在项目根内。"""
+    root_real = os.path.realpath(os.path.abspath(root))
     if os.path.isabs(raw):
         return os.path.realpath(raw)
-    return os.path.realpath(os.path.join(root, raw))
+    resolved = os.path.realpath(os.path.join(root_real, raw))
+    if not _within_root(root_real, resolved):
+        raise ValueError(f"路径不能逃出项目根: {raw}")
+    return resolved
+
+
+def _mkdir_private(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+    os.chmod(path, 0o700)
+
+
+def _write_private(path: str, text: str) -> None:
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+    except Exception:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+
+
+def _remove_file(path: str) -> None:
+    if os.path.isfile(path) or os.path.islink(path):
+        os.remove(path)
 
 
 def _skill_name(spec: SkillSpec, path: str, used: set) -> str:
@@ -65,10 +102,66 @@ def _load_mcp_file(path: str) -> Dict[str, dict]:
     servers = doc.get("mcpServers") if isinstance(doc, dict) else None
     if not isinstance(servers, dict) or not servers:
         raise ValueError(f"mcp 文件缺少 mcpServers: {path}")
+    out: Dict[str, dict] = {}
     for name, spec in servers.items():
         if not isinstance(name, str) or not isinstance(spec, dict):
             raise ValueError(f"mcp 文件条目非法: {path}")
-    return servers
+        out[name] = _file_server(name, spec, path)
+    return out
+
+
+def _file_server(name: str, spec: dict, path: str) -> dict:
+    """文件里的 server 与内联条目同一套约束，额外字段（如 timeout）保留。"""
+    if not _MCP_NAME_RE.fullmatch(name):
+        raise ValueError(
+            f"非法 MCP 名字: {name!r}（{path}；字母或数字开头，仅字母数字_-）")
+    command = spec.get("command") or ""
+    url = spec.get("url") or ""
+    if command and not isinstance(command, str):
+        raise ValueError(f"MCP {name} 的 command 必须是字符串（{path}）")
+    if url and not isinstance(url, str):
+        raise ValueError(f"MCP {name} 的 url 必须是字符串（{path}）")
+    if bool(command) == bool(url):
+        raise ValueError(f"MCP {name} 必须且只能指定 command 或 url（{path}）")
+    if url:
+        if any(c in url for c in "\n\r\x00") or not (
+                url.startswith("https://") or url.startswith("http://")):
+            raise ValueError(f"MCP {name} 的 url 只接受不含换行的 http(s)（{path}）")
+        kind = spec.get("type")
+        if kind not in ("http", "sse"):
+            raise ValueError(f"MCP {name} 的 url 必须带 type（http 或 sse）（{path}）")
+        if spec.get("headers"):
+            _str_map(spec.get("headers"), "headers")
+        return dict(spec)
+    _no_inject(command, "mcp command")
+    args = spec.get("args") or []
+    if not isinstance(args, list) or any(
+            not isinstance(a, str) or any(c in a for c in "\n\r\x00") for a in args):
+        raise ValueError(f"MCP {name} 的 args 必须是不含换行的字符串列表（{path}）")
+    if spec.get("env"):
+        _str_map(spec.get("env"), "env")
+    return dict(spec)
+
+
+def _set_frontmatter_name(text: str, name: str) -> str:
+    """把 SKILL.md 开头的 name 改成节点指定的名字。没有 frontmatter 则不动。"""
+    if not text.startswith("---"):
+        return text
+    end = text.find("\n---", 3)
+    if end == -1:
+        return text
+    lines = text[3:end].split("\n")
+    replaced = False
+    out = []
+    for line in lines:
+        if not replaced and line.startswith("name:"):
+            out.append(f"name: {name}")
+            replaced = True
+        else:
+            out.append(line)
+    if not replaced:
+        out.append(f"name: {name}")
+    return "---" + "\n".join(out) + text[end:]
 
 
 def _inline_server(spec: McpSpec) -> dict:
@@ -87,10 +180,19 @@ def _inline_server(spec: McpSpec) -> dict:
 
 def prepare(root: str, node: NodeSpec) -> Optional[NodeExtensions]:
     """生成该节点主体会话要用的 mcp 配置和 skill 插件目录。没有声明则返回 None。"""
-    if not node.mcp and not node.skills:
-        return None
     dest = os.path.join(ext_home(), _project_key(root), node.id)
-    os.makedirs(dest, exist_ok=True)
+    cfg = os.path.join(dest, "mcp.json")
+    bundle = os.path.join(dest, "skills-plugin")
+    if not node.mcp and not node.skills:
+        _remove_file(cfg)
+        _remove_file(cfg + ".tmp")
+        if os.path.isdir(bundle):
+            shutil.rmtree(bundle)
+        return None
+    home = ext_home()
+    _mkdir_private(home)
+    _mkdir_private(os.path.dirname(dest))
+    _mkdir_private(dest)
     ext = NodeExtensions()
     if node.mcp:
         servers: Dict[str, dict] = {}
@@ -107,12 +209,12 @@ def prepare(root: str, node: NodeSpec) -> Optional[NodeExtensions]:
             if spec.name in servers:
                 raise ValueError(f"MCP 名字重复: {spec.name}")
             servers[spec.name] = _inline_server(spec)
-        cfg = os.path.join(dest, "mcp.json")
-        tmp = cfg + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"mcpServers": servers}, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, cfg)
+        _write_private(cfg, json.dumps(
+            {"mcpServers": servers}, ensure_ascii=False, indent=2))
         ext.mcp_config = cfg
+    else:
+        _remove_file(cfg)
+        _remove_file(cfg + ".tmp")
     if node.skills:
         bundle = os.path.join(dest, "skills-plugin")
         skill_root = os.path.join(bundle, "skills")
@@ -131,7 +233,16 @@ def prepare(root: str, node: NodeSpec) -> Optional[NodeExtensions]:
             if not os.path.isfile(os.path.join(path, "SKILL.md")):
                 raise ValueError(f"skill 目录缺少 SKILL.md: {spec.path}")
             name = _skill_name(spec, path, used)
-            shutil.copytree(path, os.path.join(skill_root, name))
+            target = os.path.join(skill_root, name)
+            shutil.copytree(path, target)
+            if spec.name:
+                md = os.path.join(target, "SKILL.md")
+                with open(md, encoding="utf-8") as f:
+                    text = f.read()
+                rewritten = _set_frontmatter_name(text, name)
+                if rewritten != text:
+                    with open(md, "w", encoding="utf-8") as f:
+                        f.write(rewritten)
             staged = True
         if staged:
             plugin = {
@@ -147,6 +258,8 @@ def prepare(root: str, node: NodeSpec) -> Optional[NodeExtensions]:
             ext.plugin_dirs.insert(0, bundle)
         elif os.path.isdir(bundle):
             shutil.rmtree(bundle, ignore_errors=True)
+    elif os.path.isdir(bundle):
+        shutil.rmtree(bundle)
     if not ext.mcp_config and not ext.plugin_dirs:
         return None
     return ext

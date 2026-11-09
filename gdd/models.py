@@ -350,12 +350,16 @@ def _no_inject(value: str, what: str) -> str:
 
 
 def _under_root_or_abs(raw: Any, what: str) -> str:
-    """相对路径不得含 .. 逃出项目根；绝对路径允许（共用 skill/MCP 常在仓库外）。"""
+    """相对路径每一段都不能是 ..；绝对路径允许（共用 skill/MCP 常在仓库外）。
+
+    只看规范化后的前缀不够：skills/link/../secret 在 normpath 之后落在项目内，
+    但 prepare 的 realpath 会先跟着符号链接走出去。
+    """
     text = _no_inject(raw, what)
     if os.path.isabs(text):
         return text
-    norm = os.path.normpath(text)
-    if norm == ".." or norm.startswith("../"):
+    parts = text.replace("\\", "/").split("/")
+    if any(part == ".." for part in parts):
         raise ValueError(f"{what}不能逃出项目根: {raw!r}")
     return text
 
@@ -387,9 +391,15 @@ def _mcp_list(raw: Any) -> List[McpSpec]:
             continue
         if not isinstance(item, dict):
             raise ValueError(f"非法 mcp 条目: {item!r}")
-        path = str(item.get("path") or "")
-        command = str(item.get("command") or "")
-        url = str(item.get("url") or "")
+        path = item.get("path") or ""
+        if path and not isinstance(path, str):
+            raise ValueError(f"mcp 文件路径必须是字符串: {path!r}")
+        command = item.get("command") or ""
+        url = item.get("url") or ""
+        if command and not isinstance(command, str):
+            raise ValueError(f"mcp command 必须是字符串: {command!r}")
+        if url and not isinstance(url, str):
+            raise ValueError(f"mcp url 必须是字符串: {url!r}")
         if path and (command or url or item.get("name")):
             raise ValueError("mcp 条目写了 path 就不能再写 name/command/url")
         if path:
@@ -406,8 +416,9 @@ def _mcp_list(raw: Any) -> List[McpSpec]:
             raise ValueError(f"MCP {name} 必须且只能指定 command 或 url")
         if command:
             command = _no_inject(command, "mcp command")
-        if url and not (url.startswith("https://") or url.startswith("http://")):
-            raise ValueError(f"MCP {name} 的 url 只接受 http(s): {url!r}")
+        if url and (any(c in url for c in "\n\r\x00")
+                    or not (url.startswith("https://") or url.startswith("http://"))):
+            raise ValueError(f"MCP {name} 的 url 只接受不含换行的 http(s): {url!r}")
         args = item.get("args") or []
         if not isinstance(args, list) or any(
                 not isinstance(a, str) or "\n" in a or "\r" in a or "\x00" in a for a in args):

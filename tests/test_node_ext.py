@@ -85,7 +85,9 @@ def main():
     check(boom({**base, "mcp": [{"name": "a", "command": "npx"}, {"name": "a", "url": "https://x"}]}),
           "MCP 名字重复")
     check(boom({**base, "skills": ["../outside"]}), "skill 相对路径不能逃出项目根")
+    check(boom({**base, "skills": ["skills/foo/../bar"]}), "skill 路径中间的 .. 也拒绝")
     check(boom({**base, "mcp": ["../mcp.json"]}), "mcp 文件路径不能逃出项目根")
+    check(boom({**base, "mcp": [{"name": "fs", "command": ["npx"]}]}), "command 必须是字符串")
 
     proj = tempfile.mkdtemp(prefix="gdd-node-ext-proj-")
     skills = os.path.join(proj, "skills")
@@ -129,6 +131,68 @@ def main():
         check(False, "缺 SKILL.md 应拒绝")
     except ValueError as e:
         check("SKILL.md" in str(e), "缺 SKILL.md 说明原因")
+
+    print("[N5] 路径、文件 MCP、权限、残留配置")
+    outside = tempfile.mkdtemp(prefix="gdd-node-ext-out-")
+    os.symlink(outside, os.path.join(proj, "skills", "linked"))
+    linked = PipelineSpec.from_dict({
+        "id": "p", "name": "p",
+        "nodes": [{"id": "work", "name": "干活", "skills": ["skills/linked"]}],
+    }).nodes[0]
+    try:
+        prepare(proj, linked)
+        check(False, "符号链接逃出项目根应拒绝")
+    except ValueError as e:
+        check("项目根" in str(e), "符号链接逃出项目根要说明原因")
+
+    with open(os.path.join(proj, "mcp-notype.json"), "w", encoding="utf-8") as f:
+        json.dump({"mcpServers": {"remote": {"url": "https://example.com/mcp"}}}, f)
+    notype = PipelineSpec.from_dict({
+        "id": "p", "name": "p",
+        "nodes": [{"id": "work", "name": "干活", "mcp": ["mcp-notype.json"]}],
+    }).nodes[0]
+    try:
+        prepare(proj, notype)
+        check(False, "文件 MCP 缺 type 应拒绝")
+    except ValueError as e:
+        check("type" in str(e), "文件 MCP 缺 type 要说明原因")
+
+    with open(os.path.join(proj, "mcp-http.json"), "w", encoding="utf-8") as f:
+        json.dump({"mcpServers": {
+            "remote": {"type": "http", "url": "https://example.com/mcp", "timeout": 5},
+        }}, f)
+    http_node = PipelineSpec.from_dict({
+        "id": "p", "name": "p",
+        "nodes": [{"id": "work", "name": "干活", "mcp": ["mcp-http.json"]}],
+    }).nodes[0]
+    http_ext = prepare(proj, http_node)
+    with open(http_ext.mcp_config, encoding="utf-8") as f:
+        remote = json.load(f)["mcpServers"]["remote"]
+    check(remote.get("type") == "http" and remote.get("timeout") == 5, "文件 MCP 保留 type 和额外字段")
+    check(os.stat(http_ext.mcp_config).st_mode & 0o777 == 0o600, "mcp.json 仅所有者可读")
+    check(os.stat(os.path.dirname(http_ext.mcp_config)).st_mode & 0o777 == 0o700,
+          "扩展目录仅所有者可进入")
+
+    stale = prepare(proj, node)
+    stale_cfg = stale.mcp_config
+    check(os.path.isfile(stale_cfg), "先有一份带 token 的配置")
+    cleared = PipelineSpec.from_dict({
+        "id": "p", "name": "p",
+        "nodes": [{"id": "work", "name": "干活"}],
+    }).nodes[0]
+    check(prepare(proj, cleared) is None, "清空声明后不再挂扩展")
+    check(not os.path.exists(stale_cfg), "清空声明后删掉旧 mcp.json")
+
+    named = PipelineSpec.from_dict({
+        "id": "p", "name": "p",
+        "nodes": [{"id": "work", "name": "干活",
+                   "skills": [{"path": "skills/review", "name": "tester"}]}],
+    }).nodes[0]
+    named_ext = prepare(proj, named)
+    staged_md = os.path.join(named_ext.plugin_dirs[0], "skills", "tester", "SKILL.md")
+    with open(staged_md, encoding="utf-8") as f:
+        staged_text = f.read()
+    check("name: tester" in staged_text.split("---", 2)[1], "指定的 skill 名字写进 SKILL.md")
 
     print("[N3] 只有 Claude 命令挂 MCP 和 skill")
     os.environ["GDD_AGENT_BIN"] = "claude"
@@ -189,6 +253,39 @@ def main():
           "主体会话带 mcp 配置")
     check(all(ext.plugin_dirs for ext in subjects), "主体会话带 skill 插件")
     check(gates and all(ext is None for ext in gates), "门禁会话没有节点扩展")
+
+    print("[N6] 加载失败不清掉已保存的主体会话")
+    resume_work = tempfile.mkdtemp(prefix="gdd-node-ext-resume-")
+    os.makedirs(os.path.join(resume_work, "skills", "nope"), exist_ok=True)
+    calls = []
+
+    class ResumeRec(AgentRunner):
+        def run(self, prompt, *, allowed_tools, max_turns, log_path=None,
+                resume_sid="", on_stream=None):
+            calls.append(resume_sid)
+            return SessionResult(ok=True, text="ok", session_id="new")
+
+    orch.AgentRunner = ResumeRec
+    try:
+        o = Orchestrator(resume_work)
+        o.init({
+            "id": "ext", "name": "ext",
+            "git_delivery": {"enabled": False},
+            "nodes": [{
+                "id": "work", "name": "干活", "description": "完成",
+                "skills": ["skills/nope"],
+            }],
+        }, "需求")
+        ns = o.state["node_states"]["work"]
+        ns["phase"] = "working"
+        ns["sessions"] = {"subject": "keep-me"}
+        o._phase_working(o.pipeline.nodes[0], ns, ResumeRec(resume_work))
+    finally:
+        orch.AgentRunner = orig
+    check(calls == [], "加载失败不启动会话")
+    check(ns["sessions"].get("subject") == "keep-me", "加载失败保留原会话")
+    check(not any(e.get("event") == "session_resume_fail" for e in o.state["history"]),
+          "加载失败不记成会话失效")
 
     print("ALL NODE EXT PASSED")
 

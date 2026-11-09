@@ -1378,8 +1378,11 @@ class Orchestrator:
             session = self._subject_run(
                 runner, prompt, node, "subject_resume",
                 resume_sid=resume_sid, stream_cb=stream_cb)
-            if not session.ok and not session.turns_exhausted:
+            if (not session.ok and not session.turns_exhausted
+                    and not session.config_error):
                 # resume 失效（会话过期等，非打满）：清存档回退全新会话重试一次，不计故障。
+                # MCP/skill 加载失败不是会话失效：清 sid 会丢掉还能续的主体会话，
+                # 紧接着的全新一轮也只是把同一个配置错误再失败一次。
                 # turns 打满时会话仍存活：不 pop——保留 sid，由下方自动续跑块接管
                 # （否则打满被误判 resume 失效，弹档后发全新会话重跑，白烧配额）。
                 # 组复用：同组所有节点的主体 sid 都指向同一会话，逐一失效。
@@ -1509,7 +1512,8 @@ class Orchestrator:
             try:
                 runner.node_extensions = prepare(self.root, node)
             except (ValueError, OSError) as e:
-                return SessionResult(ok=False, error=f"节点 MCP/skill 无法加载: {e}")
+                return SessionResult(
+                    ok=False, error=f"节点 MCP/skill 无法加载: {e}", config_error=True)
             kw = {}
             if resume_sid:
                 kw["resume_sid"] = resume_sid

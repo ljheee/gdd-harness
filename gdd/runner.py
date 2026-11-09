@@ -46,6 +46,7 @@ class SessionResult:
     # 才完成——见 orchestrator 的自动续跑逻辑。
     turns_exhausted: bool = False
     streamed: bool = False  # 本轮是否走了 stream-json 呈现路径
+    config_error: bool = False  # 节点 MCP/skill 加载失败：不是会话失效，禁止清 sid 再重试
 
 
 # 登录态/凭证失效特征（小写匹配）。实跑教训：claude CLI 登录态过期时把
