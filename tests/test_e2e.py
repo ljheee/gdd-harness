@@ -92,7 +92,7 @@ def test_t0_builtin_template_file():
     check(builtins.DELIVERY_PIPELINE == raw, "builtins 导出与文件内容一致（权威源）")
     fp = hashlib.sha256(json.dumps(builtins.DELIVERY_PIPELINE, sort_keys=True,
                                     ensure_ascii=False).encode()).hexdigest()[:16]
-    check(fp == "6185fadf85a67d99", "模板内容指纹稳定（防误改）")
+    check(fp == "7328e40e1ba05fca", "模板内容指纹稳定（防误改）")
 
     # 同源：两路 init 实例指纹一致（--pipeline delivery ≡ 传文件路径）
     d = fresh_project()
@@ -117,7 +117,7 @@ def test_a_happy_with_exit_bounce():
         ("exit 门禁", FAIL),
         ("门禁（独立验证会话）", PASS),
         ("project_init", "bash: mkdir -p docs && printf '# R\\n## 需求描述\\n内容\\n' > docs/requirement.md"),
-        ("survey", "bash: printf '# S\\n## 现状分析\\n## 影响面\\n## 风险与未知项\\n' > docs/survey.md"),
+        ("survey", "bash: printf '# S\\n## 现状分析\\n## 影响面\\n## 相关方与依赖\\n## 风险与未知项\\n' > docs/survey.md"),
         ("需求澄清", "bash: printf '# G\\n## 目标\\n## 验收标准（DoD）\\n' > docs/goal.md"),
         ("方案设计", "bash: printf '# P\\n## 实现步骤\\n## ADR\\n' > docs/plan.md"),
         ("开发实现", "bash: printf '# L\\n## 核销台账\\n' > docs/impl-ledger.md"),
@@ -139,7 +139,7 @@ def test_a_happy_with_exit_bounce():
     # 手动放置全部产物（模拟主体完成）
     files = {
         "docs/requirement.md": "# R\n## 需求背景\n## 需求描述\n内容\n",
-        "docs/survey.md": "# S\n## 现状分析\n## 影响面\n## 风险与未知项\n",
+        "docs/survey.md": "# S\n## 现状分析\n## 影响面\n## 相关方与依赖\n## 风险与未知项\n",
         "docs/goal.md": "# G\n## 目标\n## 验收标准（DoD）\n",
         "docs/plan.md": "# P\n## 实现步骤\n## ADR\n",
         "docs/impl-ledger.md": "# L\n## 核销台账\n",
@@ -169,7 +169,7 @@ def test_a_happy_with_exit_bounce():
             "for nid in ['project_init','survey','需求澄清','方案设计','开发实现','测试验证','收尾交付','上线准备']:\n"
             "    if nid in prompt: node=nid; break\n"
             "m={'project_init':'docs/requirement.md','需求澄清':'docs/goal.md','方案设计':'docs/plan.md','开发实现':'docs/impl-ledger.md','测试验证':'docs/test-report.md','收尾交付':'docs/delivery.md','上线准备':'RELEASE-CHECKLIST.md','上线周知':'docs/notify.md'}\n"
-            "c={'project_init':'# R\\n## 需求背景\\n## 需求描述\\n内容\\n','survey':'# S\\n## 现状分析\\n## 影响面\\n## 风险与未知项\\n','需求澄清':'# G\\n## 目标\\n## 验收标准（DoD）\\n','方案设计':'# P\\n## 实现步骤\\n## ADR\\n','开发实现':'# L\\n## 核销台账\\n','测试验证':'# T\\n## 验证结果\\n','收尾交付':'# D\\n## 验收证据\\n','上线准备':'# C\\n## 发布前确认\\n## 本次变更\\n## 上线步骤\\n## 异常处理\\n'}\n"
+            "c={'project_init':'# R\\n## 需求背景\\n## 需求描述\\n内容\\n','survey':'# S\\n## 现状分析\\n## 影响面\\n## 相关方与依赖\\n## 风险与未知项\\n','需求澄清':'# G\\n## 目标\\n## 验收标准（DoD）\\n','方案设计':'# P\\n## 实现步骤\\n## ADR\\n','开发实现':'# L\\n## 核销台账\\n','测试验证':'# T\\n## 验证结果\\n','收尾交付':'# D\\n## 验收证据\\n','上线准备':'# C\\n## 发布前确认\\n## 本次变更\\n## 上线步骤\\n## 异常处理\\n'}\n"
             "if node and node in m:\n"
             "    open(m[node],'w').write(c[node])\n"
             "r='subject finished'\n"
@@ -260,7 +260,7 @@ def test_b_approval_reject():
     d = fresh_project()
     files = {
         "docs/requirement.md": "# R\n## 需求描述\n内容\n",
-        "docs/survey.md": "# S\n## 现状分析\n## 影响面\n## 风险与未知项\n",
+        "docs/survey.md": "# S\n## 现状分析\n## 影响面\n## 相关方与依赖\n## 风险与未知项\n",
         "docs/goal.md": "# G\n## 目标\n## 验收标准（DoD）\n",
     }
     os.makedirs(os.path.join(d, "docs"), exist_ok=True)
@@ -347,7 +347,7 @@ def test_c_blocked_and_retry():
                 return SessionResult(ok=True, text=PASS)
             # 主体：产出 survey.md
             with open(os.path.join(self.root, "docs", "survey.md"), "w") as f:
-                f.write("# S\n## 现状分析\n## 影响面\n## 风险与未知项\n")
+                f.write("# S\n## 现状分析\n## 影响面\n## 相关方与依赖\n## 风险与未知项\n")
             return SessionResult(ok=True, text="ok", turns=1)
 
     import gdd.orchestrator as orch
