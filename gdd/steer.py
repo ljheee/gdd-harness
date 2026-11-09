@@ -191,6 +191,20 @@ def phase_hint(root: str) -> str:
     return f"{status}/{phase}" if phase else status
 
 
+def delivery_hint(root: str) -> str:
+    """入队后的送达说明。命令行和 Web 控制台共用这一句。"""
+    if subject_active(root):
+        tail = "主体会话下一次工具返回时送入模型"
+        if os.environ.get("GDD_SUBJECT_RESUME", "on") == "off":
+            tail += "。当前 GDD_SUBJECT_RESUME=off，本轮若不再调用工具则不会在会话结束时补送"
+        else:
+            tail += "；若本轮不再调用工具，会话结束时补送一次"
+        return f"已排队。{tail}。"
+    hint = phase_hint(root)
+    where = f"（当前 {hint}）" if hint else ""
+    return f"已排队{where}。主体会话此刻不在运行，将在下一次主体会话送达。"
+
+
 def append(root: str, text: str) -> int:
     """追加一条补充。返回队列中的条数。不拿 .gdd/lock。"""
     body = (text or "").strip()

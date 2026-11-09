@@ -1,6 +1,7 @@
 """终端流式呈现（P0 clarify 全文 / P1 subject 工具摘要+截断文本）。
 
-仅 tty 交互路径（gdd go / gdd chat）注入；非 tty、门禁、UI 后台不启用。
+仅 tty 交互路径（gdd go / gdd chat）注入。门禁不走这里。
+Web 控制台有自己的滚动区（见 gdd/ui.py），不套用终端这 800 字截断。
 流式文案不是过关证据——权威结论仍在门禁/产物（见 docs/design-go.md §9）。
 """
 from __future__ import annotations

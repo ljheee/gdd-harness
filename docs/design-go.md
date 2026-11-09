@@ -191,7 +191,9 @@ Orchestrator(on_stream=factory)   # factory(role) -> callback|None
 
 cli.cmd_go / cmd_chat（tty）：
   on_stream = stream_ui.factory_for_tty()
-非 tty / UI 后台：on_stream=None（与现网一致）
+非 tty 的 `gdd run`：on_stream=None
+Web 控制台：后台线程挂自己的滚动区回调（工具行全留，助手文本按环形缓冲保留）。
+门禁会话仍然不流式，页面只写阶段行。
 ```
 
 ### 9.4 呈现约定

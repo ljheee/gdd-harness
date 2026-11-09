@@ -405,17 +405,7 @@ def cmd_steer(args) -> int:
     except ValueError as e:
         print(f"⛔ {e}")
         return 1
-    if steer_mod.subject_active(args.root):
-        tail = "主体会话下一次工具返回时送入模型"
-        if os.environ.get("GDD_SUBJECT_RESUME", "on") == "off":
-            tail += "。当前 GDD_SUBJECT_RESUME=off，本轮若不再调用工具则不会在会话结束时补送"
-        else:
-            tail += "；若本轮不再调用工具，会话结束时补送一次"
-        print(f"已排队。{tail}。")
-    else:
-        hint = steer_mod.phase_hint(args.root)
-        where = f"（当前 {hint}）" if hint else ""
-        print(f"已排队{where}。主体会话此刻不在运行，将在下一次主体会话送达。")
+    print(steer_mod.delivery_hint(args.root))
     return 0
 
 

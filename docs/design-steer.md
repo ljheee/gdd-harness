@@ -59,4 +59,6 @@ gdd go
 
 # 终端 B，working 期间
 gdd steer "不要引入 Redis，状态写本地文件"
+
+# Web 控制台在当前节点处于 working 时提供同一条队列的输入框
 ```

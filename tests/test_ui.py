@@ -94,6 +94,50 @@ def wait_for(client, name, pred, timeout=60, desc=""):
     raise AssertionError(f"等待超时: {desc}")
 
 
+def c_req_status(port, path):
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request("GET", path)
+    status = conn.getresponse().status
+    conn.close()
+    return status
+
+
+def read_sse(port, path, seconds=3):
+    """读一小段 SSE，把 data 行解析成事件。连接保持到超时。"""
+    import socket
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    sock.settimeout(0.4)
+    req = (
+        f"GET {path} HTTP/1.1\r\n"
+        "Host: 127.0.0.1\r\n"
+        "Accept: text/event-stream\r\n"
+        "Connection: keep-alive\r\n\r\n"
+    )
+    sock.sendall(req.encode())
+    buf = b""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        try:
+            chunk = sock.recv(8192)
+        except socket.timeout:
+            continue
+        if not chunk:
+            break
+        buf += chunk
+    sock.close()
+    events = []
+    for block in buf.decode("utf-8", "replace").split("\n"):
+        line = block.strip()
+        if not line.startswith("data:"):
+            continue
+        try:
+            events.append(json.loads(line[5:].strip()))
+        except json.JSONDecodeError:
+            continue
+    return events
+
+
 def main():
     from gdd import ui as gdd_ui
 
@@ -343,6 +387,102 @@ def main():
     ov2 = c.get("/api/overview")
     names2 = {t["name"]: t.get("status") for t in ov2.get("tasks", [])}
     check(names2.get("t-corrupt") == "corrupt", "损坏 state 任务以 corrupt 状态列出（UI 可见可 reset）")
+
+    # ---------- T7 运行中滚动 + working 补充（与 gdd steer 同一队列）----------
+    print("[T7] 运行进度 SSE 与 steer")
+    page = c.get("/")
+    raw_page = page.get("_raw") or ""
+    check("EventSource" in raw_page and "sendSteer" in raw_page and "liveLog" in raw_page,
+          "页面带滚动区与补充入口")
+    import socket
+    missing = c_req_status(port, "/api/task/no-such-task/live")
+    check(missing == 404, f"不存在的任务不挂 SSE（{missing}）")
+
+    # 环形缓冲丢掉最旧的，总长度有上限
+    for i in range(200):
+        gdd_ui.live_append("ring-task", "text", "字" * 1000)
+    ring = gdd_ui.live_wait("ring-task", 0, 0.01)
+    total = sum(len(ev.get("text") or "") for ev in ring)
+    check(total <= gdd_ui.LIVE_MAX_CHARS, f"滚动区不超过 {gdd_ui.LIVE_MAX_CHARS} 字（{total}）")
+    check(ring and ring[0]["id"] > 1, "最旧的片段已被丢掉")
+    gdd_ui.live_clear("ring-task")
+
+    with open(script, "w", encoding="utf-8") as f:
+        json.dump([{
+            "patterns": ["GDD-ROLE"],
+            "text": PASS,
+            "stream_tools": [{"name": "Write", "path": "docs/out.md"}],
+        }], f, ensure_ascii=False)
+    live_body = json.dumps({
+        "id": "live", "name": "滚动",
+        "nodes": [{
+            "id": "first", "name": "第一节点", "description": "产出",
+            "entry": {"goal": "可以开始"},
+            "exit": {"goal": "做完了"},
+            "approval": {"required": True, "prompt": "确认"},
+        }],
+    }, ensure_ascii=False)
+    saved = c.put("/api/template/live-ui", {"content": live_body})
+    check(saved["ok"], f"带 AI 门禁的模板（{saved}）")
+    made = c.post("/api/tasks", {"name": "t-live", "template": "live-ui", "requirement": "看进度"})
+    check(made["ok"], f"t-live 创建（{made}）")
+    c.post("/api/task/t-live/action", {"op": "run"})
+    wait_for(c, "t-live", lambda x: x["status"] == "awaiting_approval", desc="t-live 跑到审批")
+    live = read_sse(port, "/api/task/t-live/live", seconds=3)
+    texts = "".join(ev.get("text") or "" for ev in live if ev.get("kind") == "text")
+    phases = " | ".join(ev.get("text") or "" for ev in live if ev.get("kind") == "phase")
+    tools = " | ".join(ev.get("text") or "" for ev in live if ev.get("kind") == "tool")
+    check("正在跑入口门禁" in phases and "正在跑主体会话" in phases and "正在跑出口门禁" in phases,
+          f"阶段行含入口/主体/出口（{phases}）")
+    check(texts.count("stub通过") == 1, f"只有主体会话把模型文本推进滚动区（{texts.count('stub通过')}）")
+    check("docs/out.md" in tools, f"工具行留在滚动区（{tools}）")
+
+    # 持锁时仍可补充，且不改 state
+    steer_task = c.post("/api/tasks", {"name": "t-steer", "template": "mine", "requirement": "补充"})
+    check(steer_task["ok"], "t-steer 创建")
+    state_path = os.path.join(workdir, "t-steer", ".gdd", "state.json")
+    before = open(state_path, encoding="utf-8").read()
+    import fcntl
+    lock_fd = os.open(os.path.join(workdir, "t-steer", ".gdd", "lock"), os.O_CREAT | os.O_RDWR)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        r = c.post("/api/task/t-steer/action", {"op": "steer", "message": "不要用 Redis"})
+        check(r.get("ok") and "下一次主体会话" in r.get("hint", ""), f"持锁入队并说明送达时机（{r}）")
+        from gdd import steer as steer_mod
+        check("不要用 Redis" in steer_mod.pending(os.path.join(workdir, "t-steer")), "补充进了 steer 队列")
+        check(open(state_path, encoding="utf-8").read() == before, "补充不改 state.json")
+        r = c.post("/api/task/t-steer/action", {"op": "steer", "message": ""})
+        check(not r["ok"], "空补充拒绝")
+        r = c.post("/api/task/t-steer/action", {"op": "steer", "message": "长" * 8001})
+        check(not r["ok"] and "过长" in r["error"], "超长补充拒绝")
+        os.environ["GDD_STEER"] = "off"
+        try:
+            r = c.post("/api/task/t-steer/action", {"op": "steer", "message": "关掉了"})
+            check(not r["ok"] and "off" in r["error"], "GDD_STEER=off 拒绝入队")
+            check("关掉了" not in steer_mod.pending(os.path.join(workdir, "t-steer")), "关闭时不入队")
+        finally:
+            os.environ.pop("GDD_STEER", None)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+    # 澄清对话也进滚动区（门禁不在这次调用里）
+    cl_body = json.dumps({
+        "id": "cl", "name": "澄清",
+        "nodes": [{"id": "c1", "name": "澄清节点", "clarify": True, "description": "问清楚"}],
+    }, ensure_ascii=False)
+    saved = c.put("/api/template/clarify-ui", {"content": cl_body})
+    check(saved["ok"], f"澄清模板（{saved}）")
+    made = c.post("/api/tasks", {"name": "t-cl", "template": "clarify-ui", "requirement": "问"})
+    check(made["ok"], f"t-cl 创建（{made}）")
+    r = c.post("/api/task/t-cl/action", {"op": "chat", "node": "c1", "message": "先确认范围"})
+    check(r.get("started"), f"澄清已受理（{r}）")
+    wait_for(c, "t-cl", lambda x: not x["running"] and any(
+        d.get("role") == "assistant" for d in x.get("dialog_tail") or []), desc="澄清回复落盘")
+    live = read_sse(port, "/api/task/t-cl/live", seconds=2)
+    blob = " | ".join(ev.get("text") or "" for ev in live)
+    check("先确认范围" in blob and "正在澄清对话" in blob and "stub通过" in blob,
+          f"澄清轮的用户句、阶段和模型文本都在滚动区（{blob[:300]}）")
 
     srv.shutdown()
     print("\n全部通过 ✔")

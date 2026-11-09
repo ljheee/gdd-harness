@@ -10,8 +10,10 @@
   1. 模板管理：列表/查看/新建/编辑/删除（内置 delivery 只读）；
   2. 新任务：选模板 + 需求一句话 → init；
   3. 任务列表 + 任务详情：流程节点图（pending/进行中/门禁重试/待审批高亮/完成），
-     run / approve / reject / retry / abort / reset 操作；
-  4. run 在后台线程执行，前端 2s 轮询刷新。
+     run / approve / reject / retry / abort / reset 操作，working 期间用与
+     `gdd steer` 相同的队列补充信息；
+  4. run 在后台线程执行。页面 2s 轮询状态；运行进度用 SSE 滚动显示
+     （澄清全文、主体的工具行和助手文本、门禁只显示阶段行）。
 
 安全：仅监听 127.0.0.1；任务名/模板名白名单校验，禁止路径穿越。
 """
@@ -42,6 +44,11 @@ _NAME_RE = re.compile(r"^[A-Za-z0-9_\-\u4e00-\u9fff]{1,64}$")
 
 _running: dict = {}          # task -> Thread（在跑的 run）
 _running_lock = threading.Lock()
+
+# 运行中滚动区：进程内环形缓冲，SSE 推给页面。不落盘，重置任务时清掉。
+LIVE_MAX_CHARS = 64 * 1024
+_live_lock = threading.Lock()
+_live: dict = {}  # task -> {seq, events, chars, cond}
 
 
 # ---------------------------------------------------------------- 工具
@@ -180,6 +187,8 @@ def _task_detail(workdir: str, name: str) -> dict:
         "chat_error": _chat_err.get(name),
         "run_error": _run_err.get(name),
         "running": name in _running,
+        "steer_enabled": _steer_enabled(),
+        "steer_queued": _steer_queued(d),
     }
 
 
@@ -192,11 +201,150 @@ _chat_err: dict = {}  # 任务名 → 最近一次后台对话失败信息（前
 _run_err: dict = {}  # 任务名 → 最近一次后台推进失败信息（前端展示用，下次 run 启动时清除）
 
 
+def _live_bucket(name: str) -> dict:
+    with _live_lock:
+        bucket = _live.get(name)
+        if bucket is None:
+            bucket = {"seq": 0, "events": [], "chars": 0, "cond": threading.Condition()}
+            _live[name] = bucket
+        return bucket
+
+
+def live_append(name: str, kind: str, text: str, **extra) -> None:
+    """追加一条滚动事件。单条超长时保留末尾，总长度超出环形上限时丢掉最旧的。"""
+    body = text or ""
+    if kind != "reset" and not body:
+        return
+    if len(body) > LIVE_MAX_CHARS:
+        body = body[-LIVE_MAX_CHARS:]
+    bucket = _live_bucket(name)
+    with bucket["cond"]:
+        bucket["seq"] += 1
+        ev = {"id": bucket["seq"], "kind": kind, "text": body}
+        for key, value in extra.items():
+            if value is not None:
+                ev[key] = value
+        bucket["events"].append(ev)
+        bucket["chars"] += len(body)
+        while len(bucket["events"]) > 1 and bucket["chars"] > LIVE_MAX_CHARS:
+            old = bucket["events"].pop(0)
+            bucket["chars"] -= len(old.get("text") or "")
+        bucket["cond"].notify_all()
+
+
+def live_wait(name: str, after: int, timeout: float = 15) -> list:
+    """返回 id 大于 after 的事件。没有新事件时最多等 timeout 秒。"""
+    bucket = _live_bucket(name)
+    with bucket["cond"]:
+        def newer():
+            return [dict(ev) for ev in bucket["events"] if ev["id"] > after]
+        items = newer()
+        if not items:
+            bucket["cond"].wait(timeout)
+            items = newer()
+        return items
+
+
+def live_clear(name: str) -> None:
+    """重置任务时清掉滚动区，并推一条 reset 让已连接的页面跟着清空。"""
+    with _live_lock:
+        bucket = _live.get(name)
+    if bucket is None:
+        return
+    with bucket["cond"]:
+        bucket["events"].clear()
+        bucket["chars"] = 0
+        bucket["seq"] += 1
+        ev = {"id": bucket["seq"], "kind": "reset", "text": ""}
+        bucket["events"].append(ev)
+        bucket["cond"].notify_all()
+
+
+_PHASE_TEXT = {
+    "entry": "正在跑入口门禁",
+    "subject": "正在跑主体会话",
+    "exit": "正在跑出口门禁",
+    "clarify": "正在澄清对话",
+}
+
+
+def _present_event(name: str, event: str, kw: dict) -> None:
+    if event == "ui_phase":
+        phase = str(kw.get("phase") or "")
+        label = _PHASE_TEXT.get(phase, phase or "进行中")
+        node = kw.get("name") or kw.get("node") or ""
+        live_append(name, "phase", f"{label} · {node}" if node else label)
+        return
+    notes = {
+        "entry_pass": "入口门禁通过",
+        "entry_fail": "入口门禁未通过",
+        "exit_pass": "出口门禁通过",
+        "exit_fail": "出口门禁未通过",
+        "subject_done": "主体会话结束",
+        "steer_fallback": "补充未赶上工具返回，已补送一轮",
+        "steer_fallback_fail": "补充补送失败，已放回队列",
+        "blocked": "流程已阻塞",
+    }
+    if event not in notes:
+        return
+    extra = ""
+    if event == "subject_done":
+        extra = "（成功）" if kw.get("ok") else "（未成功）"
+    reason = kw.get("reason")
+    if event in ("entry_fail", "exit_fail", "blocked") and reason:
+        extra = "：" + str(reason)[:180]
+    live_append(name, "phase", notes[event] + extra)
+
+
+def _stream_factory(name: str):
+    """Web 滚动区：工具行全留，助手文本按环形缓冲保留，不套用终端 800 字截断。"""
+
+    def factory(role: str):
+        def on_stream(ev: dict) -> None:
+            kind = ev.get("kind")
+            if kind == "tool":
+                tool = ev.get("name") or "?"
+                summary = ev.get("summary") or ""
+                live_append(name, "tool", f"⋯ {tool}" + (f" {summary}" if summary else ""), role=role)
+            elif kind == "text":
+                text = ev.get("text") or ""
+                if text:
+                    live_append(name, "text", text, role=role)
+        return on_stream
+
+    return factory
+
+
+def _bind_present(orch: Orchestrator, name: str) -> None:
+    orch.on_stream = _stream_factory(name)
+    orch.on_event = lambda event, **kw: _present_event(name, event, kw)
+
+
+def _steer_enabled() -> bool:
+    try:
+        from . import steer as steer_mod
+        return steer_mod.enabled()
+    except OSError:
+        return False
+
+
+def _steer_queued(root: str) -> int:
+    try:
+        from . import steer as steer_mod
+        if not steer_mod.enabled():
+            return 0
+        return steer_mod.queued_count(root)
+    except OSError:
+        return 0
+
+
 def _bg_chat(root: str, name: str, node_id: str, message: str) -> None:
     """澄清对话后台轮：与 run 同一互斥域（_running 注册表），锁内执行。"""
     try:
         o = Orchestrator(root)
         if o.load():
+            _bind_present(o, name)
+            live_append(name, "note", "你：" + message.strip()[:500])
             r = o.chat(node_id, message)
             if not r.get("ok"):
                 with _running_lock:
@@ -218,6 +366,7 @@ def _bg_chat(root: str, name: str, node_id: str, message: str) -> None:
                             "rejected_message": message,
                         }
                 print(f"[gdd-ui] 任务 {name} 澄清对话失败: {r.get('error')}", flush=True)
+                live_append(name, "phase", "澄清会话失败")
     except Exception as e:
         with _running_lock:
             _chat_err[name] = f"澄清对话异常: {e}"
@@ -248,7 +397,28 @@ def _do_action(workdir: str, name: str, op: str, feedback: str = "", extra: dict
         with _running_lock:
             _chat_err.pop(name, None)
             _run_err.pop(name, None)
+        live_clear(name)
         return {"ok": True}
+    if op == "steer":
+        # 跑在 load() 之前：主体持锁写 state 时，补充仍然入队。不拿 .gdd/lock。
+        if not os.path.isfile(os.path.join(d, ".gdd", "state.json")):
+            raise FileNotFoundError(f"任务不存在: {name}")
+        from . import steer as steer_mod
+        if not steer_mod.enabled():
+            return {"ok": False, "error": "GDD_STEER=off，未入队。"}
+        text = str((extra or {}).get("message", "")).strip()
+        if not text:
+            return {"ok": False, "error": "补充内容为空"}
+        if len(text) > steer_mod.MAX_CHARS:
+            return {"ok": False, "error": f"消息过长（≤{steer_mod.MAX_CHARS} 字符），请拆分发送"}
+        try:
+            queued = steer_mod.append(d, text)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+        hint = steer_mod.delivery_hint(d)
+        preview = text if len(text) <= 180 else text[:180] + "…"
+        live_append(name, "note", f"✉ {preview} — {hint}")
+        return {"ok": True, "queued": queued, "hint": hint}
     o = Orchestrator(d)
     if not o.load():
         raise FileNotFoundError(f"任务不存在: {name}")
@@ -367,6 +537,7 @@ def _bg_run(root: str, name: str) -> None:
     try:
         o = Orchestrator(root)
         if o.load():
+            _bind_present(o, name)
             o.run()
         return
     except Exception as e:
@@ -466,6 +637,12 @@ td{color:var(--fg)} td.ts{color:var(--dim)}
 .tag{display:inline-block;font-size:11px;border:1px solid var(--line);border-radius:6px;padding:1px 7px;color:var(--dim);margin-left:6px}
 pre{white-space:pre-wrap;font:12px/1.5 ui-monospace,Menlo,monospace;color:#c9d3e3}
 .empty{color:var(--dim);padding:40px;text-align:center}
+#liveLog{max-height:360px;overflow-y:auto;margin-top:8px;padding:8px 10px;background:#10141c;border-radius:8px;font:12px/1.55 ui-monospace,Menlo,monospace}
+#liveLog:empty::before{content:"启动后这里滚动显示入口门禁、主体会话和出口门禁。往上翻时不会被拽回底部。";color:var(--dim)}
+.live-phase{color:var(--blue);margin-top:8px}
+.live-tool{color:var(--amber)}
+.live-text{color:#d5dced;white-space:pre-wrap}
+.live-note{color:var(--green);margin-top:6px;white-space:pre-wrap}
 .tabs{display:flex;gap:8px;margin-bottom:16px}
 .tabs button.on{border-color:var(--blue);color:#cfe0ff}
 </style></head><body>
@@ -481,6 +658,7 @@ pre{white-space:pre-wrap;font:12px/1.5 ui-monospace,Menlo,monospace;color:#c9d3e
 <script>
 const $=s=>document.querySelector(s);
 let view={mode:'home'}, pollTimer=null, lastDetail=null;
+let liveTask='', liveEs=null, liveEvents=[], liveStick=true, liveScrollTop=0;
 
 async function api(path,opts){
   opts=opts||{};
@@ -505,7 +683,69 @@ async function refreshNav(){
 function esc(s){return String(s??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}
 function enc(s){return btoa(unescape(encodeURIComponent(String(s))))}  // onclick 安全传参（避开实体解码突破引号）
 function dec(s){return decodeURIComponent(escape(atob(s)))}
-function stopPoll(){if(pollTimer){clearInterval(pollTimer);pollTimer=null}}
+function stopPoll(){if(pollTimer){clearInterval(pollTimer);pollTimer=null} closeLive()}
+function closeLive(){if(liveEs){liveEs.close();liveEs=null} liveTask=''; liveEvents=[]; liveScrollTop=0; liveStick=true}
+function bindLive(name){
+  if(liveTask===name && liveEs) return;
+  if(liveEs){liveEs.close();liveEs=null}
+  liveTask=name; liveEvents=[]; liveScrollTop=0; liveStick=true;
+  const es=new EventSource('/api/task/'+encodeURIComponent(name)+'/live');
+  liveEs=es;
+  es.onmessage=(msg)=>{
+    let ev; try{ev=JSON.parse(msg.data)}catch(e){return}
+    if(ev.kind==='reset'){liveEvents=[]; liveScrollTop=0; liveStick=true; paintLive(true); return}
+    liveEvents.push(ev);
+    paintLive(false);
+  };
+}
+function onLiveScroll(){
+  const box=document.getElementById('liveLog');
+  if(!box || box.dataset.painting==='1') return;
+  liveStick = box.scrollHeight - box.scrollTop - box.clientHeight < 48;
+  liveScrollTop = box.scrollTop;
+}
+function paintLive(force){
+  const box=document.getElementById('liveLog');
+  if(!box) return;
+  const rebuild = force || box.dataset.painted!=='1';
+  box.dataset.painting='1';
+  if(rebuild){
+    box.textContent='';
+    let last=null;
+    for(const ev of liveEvents){
+      if(ev.kind==='reset') continue;
+      if(ev.kind==='text' && last && last.dataset.kind==='text' && last.dataset.role===(ev.role||'')){
+        last.textContent += ev.text; continue;
+      }
+      const div=document.createElement('div');
+      div.dataset.kind=ev.kind; div.dataset.role=ev.role||'';
+      div.className='live-'+(ev.kind||'text');
+      div.textContent=ev.text||'';
+      box.appendChild(div); last=div;
+    }
+    box.dataset.painted='1';
+    if(liveStick) box.scrollTop=box.scrollHeight;
+    else box.scrollTop=liveScrollTop;
+  } else {
+    let last=box.lastElementChild;
+    const start = Number(box.dataset.count||0);
+    for(let i=start;i<liveEvents.length;i++){
+      const ev=liveEvents[i];
+      if(ev.kind==='reset') continue;
+      if(ev.kind==='text' && last && last.dataset.kind==='text' && last.dataset.role===(ev.role||'')){
+        last.textContent += ev.text; continue;
+      }
+      const div=document.createElement('div');
+      div.dataset.kind=ev.kind; div.dataset.role=ev.role||'';
+      div.className='live-'+(ev.kind||'text');
+      div.textContent=ev.text||'';
+      box.appendChild(div); last=div;
+    }
+    if(liveStick) box.scrollTop=box.scrollHeight;
+  }
+  box.dataset.count=String(liveEvents.length);
+  box.dataset.painting='0';
+}
 
 async function showNew(){
   stopPoll();view={mode:'new'};
@@ -528,21 +768,23 @@ async function createTask(){
 
 async function showTask(name){
   stopPoll();view={mode:'task',name:dec(name)};
+  bindLive(view.name);
   await renderTask(view.name);
   pollTimer=setInterval(()=>renderTask(view.name),2000);
 }
 async function renderTask(name){
   // 驳回反馈/澄清输入中：跳过本轮重绘，避免 2s 轮询打断/清空输入（两个输入框独立判断）
-  const rejEl=document.getElementById('rejFb'), clEl=document.getElementById('clInput');
-  if((rejEl&&document.activeElement===rejEl)||(clEl&&document.activeElement===clEl))return;
-  const rejVal=rejEl?rejEl.value:'', clVal=clEl?clEl.value:'';
+  const rejEl=document.getElementById('rejFb'), clEl=document.getElementById('clInput'), stEl=document.getElementById('steerInput');
+  if((rejEl&&document.activeElement===rejEl)||(clEl&&document.activeElement===clEl)||(stEl&&document.activeElement===stEl))return;
+  const rejVal=rejEl?rejEl.value:'', clVal=clEl?clEl.value:'', stVal=stEl?stEl.value:'';
   const j=await api('/api/task/'+encodeURIComponent(name));
   if(!j.ok){$('#main').innerHTML=`<div class="alert err">${esc(j.error)}</div>
     <div class="actions"><button class="warn" onclick="act('reset')">↺ 重置任务（删除 .gdd，不可恢复）</button></div>`;stopPoll();return}
   // await 期间用户可能又在输入框打了字：以请求返回时的现值为准，防旧快照覆盖新输入
-  const rejNow=document.getElementById('rejFb'), clNow=document.getElementById('clInput');
+  const rejNow=document.getElementById('rejFb'), clNow=document.getElementById('clInput'), stNow=document.getElementById('steerInput');
   const rejVal2=(rejNow&&document.activeElement!==rejNow&&rejNow.value)?rejNow.value:rejVal;
   const clVal2=(clNow&&document.activeElement!==clNow&&clNow.value)?clNow.value:clVal;
+  const stVal2=(stNow&&document.activeElement!==stNow&&stNow.value)?stNow.value:stVal;
   lastDetail=j; refreshNav();
   const st=j.status, running=j.running;
   const phTxt={pending:'待进入',working:'进行中',exit_retry:'门禁重试',exit_passed:'待审批',done:'已完成'};
@@ -596,15 +838,32 @@ async function renderTask(name){
     ${st==='blocked'&&!running?'<button class="warn" onclick="act(\'retry\')">↻ 重试责任节点</button>':''}
     ${!['completed','aborted'].includes(st)?`<button class="danger" onclick="act('abort')" ${running?'disabled':''}>中止</button>`:''}
     <button class="danger" onclick="if(confirm('重置将删除 .gdd/ 全部进度（git 交付分支保留），确定？'))act('reset')" ${running?'disabled':''}>重置（删 .gdd）</button></div>`;
+  const curNode=(j.nodes||[]).find(n=>n.id===j.current);
+  const showSteer=!!(curNode&&curNode.phase==='working');
+  let steerBox='';
+  if(showSteer){
+    if(j.steer_enabled===false){
+      steerBox='<div class="hint" style="margin-top:8px">GDD_STEER=off，补充已关闭。</div>';
+    } else {
+      const q=j.steer_queued?`<span class="hint" style="align-self:center">队列中 ${esc(String(j.steer_queued))} 条未送达</span>`:'';
+      steerBox=`<div class="row" style="margin-top:10px"><textarea id="steerInput" placeholder="走向偏了就写在这里，与命令行 gdd steer 同一条队列" style="min-height:60px"></textarea></div>
+        <div class="actions"><button class="pri" onclick="sendSteer()">补充给模型</button>${q}</div>
+        <div class="hint">送达时机与命令行 gdd steer 相同：主体还在跑时，下一次工具返回后送达；出口门禁期间改为下一次主体会话。不改相位、不消耗打回。</div>`;
+    }
+  }
+  const liveHtml=`<div class="card"><b style="color:var(--dim);font-size:12px">运行进度</b><div id="liveLog" onscroll="onLiveScroll()"></div>${steerBox}</div>`;
   const hist=(j.history_tail||[]).slice().reverse().map(h=>`<tr><td class="ts">${esc(h.ts||'')}</td><td>${esc(h.event)}</td><td>${esc(h.node||'')}</td><td>${esc(typeof h.reason==='string'?h.reason.slice(0,60):(h.reason==null?'':JSON.stringify(h.reason).slice(0,60)))}</td></tr>`).join('');
   $('#main').innerHTML=`<h2>${esc(name)} <span class="tag">${esc(j.pipeline_name||'')}</span><span class="tag">${esc(st)}${running?' · 运行中':''}</span></h2>
     ${alertHtml}
     <div class="card"><div class="flow">${flow}</div>${btns}</div>
+    ${liveHtml}
     ${clarifyHtml}
     <div class="card"><b style="color:var(--dim);font-size:12px">最近事件</b><table style="margin-top:8px">${hist||'<tr><td class="ts">（无）</td></tr>'}</table></div>`;
-  const r2=document.getElementById('rejFb'), c2=document.getElementById('clInput');
+  paintLive(true);
+  const r2=document.getElementById('rejFb'), c2=document.getElementById('clInput'), s2=document.getElementById('steerInput');
   if(r2&&!r2.value&&rejVal2)r2.value=rejVal2;
   if(c2&&!c2.value&&clVal2)c2.value=clVal2;
+  if(s2&&!s2.value&&stVal2)s2.value=stVal2;
 }
 async function act(op){
   if(op==='reset'&&!confirm('确认重置？将删除 .gdd 全部状态，不可恢复。'))return;
@@ -630,6 +889,21 @@ async function sendChat(nodeId){
     // 不落盘场景下用户输入不丢失（P2-18）
     box.value='';box.blur();
     renderTask(view.name);  // 显示对话中状态（轮询刷新回复）
+  }catch(e){alert('网络异常，请重试：'+e)}
+  finally{box.dataset.busy='0'}
+}
+async function sendSteer(){
+  const box=document.getElementById('steerInput');
+  if(!box)return;
+  const msg=box.value||'';
+  if(!msg.trim()){alert('补充内容为空');return}
+  if(box.dataset.busy==='1')return;
+  box.dataset.busy='1';
+  try{
+    const j=await api('/api/task/'+encodeURIComponent(view.name)+'/action',{method:'POST',body:JSON.stringify({op:'steer',message:msg})});
+    if(!j.ok){alert(j.error||'未入队（输入已保留）');return}
+    box.value=''; box.blur();
+    renderTask(view.name);
   }catch(e){alert('网络异常，请重试：'+e)}
   finally{box.dataset.busy='0'}
 }
@@ -701,6 +975,32 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         if not self.quiet:
             super().log_message(fmt, *args)
+
+    def _stream_live(self, name: str) -> None:
+        """SSE：先推环形缓冲里已有的事件，再等新事件。断开时结束。"""
+        after = 0
+        hdr = self.headers.get("Last-Event-ID") or ""
+        if hdr.isdigit():
+            after = int(hdr)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            while True:
+                events = live_wait(name, after, 15)
+                if not events:
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                    continue
+                for ev in events:
+                    data = json.dumps(ev, ensure_ascii=False)
+                    self.wfile.write(f"id: {ev['id']}\ndata: {data}\n\n".encode("utf-8"))
+                    after = ev["id"]
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+            return
 
     # ---- helpers
     def _json(self, obj, code=200):
@@ -787,6 +1087,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "error": "模板不存在"}, 404)
             with open(tp, encoding="utf-8") as f:
                 return self._json({"ok": True, "builtin": False, "content": f.read()})
+        live = re.match(r"^/api/task/([^/]+)/live$", p)
+        if live:
+            name = unquote(live.group(1))
+            if not _safe_name(name):
+                return self._json({"ok": False, "error": "非法任务名"}, 400)
+            if not os.path.isfile(os.path.join(self.root, name, ".gdd", "state.json")):
+                return self._json({"ok": False, "error": "任务不存在"}, 404)
+            self._stream_live(name)
+            return
         if p.startswith("/api/task/"):
             name = unquote(p.split("/", 3)[3])
             if not _safe_name(name):
@@ -851,7 +1160,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"ok": False, "error": "非法任务名"}, 400)
                 op = str(body.get("op", ""))
                 fb = str(body.get("feedback", ""))
-                if op not in ("run", "approve", "reject", "retry", "abort", "reset", "chat", "clarify_done"):
+                if op not in ("run", "approve", "reject", "retry", "abort", "reset", "chat", "clarify_done", "steer"):
                     return self._json({"ok": False, "error": f"未知操作: {op}"}, 400)
                 return self._json(_do_action(self.root, name, op, fb, extra=body))
         except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, ImportError, json.JSONDecodeError) as e:

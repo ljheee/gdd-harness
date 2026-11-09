@@ -548,6 +548,15 @@ class Orchestrator:
             except Exception:
                 pass  # 呈现层异常不得影响引擎主流程
 
+    def _present(self, event: str, **kw) -> None:
+        """只通知呈现层（Web 滚动区的阶段行）。不写 history，不改状态。"""
+        if not self.on_event:
+            return
+        try:
+            self.on_event(event, **kw)
+        except Exception:
+            pass
+
     # ------------------------------------------------------------ 工具
 
     def _log_path(self, node: NodeSpec, kind: str) -> str:
@@ -1287,6 +1296,7 @@ class Orchestrator:
     # ------------------------------------------------------------ 相位处理
 
     def _phase_entry(self, node: NodeSpec, ns: Dict, runner: AgentRunner) -> bool:
+        self._present("ui_phase", phase="entry", node=node.id, name=node.name)
         verdict = gates.run_gate("entry", node, self.root, runner, log_path=self._log_path(node, "entry"))
         self._check_tamper("entry_gate")  # 会话/机器命令可能篡改 .gdd，校验并恢复
         if verdict.passed:
@@ -1374,6 +1384,7 @@ class Orchestrator:
             else:
                 prompt = (f"[[GDD-ROLE:subject node:{node.id}]]\n"
                           f"上轮会话中断，请继续完成本节点工作（产物与报告路径不变）。")
+            self._present("ui_phase", phase="subject", node=node.id, name=node.name)
             stream_cb = _subject_stream_cb()
             session = self._subject_run(
                 runner, prompt, node, "subject_resume",
@@ -1390,6 +1401,7 @@ class Orchestrator:
                 self._pop_subject_group_sid(group)
                 resume_sid = ""
         if not resume_sid:
+            self._present("ui_phase", phase="subject", node=node.id, name=node.name)
             prompt = gates.build_subject_prompt(node, self.pipeline, upstream, feedback, raw_req)
             stream_cb = _subject_stream_cb()  # 与 resume 轮隔离：截断额度重新起算
             session = self._subject_run(
@@ -1468,6 +1480,7 @@ class Orchestrator:
 
         change_summary = self._change_summary(node.id) if node.exit.change_aware else ""
         # 上轮打回项：交由 exit 门禁逐项核验（首轮跑 exit 时无打回，天然为空）
+        self._present("ui_phase", phase="exit", node=node.id, name=node.name)
         verdict = gates.run_gate("exit", node, self.root, runner,
                                  change_summary=change_summary,
                                  log_path=self._log_path(node, "exit"),
@@ -1570,6 +1583,7 @@ class Orchestrator:
 
     def _phase_exit_retry(self, node: NodeSpec, ns: Dict, runner: AgentRunner) -> bool:
         """门禁自身故障后的重试：直接重跑 exit 门禁（主体产物保持不变）。"""
+        self._present("ui_phase", phase="exit", node=node.id, name=node.name)
         change_summary = self._change_summary(node.id) if node.exit.change_aware else ""
         pending_fb = self.state["feedbacks"].get(node.id, "")  # 故障重试同样要核验上轮打回项
         pending_kind = self.state.get("feedback_kinds", {}).get(node.id, "")
@@ -1984,6 +1998,7 @@ class Orchestrator:
                                     else ctx["resume_sid"])
             raw_req = self.input_path if os.path.exists(self.input_path) else ""
             self._dialog_append(node.id, "user", message)
+            self._present("ui_phase", phase="clarify", node=node.id, name=node.name)
 
             def _run_one(sid: str) -> Any:
                 prompt = gates.build_clarify_prompt(
