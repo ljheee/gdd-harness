@@ -17,7 +17,8 @@ import time
 from typing import List
 
 # Claude Code 对 additionalContext 有长度上限（超出后只给预览）。
-# 前缀加上正文停在 8000 以内，避免 hook 把原文消费掉却只送出摘要。
+# hook 发出的是前缀加正文，两者一起停在 8000 以内；超出的正文留在队列。
+# 会话结束时的 --resume 补送写进 prompt，仍按 8000 取正文。
 MAX_CHARS = 8000
 _DRAIN_LIMIT = 8000
 _CONTEXT_PREFIX = (
@@ -293,7 +294,7 @@ def hook_main(queue_file: str) -> int:
     except Exception:
         pass
     try:
-        body = _drain_path(queue_file)
+        body = _drain_path(queue_file, limit=MAX_CHARS - len(_CONTEXT_PREFIX))
     except Exception:
         return 0
     if not body:

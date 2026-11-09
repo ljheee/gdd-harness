@@ -93,6 +93,20 @@ def _is_plugin(path: str) -> bool:
     return os.path.isfile(os.path.join(path, ".claude-plugin", "plugin.json"))
 
 
+def _assert_skill_links(skill_dir: str) -> None:
+    """目录本身在项目内不够：copytree 会跟随符号链接，把目录外的文件拷成普通文件。"""
+    root_real = os.path.realpath(skill_dir)
+    for dirpath, dirnames, filenames in os.walk(skill_dir, followlinks=False):
+        for name in list(dirnames) + list(filenames):
+            full = os.path.join(dirpath, name)
+            if not os.path.islink(full):
+                continue
+            resolved = os.path.realpath(full)
+            if not _within_root(root_real, resolved):
+                rel = os.path.relpath(full, skill_dir)
+                raise ValueError(f"skill 内的符号链接不能指向目录外: {rel}")
+
+
 def _load_mcp_file(path: str) -> Dict[str, dict]:
     try:
         with open(path, encoding="utf-8") as f:
@@ -111,10 +125,14 @@ def _load_mcp_file(path: str) -> Dict[str, dict]:
 
 
 def _file_server(name: str, spec: dict, path: str) -> dict:
-    """文件里的 server 与内联条目同一套约束，额外字段（如 timeout）保留。"""
+    """文件里的 server 与内联条目同一套约束。只写出核对过的字段。"""
     if not _MCP_NAME_RE.fullmatch(name):
         raise ValueError(
             f"非法 MCP 名字: {name!r}（{path}；字母或数字开头，仅字母数字_-）")
+    unknown = sorted(k for k in spec if k not in {
+        "command", "args", "env", "type", "url", "headers", "timeout"})
+    if unknown:
+        raise ValueError(f"MCP {name} 含未支持的字段: {', '.join(unknown)}（{path}）")
     command = spec.get("command") or ""
     url = spec.get("url") or ""
     if command and not isinstance(command, str):
@@ -123,6 +141,7 @@ def _file_server(name: str, spec: dict, path: str) -> dict:
         raise ValueError(f"MCP {name} 的 url 必须是字符串（{path}）")
     if bool(command) == bool(url):
         raise ValueError(f"MCP {name} 必须且只能指定 command 或 url（{path}）")
+    side = _file_side_fields(name, spec, path)
     if url:
         if any(c in url for c in "\n\r\x00") or not (
                 url.startswith("https://") or url.startswith("http://")):
@@ -130,17 +149,30 @@ def _file_server(name: str, spec: dict, path: str) -> dict:
         kind = spec.get("type")
         if kind not in ("http", "sse"):
             raise ValueError(f"MCP {name} 的 url 必须带 type（http 或 sse）（{path}）")
-        if spec.get("headers"):
-            _str_map(spec.get("headers"), "headers")
-        return dict(spec)
+        return {"type": kind, "url": url, **side}
     _no_inject(command, "mcp command")
-    args = spec.get("args") or []
-    if not isinstance(args, list) or any(
-            not isinstance(a, str) or any(c in a for c in "\n\r\x00") for a in args):
-        raise ValueError(f"MCP {name} 的 args 必须是不含换行的字符串列表（{path}）")
+    return {"command": command, **side}
+
+
+def _file_side_fields(name: str, spec: dict, path: str) -> dict:
+    """command 与 url 两条路径都检查 args、env、headers，避免换行从另一侧漏进去。"""
+    out: dict = {}
+    if spec.get("args") not in (None, []):
+        args = spec.get("args")
+        if not isinstance(args, list) or any(
+                not isinstance(a, str) or any(c in a for c in "\n\r\x00") for a in args):
+            raise ValueError(f"MCP {name} 的 args 必须是不含换行的字符串列表（{path}）")
+        out["args"] = list(args)
     if spec.get("env"):
-        _str_map(spec.get("env"), "env")
-    return dict(spec)
+        out["env"] = _str_map(spec.get("env"), "env")
+    if spec.get("headers"):
+        out["headers"] = _str_map(spec.get("headers"), "headers")
+    if "timeout" in spec and spec.get("timeout") is not None:
+        timeout = spec["timeout"]
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 0:
+            raise ValueError(f"MCP {name} 的 timeout 必须是非负数字（{path}）")
+        out["timeout"] = timeout
+    return out
 
 
 def _set_frontmatter_name(text: str, name: str) -> str:
@@ -232,6 +264,7 @@ def prepare(root: str, node: NodeSpec) -> Optional[NodeExtensions]:
                 continue
             if not os.path.isfile(os.path.join(path, "SKILL.md")):
                 raise ValueError(f"skill 目录缺少 SKILL.md: {spec.path}")
+            _assert_skill_links(path)
             name = _skill_name(spec, path, used)
             target = os.path.join(skill_root, name)
             shutil.copytree(path, target)

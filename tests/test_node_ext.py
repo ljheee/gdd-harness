@@ -194,6 +194,45 @@ def main():
         staged_text = f.read()
     check("name: tester" in staged_text.split("---", 2)[1], "指定的 skill 名字写进 SKILL.md")
 
+    def reject_file(servers, needle):
+        with open(os.path.join(proj, "mcp-bad.json"), "w", encoding="utf-8") as f:
+            json.dump({"mcpServers": servers}, f)
+        bad = PipelineSpec.from_dict({
+            "id": "p", "name": "p",
+            "nodes": [{"id": "work", "name": "干活", "mcp": ["mcp-bad.json"]}],
+        }).nodes[0]
+        try:
+            prepare(proj, bad)
+        except ValueError as e:
+            return needle in str(e)
+        return False
+
+    check(reject_file(
+        {"fs": {"command": "echo", "headers": {"X": "a\r\nInjected: b"}}}, "headers"),
+          "command server 的 headers 不能含换行")
+    check(reject_file(
+        {"remote": {"type": "http", "url": "https://example.com/mcp", "env": {"TOKEN": "a\nb"}}},
+        "env"), "http server 的 env 不能含换行")
+    check(reject_file(
+        {"remote": {"type": "http", "url": "https://example.com/mcp", "args": ["a\nb"]}},
+        "args"), "http server 的 args 不能含换行")
+
+    outside_file = os.path.join(tempfile.mkdtemp(prefix="gdd-node-ext-secret-"), "secret.md")
+    with open(outside_file, "w", encoding="utf-8") as f:
+        f.write("OUTSIDE-SECRET")
+    linked_skill = os.path.join(proj, "skills", "linked-file")
+    os.makedirs(linked_skill, exist_ok=True)
+    os.symlink(outside_file, os.path.join(linked_skill, "SKILL.md"))
+    leaked = PipelineSpec.from_dict({
+        "id": "p", "name": "p",
+        "nodes": [{"id": "work", "name": "干活", "skills": ["skills/linked-file"]}],
+    }).nodes[0]
+    try:
+        prepare(proj, leaked)
+        check(False, "skill 内指向目录外的符号链接应拒绝")
+    except ValueError as e:
+        check("符号链接" in str(e), "skill 内指向目录外的符号链接要说明原因")
+
     print("[N3] 只有 Claude 命令挂 MCP 和 skill")
     os.environ["GDD_AGENT_BIN"] = "claude"
     os.environ.pop("GDD_AGENT_PRE_ARGS", None)

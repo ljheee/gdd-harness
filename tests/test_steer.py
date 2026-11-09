@@ -67,6 +67,17 @@ def main():
         capture_output=True, text=True, timeout=10,
     )
     check(hook2.returncode == 0 and hook2.stdout.strip() == "", "空队列 hook 无输出")
+    full = "测" * steer.MAX_CHARS
+    steer.append(proj, full)
+    hook3 = subprocess.run(
+        [sys.executable, os.path.join(ROOT, "gdd", "steer.py"), "hook", qpath],
+        input="{}",
+        capture_output=True, text=True, timeout=10,
+    )
+    ctx3 = json.loads(hook3.stdout)["hookSpecificOutput"]["additionalContext"]
+    left = steer.pending(proj)
+    check(len(ctx3) <= steer.MAX_CHARS, f"含前缀的 additionalContext 不超过 {steer.MAX_CHARS}（{len(ctx3)}）")
+    check(left and full == (ctx3[len(steer._CONTEXT_PREFIX):] + left), "超出前缀预算的正文仍留在队列")
 
     print("[S2] steer 不拿编排锁")
     gdd_dir = os.path.join(proj, ".gdd")
