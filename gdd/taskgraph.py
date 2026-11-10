@@ -98,7 +98,8 @@ def _normalize_line(line: str) -> str:
 
 
 def _section(text: str) -> str:
-    start = text.find(SECTION)
+    """取最后一节附录。前面的同名标题通常是示例，真正的任务写在文末。"""
+    start = text.rfind(SECTION)
     if start < 0:
         return ""
     rest = text[start + len(SECTION):]

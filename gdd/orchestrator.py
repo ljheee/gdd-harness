@@ -1507,6 +1507,8 @@ class Orchestrator:
                 ns.pop("adversarial_done", None)
                 ns.pop("env_retries", None)
                 ns.pop("decision_rewrites", None)
+                # 修订后的方案要重新开发。旧的完成记录和核销文件不能把任务直接放行。
+                self._reset_task_progress(ns)
             if n.id == end:
                 passed_end = True
         self.state["current"] = ids[0]
@@ -1836,20 +1838,17 @@ class Orchestrator:
         if graph is None:
             return None
         if graph.error:
-            self._record("task_graph_invalid", node=node.id, reason=graph.error[:200])
-            self._reset_task_progress(ns)
-            return self._bounce_to_previous(node, gates.Verdict(
-                passed=False, reason=graph.error,
-                feedback="方案附录「任务依赖」需要改成无环的依赖拆分后再开发：" + graph.error))
+            return self._reject_task_graph(
+                node, ns, graph.error,
+                "方案附录「任务依赖」需要改成无环的依赖拆分后再开发：" + graph.error)
+        ns.pop("task_graph_rejects", None)
         done = self._reconcile_done_tasks(ns, graph)
         ready = graph.ready(done)
         if not ready:
             if len(done) < len(graph.tasks):
-                self._record("task_graph_stuck", node=node.id)
-                self._reset_task_progress(ns)
-                return self._bounce_to_previous(node, gates.Verdict(
-                    passed=False, reason="任务依赖无法继续",
-                    feedback="还有任务没做，但它们的依赖没有全部完成。请检查附录里的依赖。"))
+                return self._reject_task_graph(
+                    node, ns, "任务依赖无法继续",
+                    "还有任务没做，但它们的依赖没有全部完成。请检查附录里的依赖。")
             if feedback:
                 # 出口打回时任务已经跑完，回到单会话按反馈改，避免把做完的任务再并行一遍。
                 return None
@@ -1903,6 +1902,8 @@ class Orchestrator:
                 return SessionResult(ok=False, error=str(e))
 
         logs = {task.id: self._log_path(node, f"task-{task.id}") for task in ready}
+        for task in ready:
+            self._discard_task_note(task.id)
         from . import steer as steer_mod
         steer_mod.mark_subject(self.root, True)
         try:
@@ -1915,12 +1916,15 @@ class Orchestrator:
         failed = []
         continued = []
         missing_note = []
+        judged = []
         continues = dict(ns.get("task_continues") or {})
         misses = dict(ns.get("task_note_misses") or {})
         sig = dict(ns.get("task_sig") or {})
         for task, session in zip(ready, results):
-            if session.session_id:
+            if session.session_id and (session.ok or session.turns_exhausted):
                 sessions[f"task:{task.id}"] = session.session_id
+            elif not session.ok:
+                sessions.pop(f"task:{task.id}", None)
             if session.ok and self._task_note(task.id):
                 self._record("task_done", node=node.id, task=task.id, ok=True)
                 done.add(task.id)
@@ -1931,6 +1935,7 @@ class Orchestrator:
                     node, type(runner)(self.root), session, lambda: base_cb)
                 if session.session_id:
                     sessions[f"task:{task.id}"] = session.session_id
+                judged.append((task, session))
             elif session.ok:
                 misses[task.id] = misses.get(task.id, 0) + 1
                 missing_note.append(task)
@@ -1959,6 +1964,8 @@ class Orchestrator:
                 passed=False, gate_error=True,
                 reason=f"任务 {task.id} 会话失败: {session.error}",
                 feedback=f"任务 {task.id} 没有完成（{str(session.error)[:200]}）。已完成的任务不用重做。"))
+        if any(session.ok for session in results):
+            self._clear_gate_error_streak()
         if any(misses.get(task.id, 0) >= 2 for task in missing_note):
             task = next(task for task in missing_note if misses.get(task.id, 0) >= 2)
             return self._bounce_current(node, gates.Verdict(
@@ -1967,11 +1974,8 @@ class Orchestrator:
                           "请写上：ID｜处理结果｜代码位置｜证据｜待办。没有核销行不能算完成。")))
         if missing_note or continued:
             return True
-        self._clear_gate_error_streak()
         routed = None
-        for task, session in zip(ready, results):
-            if not session.ok:
-                continue
+        for task, session in judged:
             decided = self._after_subject(node, ns, runner, session)
             if decided is not None and routed is None:
                 routed = decided
@@ -2015,8 +2019,40 @@ class Orchestrator:
         except OSError:
             return ""
 
+    def _discard_task_note(self, task_id: str) -> None:
+        path = os.path.join(self.root, ".gdd", "task-results", f"{task_id}.md")
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    def _discard_task_notes(self) -> None:
+        folder = os.path.join(self.root, ".gdd", "task-results")
+        if not os.path.isdir(folder):
+            return
+        for name in os.listdir(folder):
+            try:
+                os.remove(os.path.join(folder, name))
+            except OSError:
+                pass
+
+    def _reject_task_graph(self, node: NodeSpec, ns: Dict, reason: str, feedback: str) -> bool:
+        """附录不可用时退回方案。计数挂在开发节点上，避免下游入口通过把上游计数清零后永远打不回。"""
+        self._reset_task_progress(ns)
+        rejects = int(ns.get("task_graph_rejects") or 0) + 1
+        ns["task_graph_rejects"] = rejects
+        self._record("task_graph_invalid", node=node.id, reason=reason[:200], n=rejects)
+        if rejects >= node.max_bounces:
+            self.state["status"] = "blocked"
+            self.state["blocked_reason"] = f"任务依赖连续 {rejects} 次无法使用：{reason[:300]}"
+            self.state["blocked_owner"] = node.id
+            self._save()
+            return False
+        return self._bounce_to_previous(node, gates.Verdict(
+            passed=False, reason=reason, feedback=feedback))
+
     def _reset_task_progress(self, ns: Dict) -> None:
-        """附录要重写时，旧任务 ID 不能继续当成已完成。"""
+        """附录要重写时，旧任务 ID 和旧核销文件都不能继续当成已完成。"""
         ns.pop("tasks_done", None)
         ns.pop("task_sig", None)
         ns.pop("task_continues", None)
@@ -2025,6 +2061,7 @@ class Orchestrator:
         for key in list(sessions):
             if str(key).startswith("task:"):
                 sessions.pop(key, None)
+        self._discard_task_notes()
 
     def _reconcile_done_tasks(self, ns: Dict, graph) -> set:
         """同一个 ID 的标题或依赖变了，就不再算做完。"""
@@ -2037,6 +2074,7 @@ class Orchestrator:
                 done.discard(tid)
                 sig.pop(tid, None)
                 sessions.pop(f"task:{tid}", None)
+                self._discard_task_note(tid)
         ns["tasks_done"] = [task.id for task in graph.tasks if task.id in done]
         ns["task_sig"] = {tid: sig[tid] for tid in ns["tasks_done"] if tid in sig}
         return done

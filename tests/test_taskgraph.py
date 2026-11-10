@@ -47,6 +47,10 @@ def test_parse():
     check(not wide.error and wide.tasks[0].id == "T1", "全角竖线也能解析")
     bad_row = parse("## 附录：任务依赖\n- T1 | ??? | 窗口\n")
     check(bad_row.error, "有竖线但写坏的行仍然拒绝")
+    later = parse(
+        "## 附录：任务依赖\n- EX | - | 示例\n\n## ADR\n"
+        "## 附录：任务依赖\n- T1 | - | 真正的任务\n")
+    check(not later.error and [t.id for t in later.tasks] == ["T1"], "只采用最后一节附录")
     print("[P] PASS\n")
 
 
@@ -57,11 +61,16 @@ class ParRunner:
     fail = ""
     exhaust_left = 0
     skip_note = ""
+    grade_on_steer = False
 
     def __init__(self, root):
         self.root = root
 
     def run(self, prompt, *, allowed_tools, max_turns, log_path=None, resume_sid="", on_stream=None):
+        if ParRunner.grade_on_steer and "用户在主体执行过程中补充了信息" in prompt:
+            return SessionResult(
+                ok=True, session_id="steer", turns=1,
+                text='GDD-GRADE: {"level":"L0","clause":"接口","fact":"改成异步","basis":"已确认"}')
         marker = "[[GDD-TASK:"
         if marker not in prompt:
             return SessionResult(ok=True, text="gate", session_id="g", turns=1)
@@ -91,12 +100,14 @@ class ParRunner:
         return SessionResult(ok=True, text="done " + tid, session_id="s-" + tid, turns=1)
 
 
-def _orch(plan, fail="", with_plan=False):
+def _orch(plan, fail="", with_plan=False, clarify=False):
     root = tempfile.mkdtemp(prefix="gdd-task-")
     os.makedirs(os.path.join(root, "docs"))
     with open(os.path.join(root, "docs", "plan.md"), "w", encoding="utf-8") as f:
         f.write(plan)
     nodes = []
+    if clarify:
+        nodes.append({"id": "clarify", "name": "需求澄清"})
     if with_plan:
         nodes.append({"id": "plan", "name": "方案设计"})
     nodes.append({"id": "implement", "name": "开发实现", "baseline_marker": True})
@@ -113,6 +124,7 @@ def _orch(plan, fail="", with_plan=False):
     ParRunner.fail = fail
     ParRunner.exhaust_left = 0
     ParRunner.skip_note = ""
+    ParRunner.grade_on_steer = False
     o = Orchestrator(root)
     o.init(pipe, "r")
     o.load()
@@ -262,6 +274,148 @@ def test_cycle_returns_to_plan():
     print("[C] PASS\n")
 
 
+def test_stale_note_does_not_finish_a_rewritten_task():
+    print("[R] 旧核销文件不能把改写后的任务标成完成")
+    o, orig, root = _orch(PLAN)
+    import gdd.orchestrator as orch
+    try:
+        o.step()
+        check(o.step() is True, "先做完第一批")
+        note = os.path.join(root, ".gdd", "task-results", "T1.md")
+        check(os.path.isfile(note), "T1 有核销文件")
+        with open(os.path.join(root, "docs", "plan.md"), "w", encoding="utf-8") as f:
+            f.write(PLAN.replace("先做甲", "新标题必须重做"))
+        ParRunner.skip_note = "T1"
+        ParRunner.events = []
+        check(o.step() is True, "改写后的 T1 会再跑")
+        done = set(o.state["node_states"]["implement"].get("tasks_done") or [])
+        check("T1" not in done, "没有新核销行就不算完成")
+        check(not any(tid == "T3" for tid, _, _ in ParRunner.events), "T3 不会被旧核销放开")
+    finally:
+        orch.AgentRunner = orig
+    print("[R] PASS\n")
+
+
+def test_revision_clears_finished_tasks():
+    print("[V] 定级修订后开发任务要重做")
+    one = "## 附录：任务依赖\n- T1 | - | 实现接口\n"
+    o, orig, root = _orch(one, clarify=True)
+    import gdd.orchestrator as orch
+    try:
+        for _ in range(8):
+            if "T1" in set(o.state["node_states"]["implement"].get("tasks_done") or []):
+                break
+            o.step()
+        check("T1" in set(o.state["node_states"]["implement"].get("tasks_done") or []),
+              "修订前 T1 已完成")
+        note = os.path.join(root, ".gdd", "task-results", "T1.md")
+        check(os.path.isfile(note), "修订前核销文件还在")
+        check(o._start_revision("implement", reason="L0", confirmed=["L0|接口|改成异步"]) is True,
+              "修订能启动")
+        ns = o.state["node_states"]["implement"]
+        check(not ns.get("tasks_done"), "完成记录清掉")
+        check(ns.get("phase") == "pending", "开发阶段回到待进入")
+        check(not os.path.isfile(note), "旧核销文件删掉")
+    finally:
+        orch.AgentRunner = orig
+    print("[V] PASS\n")
+
+
+def test_invalid_appendix_eventually_blocks():
+    print("[L] 附录一直不可用时会停住，而不是来回打回")
+    bad = "## 附录：任务依赖\n这里只有说明。\n## 后面\n- T1 | - | 真任务\n"
+    o, orig, _root = _orch(bad, with_plan=True)
+    import gdd.orchestrator as orch
+    try:
+        blocked = False
+        for _ in range(24):
+            if o.state["status"] == "blocked":
+                blocked = True
+                break
+            o.step()
+        check(blocked, "连续无法排期后停住")
+        check("任务依赖" in (o.state.get("blocked_reason") or ""), "停住原因是任务依赖")
+        check(o.state["node_states"]["implement"].get("task_graph_rejects", 0) >= 3,
+              "计数挂在开发节点上")
+    finally:
+        orch.AgentRunner = orig
+    print("[L] PASS\n")
+
+
+def test_failed_task_session_is_not_resumed():
+    print("[E] 失败的任务会话下一次重新开始")
+    one = "## 附录：任务依赖\n- T1 | - | 单独一项\n"
+    o, orig, _root = _orch(one, fail="T1")
+    import gdd.orchestrator as orch
+    try:
+        o.step()
+        check(o.step() is True, "第一次失败先重试")
+        sessions = o.state["node_states"]["implement"].get("sessions") or {}
+        check("task:T1" not in sessions, "失败会话不留下可续跑的 id")
+        ParRunner.fail = ""
+        ParRunner.resumes = []
+        check(o.step() is True, "下一次做完")
+        check(not ParRunner.resumes, "没有续跑上次失败的会话")
+        check("T1" in set(o.state["node_states"]["implement"].get("tasks_done") or []),
+              "新会话成功才记完成")
+    finally:
+        orch.AgentRunner = orig
+    print("[E] PASS\n")
+
+
+def test_ok_without_note_clears_fault_streak():
+    print("[K] 会话成功但没写核销，不算一次故障")
+    one = "## 附录：任务依赖\n- T1 | - | 单独一项\n"
+    o, orig, _root = _orch(one, fail="T1")
+    import gdd.orchestrator as orch
+    try:
+        o.step()
+        check(o.step() is True, "先记一次会话故障")
+        check(o.state.get("gate_error_streak") == 1, "故障计数是 1")
+        ParRunner.fail = ""
+        ParRunner.skip_note = "T1"
+        check(o.step() is True, "接着一次成功但没有核销")
+        check(not o.state.get("gate_error_streak"), "这次把故障计数清掉")
+        ParRunner.skip_note = ""
+        ParRunner.fail = "T1"
+        check(o.step() is True, "再失败一次")
+        check(o.state.get("gate_error_streak") == 1, "重新从 1 计数")
+        check(o.state["status"] != "blocked", "不会因为中间那次成功被判成连续故障")
+    finally:
+        orch.AgentRunner = orig
+    print("[K] PASS\n")
+
+
+def test_grade_in_steer_fallback_pauses():
+    print("[G] 补充会话里的定级也会停下等人确认")
+    one = "## 附录：任务依赖\n- T1 | - | 实现接口\n"
+    o, orig, root = _orch(one)
+    import gdd.orchestrator as orch
+    from gdd import steer
+    old_steer = os.environ.get("GDD_STEER")
+    old_resume = os.environ.get("GDD_SUBJECT_RESUME")
+    os.environ["GDD_STEER"] = "on"
+    os.environ["GDD_SUBJECT_RESUME"] = "on"
+    try:
+        ParRunner.grade_on_steer = True
+        steer.append(root, "请确认改成异步")
+        check(o.step() is True, "先过入口")
+        check(o.step() is False, "补充会话给出 L0 后停下")
+        check(o.state["status"] == "awaiting_approval", "等确认")
+        check((o.state.get("pending_approval") or {}).get("kind") == "grade", "等的是定级")
+    finally:
+        orch.AgentRunner = orig
+        if old_steer is None:
+            os.environ.pop("GDD_STEER", None)
+        else:
+            os.environ["GDD_STEER"] = old_steer
+        if old_resume is None:
+            os.environ.pop("GDD_SUBJECT_RESUME", None)
+        else:
+            os.environ["GDD_SUBJECT_RESUME"] = old_resume
+    print("[G] PASS\n")
+
+
 if __name__ == "__main__":
     test_parse()
     test_parallel_waves()
@@ -270,4 +424,10 @@ if __name__ == "__main__":
     test_missing_note_is_not_done()
     test_rewritten_task_runs_again()
     test_cycle_returns_to_plan()
+    test_stale_note_does_not_finish_a_rewritten_task()
+    test_revision_clears_finished_tasks()
+    test_invalid_appendix_eventually_blocks()
+    test_failed_task_session_is_not_resumed()
+    test_ok_without_note_clears_fault_streak()
+    test_grade_in_steer_fallback_pauses()
     print("ALL PASS")
