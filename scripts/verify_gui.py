@@ -417,7 +417,9 @@ def check_8765_reuse(bundle: Path, python: str) -> int:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def check_error_dialogs(bundle: Path, python: str, evidence: Path) -> int:
+def check_error_dialogs(
+    bundle: Path, python: str, evidence: Path, port_override: int | None = None
+) -> int:
     """D9/D11 GUI 错误对话框可见性验证（不设置 NO_DIALOG，直接观察窗口）。"""
     if app_pid(bundle) is not None:
         print("FAIL: 已有 GDD Console 在运行，无法做错误对话框隔离验证")
@@ -486,17 +488,17 @@ def check_error_dialogs(bundle: Path, python: str, evidence: Path) -> int:
         config_dir = tmp / "config"
         log_dir = tmp / "logs"
         write_config(config_dir, gdd, python, workbench)
-        port = free_port()
+        port = port_override or free_port()
         dummy = start_dummy(port)
-        launch(
-            bundle,
-            [
-                ("GDD_CONSOLE_CONFIG_DIR", str(config_dir)),
-                ("GDD_CONSOLE_LOG_DIR", str(log_dir)),
-                ("GDD_CONSOLE_TEST_PORT", str(port)),
-                ("GDD_CONSOLE_TEST_NO_DIALOG", "0"),
-            ],
-        )
+        error_env = [
+            ("GDD_CONSOLE_CONFIG_DIR", str(config_dir)),
+            ("GDD_CONSOLE_LOG_DIR", str(log_dir)),
+            ("GDD_CONSOLE_TEST_NO_DIALOG", "0"),
+        ]
+        # 8765 是生产默认端口：不注入测试覆盖，走 app 的生产默认路径。
+        if port != 8765:
+            error_env.insert(2, ("GDD_CONSOLE_TEST_PORT", str(port)))
+        launch(bundle, error_env)
         pid = wait_app_pid(bundle)
         wait_logged(log_dir / "app.log", r"event=dialog_shown", 15)
         windows = wait_visible_windows(pid, is_alert_window, 10)
@@ -553,6 +555,12 @@ def main() -> int:
         action="store_true",
         help="验证 D9/D11 的原生错误对话框可见性",
     )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="固定端口（默认随机；8765 空闲时传 8765 做字面生产端口验证，不注入测试端口覆盖）",
+    )
     args = parser.parse_args()
 
     bundle = Path(args.app)
@@ -566,7 +574,7 @@ def main() -> int:
     if args.check_8765_reuse:
         return check_8765_reuse(bundle, python)
     if args.check_error_dialogs:
-        return check_error_dialogs(bundle, python, evidence)
+        return check_error_dialogs(bundle, python, evidence, args.port)
 
     tmp = Path(tempfile.mkdtemp(prefix="gdd-console-gui-")).resolve()
     gdd = tmp / "gdd-src"
@@ -578,7 +586,7 @@ def main() -> int:
     config_dir = tmp / "config"
     log_dir = tmp / "logs"
     write_config(config_dir, gdd, python, workbench)
-    port = free_port()
+    port = args.port or free_port()
     task = f"task-{uuid.uuid4().hex[:8]}"
 
     env = os.environ.copy()
@@ -609,17 +617,17 @@ def main() -> int:
         external.wait(timeout=5)
         wait_port_free(port)
 
-        launch(
-            bundle,
-            [
-                ("GDD_CONSOLE_CONFIG_DIR", str(config_dir)),
-                ("GDD_CONSOLE_LOG_DIR", str(log_dir)),
-                ("GDD_CONSOLE_TEST_PORT", str(port)),
-                ("GDD_CONSOLE_TEST_NO_DIALOG", "1"),
-                ("GDD_CONSOLE_TEST_DUMP_PAGE", "1"),
-                ("GDD_CONSOLE_TEST_CLOSE_AFTER_READY", "1"),
-            ],
-        )
+        gui_env = [
+            ("GDD_CONSOLE_CONFIG_DIR", str(config_dir)),
+            ("GDD_CONSOLE_LOG_DIR", str(log_dir)),
+            ("GDD_CONSOLE_TEST_NO_DIALOG", "1"),
+            ("GDD_CONSOLE_TEST_DUMP_PAGE", "1"),
+            ("GDD_CONSOLE_TEST_CLOSE_AFTER_READY", "1"),
+        ]
+        # 8765 是生产默认端口：不注入测试覆盖，走 app 的生产默认路径。
+        if port != 8765:
+            gui_env.insert(2, ("GDD_CONSOLE_TEST_PORT", str(port)))
+        launch(bundle, gui_env)
         url = wait_window(log_dir / "app.log")
         if url != f"http://127.0.0.1:{port}/":
             failures.append(f"窗口 URL 不符：{url}")

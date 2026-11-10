@@ -224,9 +224,12 @@ def run_app(
             "GDD_CONSOLE_LOG_DIR": str(log_dir),
             "GDD_CONSOLE_TEST_HEADLESS": "1",
             "GDD_CONSOLE_TEST_NO_DIALOG": "1",
-            "GDD_CONSOLE_TEST_PORT": str(port),
         }
     )
+    # 8765 是 app 的生产默认端口：此时不注入测试端口覆盖，
+    # 让 app 走“未设置环境变量”的生产路径（D2/D3/D11 字面验证）。
+    if port != 8765:
+        env["GDD_CONSOLE_TEST_PORT"] = str(port)
     if extra_env:
         env.update(extra_env)
     return subprocess.run(
@@ -590,15 +593,28 @@ def d7(tmp: Path, app_bin: Path, python: str) -> str:
     task1 = f"task-{uuid.uuid4().hex[:8]}"
     task2 = f"task-{uuid.uuid4().hex[:8]}"
 
+    # Gherkin 要求 R1/T1 与 R2/T2 在查询 R1 之前都已存在。
+    # 先后用真实控制台 API 在工作台预置任务（每次创建后立即校验该工作台仅含自己的任务），
+    # 然后才启动 app 查询 R1；这样“R1 不列出 T2”才是有意义的断言。
+    for workbench, task in ((r1, task1), (r2, task2)):
+        pre = start_external_console(python, gdd, workbench, port)
+        try:
+            create_task(port, task)
+            names = [item["name"] for item in get_json(port, "/api/overview")["tasks"]]
+            check(names == [task], f"预置 {workbench.name} 任务列表异常：{names}")
+        finally:
+            stop_external(pre)
+            wait_port_free(port)
+
     write_config(config_dir, gdd, python, r1)
     proc = run_app(app_bin, config_dir, log_dir, port)
     check(proc.returncode == 0, f"R1 启动失败：{read_log(log_dir)[-800:]}")
     ready = parse_ready(read_log(log_dir))
     pid1 = int(ready["pid"])
     try:
-        create_task(port, task1)
         names1 = [item["name"] for item in get_json(port, "/api/overview")["tasks"]]
-        check(names1 == [task1], f"R1 任务列表异常：{names1}")
+        check(names1 == [task1], f"R1 任务列表异常（应仅 T1，T2 已存在于 R2）：{names1}")
+        check(task2 not in names1, f"R1 不应列出 R2 的任务 {task2}：{names1}")
         # 页面由同一 overview 数据驱动（任务名在前端渲染，不在静态 HTML 中；
         # 页面 JS 使用相对路径 api('api/overview')）。
         check("api/overview" in get_text(port, "/"), "页面应通过 overview 接口加载任务列表")
@@ -613,10 +629,13 @@ def d7(tmp: Path, app_bin: Path, python: str) -> str:
     ready2 = parse_ready(read_log(log_dir2))
     pid2 = int(ready2["pid"])
     try:
-        create_task(port, task2)
         names2 = [item["name"] for item in get_json(port, "/api/overview")["tasks"]]
-        check(names2 == [task2], f"R2 任务列表异常：{names2}")
-        return f"R1 仅列 {task1}；R2 仅列 {task2}"
+        check(names2 == [task2], f"R2 任务列表异常（应仅 T2，T1 已存在于 R1）：{names2}")
+        check(task1 not in names2, f"R2 不应列出 R1 的任务 {task1}：{names2}")
+        return (
+            f"预置 R1={task1}、R2={task2}（均在查询前创建）；"
+            f"R1 仅列 {task1} 不列 {task2}；R2 仅列 {task2} 不列 {task1}"
+        )
     finally:
         terminate(pid2)
         wait_port_free(port)
