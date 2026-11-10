@@ -462,6 +462,7 @@ class NodeSpec:
     max_bounces: int = 3  # 打回上限（entry 打回计入前节点，exit/审批打回计入本节点）
     baseline_marker: bool = False  # 进入本节点主体工作时记录 git 基线，供 change_aware exit 使用
     clarify: bool = False  # 允许交互式要点澄清（人工对话对齐，不消耗打回预算，结论必须固化 artifact）
+    adversarial: bool = False  # 主体成功后另开会话，核对 verify.md 并按 code/test/spec/env 分流
     session_group: str = ""  # 主体会话复用组（空=独立，组名仅字母数字_；设计见 docs/design-session-group.md）
     preset_group: bool = False  # 该组名由 session_preset 展开产生（非用户手写；不序列化：磁盘始终存 preset 形态）
     mcp: List[McpSpec] = field(default_factory=list)  # 仅主体会话追加的 MCP，门禁不继承
@@ -481,6 +482,7 @@ class NodeSpec:
             max_bounces=int(d.get("max_bounces", 3)),
             baseline_marker=_parse_bool(d.get("baseline_marker", False)),
             clarify=_parse_bool(d.get("clarify", False)),
+            adversarial=_parse_bool(d.get("adversarial", False)),
             session_group=str(d.get("session_group", "") or ""),
             mcp=_mcp_list(d.get("mcp")),
             skills=_skill_list(d.get("skills")),
@@ -499,6 +501,8 @@ class NodeSpec:
             "baseline_marker": self.baseline_marker,
             "clarify": self.clarify,
         }
+        if self.adversarial:
+            d["adversarial"] = True
         if self.session_group and not self.preset_group:
             # 预设展开产物不落盘（磁盘存 session_preset，load 重放重新展开）——
             # 否则磁盘展开值在重放中被当手写保留字拒绝（P1-4 砖化形态）；

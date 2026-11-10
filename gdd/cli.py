@@ -36,7 +36,11 @@ def _load_pipeline_file(path: str):
     except ImportError:
         raise RuntimeError(
             "检测到 YAML 格式的 pipeline 文件，但未安装 PyYAML（pip3 install pyyaml）")
-    data = yaml.safe_load(text)
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as e:
+        # 与 UI 保存路径一致：语法错误变成 ValueError，HTTP 层才能回 JSON 400。
+        raise ValueError(f"YAML 无法解析: {e}") from e
     if not isinstance(data, dict):
         raise ValueError("YAML 顶层必须是 mapping（nodes 列表）")
     return data
@@ -161,7 +165,7 @@ def _print_status(o: Orchestrator) -> None:
         # corrupt-but-parseable state 防御：缺节点条目时优雅降级而非裸 KeyError
         #（load 校验 phase 在场，但 pipeline 有节点而 state 无条目的形态仍可达）
         ns = st["node_states"].get(n.id) or {}
-        mark = {"pending": " ", "working": "▶", "exit_retry": "↻", "exit_passed": "⏸", "done": "✓"}.get(ns.get("phase"), "?")
+        mark = {"pending": " ", "working": "▶", "exit_retry": "↻", "adversarial_retry": "↻", "exit_passed": "⏸", "done": "✓"}.get(ns.get("phase"), "?")
         approval_mark = " [人工]" if n.approval.required else ""
         bounce = f" 打回{ns.get('bounces', 0)}/{n.max_bounces}" if ns.get("bounces") else ""
         print(f" {mark} {n.name}（{n.id}）{approval_mark}{bounce}")

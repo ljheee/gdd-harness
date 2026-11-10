@@ -89,8 +89,16 @@ def _parse_pipeline_content(content: str):
     if stripped.startswith("{"):
         data = json.loads(content)
     else:
-        import yaml  # 可选依赖
-        data = yaml.safe_load(content)
+        try:
+            import yaml  # 可选依赖
+        except ImportError as e:
+            raise ImportError("解析 YAML 模板需要 PyYAML（pip3 install pyyaml）") from e
+        try:
+            data = yaml.safe_load(content)
+        except yaml.YAMLError as e:
+            # YAMLError 不是 ValueError。转成 ValueError，创建/保存模板的
+            # 请求才能回到 JSON 400，而不是把连接打掉。
+            raise ValueError(f"YAML 无法解析: {e}") from e
     if not isinstance(data, dict):
         raise ValueError("顶层必须是 mapping")
     PipelineSpec.from_dict(data)  # 结构校验（非法即抛 ValueError/KeyError）
@@ -153,10 +161,13 @@ def _task_detail(workdir: str, name: str) -> dict:
     pa = st.get("pending_approval")
     prompt = ""
     if pa:
-        # P2-13：同输入优雅降级——缺键/幽灵 node 不 500（load 已有 RuntimeError
-        # 契约，这里兜住 load 与读取之间的竞态窗口）
-        node = o.pipeline.node(pa.get("node")) if isinstance(pa.get("node"), str) else None
-        prompt = node.approval.prompt if node else ""
+        # 定级和基线签批把给人看的话写在挂起项上；普通节点审批仍用模板里的 prompt。
+        stored = pa.get("prompt")
+        if isinstance(stored, str) and stored.strip():
+            prompt = stored
+        else:
+            node = o.pipeline.node(pa.get("node")) if isinstance(pa.get("node"), str) else None
+            prompt = node.approval.prompt if node else ""
     # 澄清窗口信息（只读，不落盘）
     clarify = None
     try:
@@ -265,6 +276,7 @@ _PHASE_TEXT = {
     "subject": "正在跑主体会话",
     "exit": "正在跑出口门禁",
     "clarify": "正在澄清对话",
+    "adversarial": "正在核对验证记录",
 }
 
 
@@ -787,7 +799,7 @@ async function renderTask(name){
   const stVal2=(stNow&&document.activeElement!==stNow&&stNow.value)?stNow.value:stVal;
   lastDetail=j; refreshNav();
   const st=j.status, running=j.running;
-  const phTxt={pending:'待进入',working:'进行中',exit_retry:'门禁重试',exit_passed:'待审批',done:'已完成'};
+  const phTxt={pending:'待进入',working:'进行中',exit_retry:'门禁重试',adversarial_retry:'核对重试',exit_passed:'待审批',done:'已完成'};
   const flow=j.nodes.map((n,i)=>{
     let cls='';let flag='';
     const isCur=n.id===j.current;
@@ -795,7 +807,7 @@ async function renderTask(name){
     else if(n.phase==='done')cls='done';
     if(n.needs_approval&&n.phase!=='done')flag='需人工';
     let ph=esc(phTxt[n.phase]||n.phase);
-    if(n.phase==='exit_passed'&&j.pending_approval&&j.pending_approval.node===n.id){cls='approval';ph='⏸ 等你审批'}
+    if((n.phase==='exit_passed'||n.phase==='working'||n.phase==='adversarial_retry')&&j.pending_approval&&j.pending_approval.node===n.id){cls='approval';ph='⏸ 等你审批'}
     const bd=[];
     if(n.bounces)bd.push(`打回${esc(String(n.bounces))}`);
     if(n.entry_bounces)bd.push(`entry打回${esc(String(n.entry_bounces))}`);

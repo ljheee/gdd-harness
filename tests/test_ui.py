@@ -175,6 +175,8 @@ def main():
 
     r = c.put("/api/template/mine", {"content": "{ bad json"})
     check(not r["ok"] and "模板不合法" in r["error"], "坏内容拒绝保存")
+    r = c.put("/api/template/mine", {"content": "foo: [\n"})
+    check(not r["ok"] and "模板不合法" in r.get("error", ""), "非法 YAML 拒绝保存")
 
     r = c.put("/api/template/mine", {"content": PIPELINE_YAML})
     check(r["ok"], "自定义模板保存（YAML 校验通过）")
@@ -201,6 +203,16 @@ def main():
     check(not r["ok"], "路径穿越任务名拒绝")
     r = c.post("/api/tasks", {"name": "t1", "template": "nope", "requirement": "x"})
     check(not r["ok"], "未知模板拒绝")
+    bad_yaml = os.path.join(workdir, ".gdd-templates", "broken.yaml")
+    os.makedirs(os.path.dirname(bad_yaml), exist_ok=True)
+    with open(bad_yaml, "w", encoding="utf-8") as f:
+        f.write("foo: [\n")
+    try:
+        r = c.post("/api/tasks", {"name": "from-bad-yaml", "template": "broken", "requirement": "x"})
+    except Exception as e:
+        raise AssertionError(f"非法 YAML 创建任务不应断开连接: {e}")
+    check(not r["ok"] and "无法解析" in r.get("error", ""),
+          f"非法 YAML 创建任务返回 JSON（{r.get('error')}）")
     r = c.post("/api/tasks", {"name": "t1", "template": "mine", "requirement": "做个小工具"})
     check(r["ok"], "任务创建成功")
     check(os.path.exists(os.path.join(workdir, "t1", ".gdd", "state.json")), "state.json 已生成")

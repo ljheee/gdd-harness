@@ -92,7 +92,7 @@ def test_t0_builtin_template_file():
     check(builtins.DELIVERY_PIPELINE == raw, "builtins 导出与文件内容一致（权威源）")
     fp = hashlib.sha256(json.dumps(builtins.DELIVERY_PIPELINE, sort_keys=True,
                                     ensure_ascii=False).encode()).hexdigest()[:16]
-    check(fp == "7328e40e1ba05fca", "模板内容指纹稳定（防误改）")
+    check(fp == "50e90f43e0046601", "模板内容指纹稳定（防误改）")
 
     # 同源：两路 init 实例指纹一致（--pipeline delivery ≡ 传文件路径）
     d = fresh_project()
@@ -141,9 +141,13 @@ def test_a_happy_with_exit_bounce():
         "docs/requirement.md": "# R\n## 需求背景\n## 需求描述\n内容\n",
         "docs/survey.md": "# S\n## 现状分析\n## 影响面\n## 相关方与依赖\n## 风险与未知项\n",
         "docs/goal.md": "# G\n## 目标\n## 验收标准（DoD）\n",
+        "docs/spec.md": "# S\n## 规格\n",
         "docs/plan.md": "# P\n## 实现步骤\n## ADR\n",
+        "docs/acceptance.feature": "Feature: 验收\n  Scenario: 主路径\n    Given 就绪\n    When 执行\n    Then 通过\n",
+        "docs/decisions.md": "# D\n## 决策记录\n",
         "docs/impl-ledger.md": "# L\n## 核销台账\n",
         "docs/test-report.md": "# T\n## 验证结果\n",
+        "docs/verify.md": "# V\n使用的数据\n过程日志\n落盘数据\n",
         "docs/delivery.md": "# D\n## 验收证据\n",
         "RELEASE-CHECKLIST.md": "# C\n## 发布前确认\n## 本次变更\n## 上线步骤\n## 异常处理\n",
         "docs/notify.md": "# N\n## 周知内容\n## 改动服务与 PR\n",
@@ -210,6 +214,11 @@ def test_a_happy_with_exit_bounce():
                             f.write(files[rel])
                         break
                 return SessionResult(ok=True, text="subject done", session_id="s", turns=2)
+            if "[[GDD-ROLE:adversarial" in prompt:
+                return SessionResult(
+                    ok=True,
+                    text='GDD-ADVERSARIAL: {"cases":[{"id":"c","result":"pass","cause":"code","reason":"ok"}]}',
+                    session_id="adv", turns=1)
             if "[[GDD-ROLE:gate:exit" in prompt:  # exit 门禁：第一次 fail，之后 pass
                 HybridRunner._exit_calls += 1
                 if HybridRunner._exit_calls == 1:
@@ -262,6 +271,7 @@ def test_b_approval_reject():
         "docs/requirement.md": "# R\n## 需求描述\n内容\n",
         "docs/survey.md": "# S\n## 现状分析\n## 影响面\n## 相关方与依赖\n## 风险与未知项\n",
         "docs/goal.md": "# G\n## 目标\n## 验收标准（DoD）\n",
+        "docs/spec.md": "# S\n## 规格\n",
     }
     os.makedirs(os.path.join(d, "docs"), exist_ok=True)
     for rel, content in files.items():
@@ -3113,6 +3123,172 @@ def test_stream_p0_p1():
     print("[STREAM] PASS\n")
 
 
+def test_timeout_keeps_unread_pipe():
+    """超时点上还留在管道里的 result 要并回来；挂死且没有成功结果仍报超时。
+
+    缓冲路径：第二次 communicate 的返回值含已读前缀和未读残片，旧代码把返回值丢掉。
+    流式路径：主线程不能再读 stdout，残行只从读线程的队列取。
+    """
+    print("[E2g] 超时残片")
+    import threading
+    import time
+
+    from gdd.runner import AgentRunner, _merge_captured
+
+    check(_merge_captured("HEAD", "HEADTAIL") == "HEADTAIL", "重读含前缀时不双计")
+    check(_merge_captured("HEAD", "TAIL") == "HEADTAIL", "只返回残片时拼接")
+    check(_merge_captured("HEAD", "") == "HEAD", "重读为空保留快照")
+    check(_merge_captured("", "TAIL") == "TAIL", "快照为空用残片")
+
+    result = json.dumps({
+        "type": "result", "subtype": "success", "result": "done",
+        "is_error": False, "session_id": "s",
+    })
+
+    class Buf:
+        def __init__(self):
+            self.pid = 2 ** 22
+            self.returncode = 0
+            self.n = 0
+
+        def poll(self):
+            return self.returncode
+
+        def communicate(self, input=None, timeout=None):
+            self.n += 1
+            if self.n == 1:
+                raise subprocess.TimeoutExpired(["x"], timeout or 1, output="NOISE\n", stderr="")
+            return ("NOISE\n" + result + "\n", "")
+
+    class Hang:
+        def __init__(self):
+            self.pid = 2 ** 22
+            self.returncode = -9
+            self.n = 0
+
+        def poll(self):
+            return self.returncode
+
+        def communicate(self, input=None, timeout=None):
+            self.n += 1
+            if self.n == 1:
+                raise subprocess.TimeoutExpired(["x"], timeout or 1, output="NOISE\n", stderr="")
+            return ("NOISE\n", "")
+
+    d = tempfile.mkdtemp()
+    try:
+        runner = AgentRunner(d)
+        runner.timeout = 1
+        res = runner._run_buffered(Buf(), "p", ["x"], None, time.time())
+        check(res.ok and res.text == "done", f"缓冲超时并回管道残片（{res.error}）")
+        res = runner._run_buffered(Hang(), "p", ["x"], None, time.time())
+        check(not res.ok and "超时" in (res.error or ""), f"无结果的超时仍报超时（{res.error}）")
+    finally:
+        shutil.rmtree(d)
+
+    released = threading.Event()
+    read_calls = {"n": 0}
+    real_killpg = os.killpg
+
+    def fake_killpg(pid, sig):
+        released.set()
+        raise ProcessLookupError()
+
+    class Stdin:
+        def write(self, data):
+            return len(data or "")
+
+        def close(self):
+            pass
+
+    class Stdout:
+        def __init__(self):
+            self.phase = 0
+
+        def readline(self):
+            if self.phase == 0:
+                self.phase = 1
+                released.wait(timeout=3)
+                return result + "\n"
+            return ""
+
+        def read(self):
+            read_calls["n"] += 1
+            raise AssertionError("main thread read stdout")
+
+    class Stderr:
+        def __iter__(self):
+            return iter(())
+
+    class StreamProc:
+        def __init__(self):
+            self.pid = 2 ** 22
+            self.returncode = 0
+            self.stdin = Stdin()
+            self.stdout = Stdout()
+            self.stderr = Stderr()
+
+        def poll(self):
+            # 杀掉之前必须看起来还活着，否则主循环会当成正常结束，进不了超时分支。
+            if released.is_set():
+                return self.returncode
+            return None
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    d2 = tempfile.mkdtemp()
+    os.killpg = fake_killpg
+    try:
+        runner = AgentRunner(d2)
+        runner.timeout = 0.4
+        res = runner._run_streaming(
+            StreamProc(), "p", ["x"], None, time.time(), lambda e: None)
+        check(res.ok and res.text == "done" and res.streamed,
+              f"流式超时并回读线程残行（{res.error}）")
+        check(read_calls["n"] == 0, "流式超时主线程不读 stdout")
+    finally:
+        os.killpg = real_killpg
+        shutil.rmtree(d2)
+
+    # 真进程：result 已写出，孙进程占着 stdout 把 communicate 拖到超时。
+    # 以及睡过超时、没有 result 的会话仍报超时。
+    keys = ("GDD_AGENT_BIN", "GDD_AGENT_PRE_ARGS", "GDD_AGENT_TIMEOUT")
+    saved = {k: os.environ.get(k) for k in keys}
+    d3 = tempfile.mkdtemp()
+    try:
+        held = os.path.join(d3, "held.py")
+        with open(held, "w", encoding="utf-8") as f:
+            f.write(
+                "import os, sys, time\n"
+                "sys.stdout.write(" + repr(result + "\n") + ")\n"
+                "sys.stdout.flush()\n"
+                "if os.fork() == 0:\n"
+                "    time.sleep(30)\n"
+                "    os._exit(0)\n"
+                "os._exit(0)\n"
+            )
+        slow = os.path.join(d3, "slow.py")
+        with open(slow, "w", encoding="utf-8") as f:
+            f.write("import time\ntime.sleep(5)\n")
+        os.environ["GDD_AGENT_BIN"] = sys.executable
+        os.environ["GDD_AGENT_TIMEOUT"] = "1"
+        os.environ["GDD_AGENT_PRE_ARGS"] = held
+        res = AgentRunner(d3).run("p", allowed_tools=[], max_turns=1)
+        check(res.ok and res.text == "done", f"孙进程占管道时不丢已写出的结果（{res.error}）")
+        os.environ["GDD_AGENT_PRE_ARGS"] = slow
+        res = AgentRunner(d3).run("p", allowed_tools=[], max_turns=1)
+        check(not res.ok and "超时" in (res.error or ""), f"真超时仍报超时（{res.error}）")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(d3)
+    print("[E2g] PASS\n")
+
+
 if __name__ == "__main__":
     test_t0_builtin_template_file()
     test_a_happy_with_exit_bounce()
@@ -3152,4 +3328,5 @@ if __name__ == "__main__":
     test_r7_bugbot_pins()
     test_r8_bugbot_pins()
     test_stream_p0_p1()
+    test_timeout_keeps_unread_pipe()
     print("全部通过 ✅")

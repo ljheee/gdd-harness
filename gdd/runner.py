@@ -31,6 +31,18 @@ _STREAM_EOF = object()
 _STREAM_POLL_S = 0.5  # queue.get 上限：既要及时超时，又不要空转过猛
 
 
+def _drain_line_queue(line_q: "queue.Queue", out_lines: List[str]) -> None:
+    """把读线程已经放入、主循环还没取走的行并进 out_lines。异常和 EOF 标记跳过。"""
+    while True:
+        try:
+            item = line_q.get_nowait()
+        except queue.Empty:
+            return
+        if item is _STREAM_EOF or isinstance(item, BaseException):
+            continue
+        out_lines.append(item)
+
+
 @dataclass
 class SessionResult:
     ok: bool
@@ -67,6 +79,29 @@ def _auth_hint(*texts: str) -> str:
             if h in low:
                 return h
     return ""
+
+
+def _as_text(data) -> str:
+    if data is None:
+        return ""
+    if isinstance(data, bytes):
+        return data.decode("utf-8", "replace")
+    return data
+
+
+def _merge_captured(already: str, reread) -> str:
+    """合并超时快照和再次 communicate 的返回。
+
+    CPython 把已读块留在 _fileobj2output，重试时连同管道里还没读走的残片一起返回
+    （残片不在 TimeoutExpired.output 里）。返回值已含已读前缀，再追加会把前缀算两遍。
+    若某实现只返回残片，则拼到已读内容后面。
+    """
+    extra = _as_text(reread)
+    if not extra:
+        return already
+    if not already or extra.startswith(already):
+        return extra
+    return already + extra
 
 
 def _auth_error(hint: str, bin_name: str) -> str:
@@ -299,39 +334,25 @@ class AgentRunner:
         except subprocess.TimeoutExpired as te:
             # P1-9（R6）：超时不必然是 agent 挂死——孙进程（dev server/watcher）
             # 继承 stdout 管道使 communicate 等不到 EOF；agent 本体可能已退出
-            # 且 result JSON 已完整打印（te.output 持有已读到的 stdout）。
-            # 先查 agent 本体：已退出 → 按已完成解析（不谎报超时、不丢结果、
-            # 不白烧 2h）；未退出才是真超时。
+            # 且 result JSON 已完整打印。te.output 只有选择器循环超时前读进
+            # 用户空间的字节；刚好落在超时点、还留在 OS 管道里的残片要靠再次
+            # communicate 取回（返回值含已读前缀，不能丢掉也不能再追加一遍）。
+            # 先杀组再收尸：孙进程松手后管道 EOF，communicate 才能返回。
+            # 已退出且合并后能解析出成功结果 → 不谎报超时；否则仍是真超时。
             try:
                 os.killpg(proc.pid, signal.SIGKILL)  # 组长 pid = PGID（新会话）——先杀组再判活（已退出的组无成员，无害）
             except (ProcessLookupError, PermissionError, OSError):
                 pass
+            partial_out, partial_err = self._reap_after_timeout(proc, te)
             if proc.poll() is not None:
-                # agent 已退出：结果已进管道（te.output / te.stderr），
-                # 孙进程持管导致的 EOF 等待不应谎报为「会话超时」
-                partial_out = te.output or ""
-                partial_err = te.stderr or ""
-                if isinstance(partial_out, bytes):
-                    partial_out = partial_out.decode("utf-8", "replace")
-                if isinstance(partial_err, bytes):
-                    partial_err = partial_err.decode("utf-8", "replace")
-                # 收尸（SIGKILL 后 communicate 快速返回）
-                try:
-                    proc.communicate(timeout=5)
-                except Exception:
-                    pass
                 res = self._parse_output(partial_out, partial_err, proc.returncode)
                 if res.ok:
                     res.duration_s = time.time() - started
                     self._dump_log(log_path, prompt, cmd, partial_out, res)
                     return res
                 # 输出不完整（agent 死于中途）：按真实形态报错，仍走会话失败链
-            try:
-                proc.communicate(timeout=5)  # 收尸（SIGKILL 后必然快速返回）
-            except Exception:
-                pass
             res = SessionResult(ok=False, error=f"会话超时（>{self.timeout}s）", duration_s=time.time() - started)
-            self._dump_log(log_path, prompt, cmd, "", res)
+            self._dump_log(log_path, prompt, cmd, partial_out, res)
             return res
         except OSError as e:
             # communicate 期 IO 异常（管道断裂等）：杀组防残留再走会话失败链
@@ -466,13 +487,14 @@ class AgentRunner:
                 os.killpg(proc.pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError, OSError):
                 pass
+            # stdout 由读线程独占。主线程再 read() 会和阻塞中的 readline
+            # 抢同一个 TextIOWrapper，尾部字节会丢或错乱。killpg 让管道 EOF，
+            # 读线程把剩余行放进队列后退出；这里只 join 再排空队列。
+            out_thr.join(timeout=2)
+            err_thr.join(timeout=2)
+            _drain_line_queue(line_q, out_lines)
             try:
-                # 尽量再读残片
-                if proc.stdout:
-                    rest = proc.stdout.read() or ""
-                    if rest:
-                        out_lines.append(rest)
-                proc.wait(timeout=5)
+                proc.wait(timeout=1)
             except Exception:
                 pass
             out = "".join(out_lines)
@@ -512,6 +534,18 @@ class AgentRunner:
         res.streamed = True
         self._dump_log(log_path, prompt, cmd, out, res)
         return res
+
+    def _reap_after_timeout(self, proc, te) -> tuple:
+        """killpg 之后收一次管道，把未读残片并进超时快照。只调用一次 communicate。"""
+        out = _as_text(getattr(te, "output", None))
+        err = _as_text(getattr(te, "stderr", None))
+        try:
+            out2, err2 = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired as te2:
+            out2, err2 = te2.output, te2.stderr
+        except Exception:
+            return out, err
+        return _merge_captured(out, out2), _merge_captured(err, err2)
 
     @staticmethod
     def _parse_output(stdout: str, stderr: str, returncode: int) -> SessionResult:

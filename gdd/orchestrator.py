@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 
 from . import approval as approval_mod
 from . import gates
+from . import revision as revision_mod
 from .models import ArtifactCheck, NodeSpec, PipelineSpec
 from .runner import AgentRunner
 
@@ -1287,11 +1288,338 @@ class Orchestrator:
             return self._phase_working(node, ns, runner)
         if ns["phase"] == "exit_retry":  # 门禁自身故障后仅重跑 exit 门禁（不重跑主体）
             return self._phase_exit_retry(node, ns, runner)
+        if ns["phase"] == "adversarial_retry":
+            return self._phase_adversarial_retry(node, ns, runner)
         if ns["phase"] == "exit_passed":
             return self._phase_exit_passed(node, ns)
         if ns["phase"] == "done":
             return self._advance(node)
         return False
+
+    # ------------------------------------------------------------ 定级 / 重跑 / 对抗
+
+    def _decorate_subject_prompt(self, node: NodeSpec, prompt: str) -> str:
+        extra = "\n\n" + revision_mod.CONTRACT
+        rev = self.state.get("revision") or {}
+        if rev.get("active") and node.id in (rev.get("nodes") or []):
+            extra += "\n\n" + revision_mod.RERUN_BLOCK
+            if rev.get("reason"):
+                extra += "\n\n这次修订要处理的已确认决定：\n" + str(rev["reason"])
+        return prompt + extra
+
+    def _revision_nodes(self) -> List[NodeSpec]:
+        return revision_mod.revision_range(self.pipeline.nodes)
+
+    def _outside_ids(self, in_ids: List[str]) -> List[str]:
+        return [n.id for n in self.pipeline.nodes if n.id not in in_ids]
+
+    def _implement_node(self) -> Optional[NodeSpec]:
+        for n in self.pipeline.nodes:
+            if n.baseline_marker or n.id == "implement":
+                return n
+        return None
+
+    def _after_subject(self, node: NodeSpec, ns: Dict, runner: AgentRunner, session) -> Optional[bool]:
+        """主体成功之后：定级确认、重跑落盘、对抗裁决。返回 None 表示继续出口门禁。"""
+        grade = revision_mod.parse_grade(session.text or "")
+        rev = self.state.get("revision") or {}
+        confirmed = set(rev.get("confirmed") or [])
+        grade_key = ""
+        if grade:
+            grade_key = f"{grade.get('level')}|{grade.get('clause')}|{grade.get('fact')}"
+        fresh_grade = bool(
+            grade and grade.get("level") in ("L0", "L1")
+            and ns.get("grade_rejected") != grade_key
+            and grade_key not in confirmed)
+        in_rev = bool(rev.get("active") and node.id in (rev.get("nodes") or []))
+        if in_rev:
+            outside = self._outside_ids(rev.get("nodes") or [])
+            if revision_mod.live_decisions_rewritten(self.root):
+                revision_mod.restore_decisions(self.root)
+                note = ("决策记录的正式文件改了已有条目，已退回基线。"
+                        "旧行不能改。要追加请写到 .gdd/revision-stage/docs/decisions.md。")
+                ns["decision_rewrites"] = ns.get("decision_rewrites", 0) + 1
+                self._record("revision_decisions_rewrite", node=node.id,
+                             n=ns["decision_rewrites"], where="live")
+                if ns["decision_rewrites"] >= 2:
+                    return self._bounce_current(node, gates.Verdict(
+                        passed=False, reason="决策记录改写了已有条目", feedback=note))
+                self.state["feedbacks"][node.id] = note
+                self.state.setdefault("feedback_kinds", {})[node.id] = "revision"
+                ns["phase"] = "working"
+                self._save()
+                return True
+            if not revision_mod.baseline_matches(
+                    self.root, self.state, rev.get("baseline") or {}, outside):
+                return self._pause_rebase(node)
+            if not revision_mod.staged_decisions_ok(self.root):
+                note = ("决策记录只能在已有条目之后追加，不能改旧行。"
+                        "请把修订稿重新写到 .gdd/revision-stage/docs/decisions.md。")
+                ns["decision_rewrites"] = ns.get("decision_rewrites", 0) + 1
+                self._record("revision_decisions_rewrite", node=node.id,
+                             n=ns["decision_rewrites"])
+                if ns["decision_rewrites"] >= 2:
+                    return self._bounce_current(node, gates.Verdict(
+                        passed=False, reason="决策记录改写了已有条目", feedback=note))
+                self.state["feedbacks"][node.id] = note
+                self.state.setdefault("feedback_kinds", {})[node.id] = "revision"
+                self.state["node_states"][node.id]["phase"] = "working"
+                self._save()
+                return True
+            if fresh_grade:
+                return self._pause_grade(node, grade)
+            revision_mod.apply_staged(self.root)
+            ns.pop("decision_rewrites", None)
+            rev["baseline"] = revision_mod.snapshot_baseline(self.root, self.state, outside)
+            self.state["revision"] = rev
+            self._save()
+        elif fresh_grade:
+            return self._pause_grade(node, grade)
+        if node.adversarial and not ns.get("adversarial_done"):
+            return self._run_adversarial(node, ns, runner)
+        return None
+
+    def _pause_grade(self, node: NodeSpec, grade: dict) -> bool:
+        summary = (f"{grade.get('level')} · {grade.get('clause')}\n"
+                   f"事实：{grade.get('fact')}\n依据：{grade.get('basis')}")
+        self.state["pending_approval"] = {
+            "node": node.id,
+            "kind": "grade",
+            "summary": summary,
+            "prompt": "请确认这是 L0/L1。批准后从需求澄清起增量重跑；驳回则不修订。",
+            "grade": {k: str(grade.get(k) or "") for k in ("level", "clause", "fact", "basis")},
+        }
+        self.state["status"] = "awaiting_approval"
+        self._record("grade_pending", node=node.id, level=str(grade.get("level")))
+        self._save()
+        return False
+
+    def _pause_rebase(self, node: NodeSpec) -> bool:
+        self.state["pending_approval"] = {
+            "node": node.id,
+            "kind": "rebase",
+            "summary": "修订落盘前基线变了。批准则把暂存修订挪到新基线上再签批；驳回则退回上次确认的产物。",
+            "prompt": "基线已变化。批准后按新基线重新准备修订稿。",
+        }
+        self.state["status"] = "awaiting_approval"
+        self._record("revision_baseline_moved", node=node.id)
+        self._save()
+        return False
+
+    def _resolve_grade(self, node: NodeSpec, approved: bool, feedback: str) -> bool:
+        grade = dict(self.state["pending_approval"].get("grade") or {})
+        self.state["pending_approval"] = None
+        key = f"{grade.get('level')}|{grade.get('clause')}|{grade.get('fact')}"
+        if approved:
+            text = self._grade_text(grade, feedback)
+            self._record("grade_confirmed", node=node.id, level=grade.get("level"))
+            rev = self.state.get("revision") or {}
+            if rev.get("active"):
+                confirmed = list(rev.get("confirmed") or [])
+                if key not in confirmed:
+                    confirmed.append(key)
+                rev["confirmed"] = confirmed
+                prev = str(rev.get("reason") or "").strip()
+                rev["reason"] = (prev + "\n\n" + text).strip()
+                self.state["revision"] = rev
+                self.state["status"] = "running"
+                self.state["node_states"][node.id]["phase"] = "working"
+                self.state["feedbacks"][node.id] = (
+                    "这条决定已确认。继续当前这次修订，不要再为同一事实提交定级。\n" + text)
+                self.state.setdefault("feedback_kinds", {})[node.id] = "revision"
+                self._save()
+                return True
+            self.state["status"] = "running"
+            self._save()
+            return self._start_revision(node.id, reason=text, confirmed=[key])
+        ns = self.state["node_states"][node.id]
+        ns["grade_rejected"] = key
+        ns["phase"] = "working"
+        self.state["status"] = "running"
+        if (self.state.get("revision") or {}).get("active"):
+            revision_mod.clear_stage(self.root)
+        note = "定级被否决，不启动修订。按 L2 继续完成本节点，不要再以同一事实提起 L0/L1。"
+        if feedback:
+            note += "\n" + feedback
+        self.state["feedbacks"][node.id] = note
+        self.state.setdefault("feedback_kinds", {})[node.id] = "grade_reject"
+        self._record("grade_rejected", node=node.id)
+        self._save()
+        return True
+
+    def _resolve_rebase(self, node: NodeSpec, approved: bool, feedback: str) -> bool:
+        rev = self.state.get("revision") or {}
+        baseline = rev.get("baseline") or {}
+        outside = self._outside_ids(rev.get("nodes") or [])
+        if approved:
+            revision_mod.clear_stage(self.root)
+            rev["baseline"] = revision_mod.snapshot_baseline(self.root, self.state, outside)
+            self.state["revision"] = rev
+            note = "基线已确认变化。旧暂存稿已作废。请按这份新基线重新准备修订稿，只写到 .gdd/revision-stage/，不要直接改正式产物。"
+        else:
+            revision_mod.restore_baseline_files(self.root, baseline)
+            note = "签批未通过。正式产物已退回上次确认的基线。请只把修订稿写到 .gdd/revision-stage/。"
+        if feedback:
+            note += "\n" + feedback
+        self.state["feedbacks"][node.id] = note
+        self.state.setdefault("feedback_kinds", {})[node.id] = "revision"
+        self.state["node_states"][node.id]["phase"] = "working"
+        self.state["status"] = "running"
+        self.state["pending_approval"] = None
+        self._record("revision_rebase", node=node.id, approved=approved)
+        self._save()
+        return True
+
+    def _grade_text(self, grade: dict, feedback: str = "") -> str:
+        lines = [
+            f"等级：{grade.get('level')}",
+            f"条款：{grade.get('clause')}",
+            f"事实：{grade.get('fact')}",
+            f"依据：{grade.get('basis')}",
+        ]
+        if feedback:
+            lines.append(f"确认意见：{feedback}")
+        return "\n".join(lines)
+
+    def _start_revision(self, origin: str, reason: str = "", confirmed: Optional[List[str]] = None) -> bool:
+        nodes = self._revision_nodes()
+        if not nodes:
+            reason_blocked = "无法增量重跑：流水线里没有从需求澄清到开发阶段之前的节点。"
+            self.state["status"] = "blocked"
+            self.state["blocked_reason"] = reason_blocked
+            self.state["blocked_owner"] = origin
+            self.state["pending_approval"] = None
+            self.last_refusal = reason_blocked
+            self._record("revision_unavailable", node=origin)
+            self._save()
+            return True
+        ids = [n.id for n in nodes]
+        revision_mod.clear_stage(self.root)
+        outside = self._outside_ids(ids)
+        passed_end = False
+        end = ids[-1]
+        for n in self.pipeline.nodes:
+            ns = self.state["node_states"][n.id]
+            if n.id in ids or passed_end:
+                ns["phase"] = "pending"
+                ns.pop("adversarial_done", None)
+                ns.pop("env_retries", None)
+                ns.pop("decision_rewrites", None)
+            if n.id == end:
+                passed_end = True
+        self.state["current"] = ids[0]
+        self.state["status"] = "running"
+        self.state["pending_approval"] = None
+        self.state["revision"] = {
+            "active": True,
+            "nodes": ids,
+            "baseline": revision_mod.snapshot_baseline(self.root, self.state, outside),
+            "reason": reason,
+            "confirmed": list(confirmed or []),
+        }
+        self._record("revision_start", node=origin, nodes=ids)
+        self._save()
+        return True
+
+    def _run_adversarial(self, node: NodeSpec, ns: Dict, runner: AgentRunner) -> Optional[bool]:
+        prompt = revision_mod.ADVERSARIAL_INTRO.replace("{node_id}", node.id)
+        self._present("ui_phase", phase="adversarial", node=node.id, name=node.name)
+        session = runner.run(
+            prompt, allowed_tools=["Read", "Grep", "Glob"], max_turns=node.subject.max_turns,
+            log_path=self._log_path(node, "adversarial"))
+        self._check_tamper("adversarial")
+        parsed = revision_mod.parse_adversarial(session.text or "") if session.ok else None
+        if not session.ok or not parsed:
+            ns["phase"] = "adversarial_retry"
+            return self._handle_gate_error(node, gates.Verdict(
+                passed=False, gate_error=True,
+                reason="对抗会话没有给出可解析的用例裁决",
+                feedback="请重新核对 docs/verify.md 与 docs/acceptance.feature，并给出 GDD-ADVERSARIAL 裁决。"))
+        cases = revision_mod.normalize_cases(
+            [c for c in (parsed.get("cases") or []) if isinstance(c, dict)])
+        if not cases:
+            ns["phase"] = "adversarial_retry"
+            return self._handle_gate_error(node, gates.Verdict(
+                passed=False, gate_error=True,
+                reason="对抗会话没有给出任何用例裁决",
+                feedback="请对照 docs/acceptance.feature 逐条裁决，cases 不能为空。"))
+        route = revision_mod.route_cases(cases)
+        self._record("adversarial", node=node.id, route=route)
+        if route == "pass":
+            ns["adversarial_done"] = True
+            ns["env_retries"] = 0
+            self._save()
+            return None
+        if route == "spec":
+            spec_fails = revision_mod.failed_cases(cases, {"spec"})
+            others = [c for c in revision_mod.failed_cases(cases) if c.get("cause") != "spec"]
+            fact = revision_mod.format_failed(spec_fails)
+            if others:
+                fact += ("\n同一轮还有这些失败，修订后的实现和测试仍要处理：\n"
+                         + revision_mod.format_failed(others))
+            return self._pause_grade(node, {
+                "level": "L0",
+                "clause": "spec",
+                "fact": fact,
+                "basis": "对抗会话判定失败原因是 spec",
+            })
+        if route == "code":
+            return self._return_to_implement(node, cases)
+        return self._rerun_test(node, ns, cases)
+
+    def _return_to_implement(self, test_node: NodeSpec, cases: List[dict]) -> bool:
+        impl = self._implement_node()
+        fails = revision_mod.failed_cases(cases)
+        text = "对抗测试判定有 code 问题。请按这些失败用例修改实现：\n" + revision_mod.format_failed(fails)
+        if impl is None:
+            return self._bounce_current(test_node, gates.Verdict(
+                passed=False, reason="对抗测试判定为 code 问题", feedback=text))
+        ns = self.state["node_states"][impl.id]
+        ns["bounces"] = ns.get("bounces", 0) + 1
+        self.state["feedbacks"][impl.id] = text
+        self.state.setdefault("feedback_kinds", {})[impl.id] = "adversarial"
+        if ns["bounces"] >= impl.max_bounces:
+            self.state["status"] = "blocked"
+            self.state["blocked_reason"] = f"实现环节因对抗测试打回已达上限：{text[:300]}"
+            self.state["blocked_owner"] = impl.id
+            self._record("blocked", node=impl.id, reason="adversarial_code")
+            self._save()
+            return False
+        ns["phase"] = "working"
+        passed = False
+        for n in self.pipeline.nodes:
+            if n.id == impl.id:
+                passed = True
+                continue
+            if passed:
+                later = self.state["node_states"][n.id]
+                later["phase"] = "pending"
+                later.pop("adversarial_done", None)
+                later.pop("env_retries", None)
+        self.state["current"] = impl.id
+        self._record("adversarial_code", node=impl.id)
+        self._save()
+        return True
+
+    def _rerun_test(self, node: NodeSpec, ns: Dict, cases: List[dict]) -> bool:
+        fails = revision_mod.failed_cases(cases)
+        env_only = bool(fails) and all(c.get("cause") == "env" for c in fails)
+        text = "对抗测试未通过，留在测试环节当前环境重跑：\n" + revision_mod.format_failed(fails)
+        if any(c.get("cause") == "env" for c in fails):
+            text += ("\n环境问题能自己解决的就在当前环境解决，例如 mock 依赖，然后更新 docs/verify.md。"
+                     "确需用户提供权限、缺失资料或外部动作时，才一次说明：失败点、已经试过什么、"
+                     "排除了什么、推荐路径、最少需要什么帮助。环境缺口不能记成通过。")
+        if env_only and ns.get("env_retries", 0) < 1:
+            ns["env_retries"] = ns.get("env_retries", 0) + 1
+            ns["phase"] = "working"
+            ns.pop("adversarial_done", None)
+            self.state["feedbacks"][node.id] = text
+            self.state.setdefault("feedback_kinds", {})[node.id] = "adversarial"
+            self._record("adversarial_env", node=node.id)
+            self._save()
+            return True
+        return self._bounce_current(node, gates.Verdict(
+            passed=False, reason="对抗测试未通过", feedback=text))
 
     # ------------------------------------------------------------ 相位处理
 
@@ -1357,20 +1685,27 @@ class Orchestrator:
         sessions = ns.setdefault("sessions", {})
         group = self._node_group(node)
         resume_sid = ""
+        rev_now = self.state.get("revision") or {}
+        in_revision = bool(rev_now.get("active") and node.id in (rev_now.get("nodes") or []))
         if (os.environ.get("GDD_SUBJECT_RESUME", "on") != "off"
                 and (fb_kind == "clarify"
                      or ns.get("bounces", 0) < 2
-                     or ns.get("auto_continues", 0) > 0)):
+                     or ns.get("auto_continues", 0) > 0
+                     or in_revision)):
             # bounces<2 是防门禁打回循环的预算；turns 打满自动续跑与打回正交，
             # 打回打满后仍应续会话而非每轮全新重跑（否则 sid 成死档、烧多倍配额）；
             # clarify 反馈例外：review 澄清对话就发生在主体会话上，收尾轮必须
-            # resume 该会话（§4 主体 resume 收尾），否则 review 结论对收尾轮不可见
+            # resume 该会话（§4 主体 resume 收尾），否则 review 结论对收尾轮不可见。
+            # 增量重跑同样必须复用该节点原来的主体会话，不受打回次数限制。
             resume_sid = self._subject_group_sid(group)
         if resume_sid:
             # 续会话：历史上下文已在会话内，只发反馈/继续指令；门禁不受影响（每次全新）
             own_sid = sessions.get("subject")  # 进入本相位时本节点自己的存档（快照于 run 前）
             self._record("subject_resume", node=node.id)  # 审计：history 可查，不必翻日志文件
-            if feedback:
+            if in_revision:
+                # 重跑是修订，不是把中断的半成品做完。任务书要带目标，并标明这是重跑。
+                prompt = gates.build_subject_prompt(node, self.pipeline, upstream, feedback, raw_req)
+            elif feedback:
                 ev = self.state.get("last_exit_evidence") or []
                 ev_part = ("\n门禁核验证据（修改时对照）：\n- "
                            + "\n- ".join(str(e)[:300] for e in ev[:8])) if ev else ""
@@ -1384,6 +1719,7 @@ class Orchestrator:
             else:
                 prompt = (f"[[GDD-ROLE:subject node:{node.id}]]\n"
                           f"上轮会话中断，请继续完成本节点工作（产物与报告路径不变）。")
+            prompt = self._decorate_subject_prompt(node, prompt)
             self._present("ui_phase", phase="subject", node=node.id, name=node.name)
             stream_cb = _subject_stream_cb()
             session = self._subject_run(
@@ -1403,6 +1739,7 @@ class Orchestrator:
         if not resume_sid:
             self._present("ui_phase", phase="subject", node=node.id, name=node.name)
             prompt = gates.build_subject_prompt(node, self.pipeline, upstream, feedback, raw_req)
+            prompt = self._decorate_subject_prompt(node, prompt)
             stream_cb = _subject_stream_cb()  # 与 resume 轮隔离：截断额度重新起算
             session = self._subject_run(
                 runner, prompt, node, "subject", stream_cb=stream_cb)
@@ -1473,6 +1810,9 @@ class Orchestrator:
             return self._handle_gate_error(node, gates.Verdict(
                 passed=False, reason=f"主体会话执行失败: {session.error}",
                 feedback=f"上一轮会话异常中断（{session.error[:200]}），请重新完成本节点工作。"))
+        routed = self._after_subject(node, ns, runner, session)
+        if routed is not None:
+            return routed
         # 上轮打回项：随 exit 门禁逐项核验；**核验通过才消费**（pop 后移）——
         # 门禁自身故障（exit_retry）或进程崩溃时反馈保留在 state，重试/重启后不丢失核验项
         pending_fb = self.state["feedbacks"].get(node.id, "")
@@ -1580,6 +1920,14 @@ class Orchestrator:
                          error=(follow.error or "")[:200])
             return session
         return follow
+
+    def _phase_adversarial_retry(self, node: NodeSpec, ns: Dict, runner: AgentRunner) -> bool:
+        """对抗会话自身不可解析时只重开会话，不重跑测试主体。通过后直接跑出口门禁。"""
+        routed = self._run_adversarial(node, ns, runner)
+        if routed is not None:
+            return routed
+        ns["phase"] = "exit_retry"
+        return self._phase_exit_retry(node, ns, runner)
 
     def _phase_exit_retry(self, node: NodeSpec, ns: Dict, runner: AgentRunner) -> bool:
         """门禁自身故障后的重试：直接重跑 exit 门禁（主体产物保持不变）。"""
@@ -1748,6 +2096,11 @@ class Orchestrator:
     def _complete(self, node: NodeSpec) -> bool:
         ns = self.state["node_states"][node.id]
         ns["phase"] = "done"
+        rev = self.state.get("revision") or {}
+        if rev.get("active") and rev.get("nodes") and node.id == rev["nodes"][-1]:
+            rev["active"] = False
+            self.state["revision"] = rev
+            self._record("revision_done", node=node.id)
         # 完成即清零打回计数（历史累计归档到 bounces_total，避免跨事件累计误 blocked）
         if ns["bounces"]:
             ns["bounces_total"] = ns.get("bounces_total", 0) + ns["bounces"]
@@ -1812,6 +2165,7 @@ class Orchestrator:
 
     def _bounce_current(self, node: NodeSpec, verdict: gates.Verdict) -> bool:
         ns = self.state["node_states"][node.id]
+        ns.pop("adversarial_done", None)
         ns["bounces"] += 1
         if ns["bounces"] >= node.max_bounces:
             self.state["status"] = "blocked"
@@ -1939,6 +2293,8 @@ class Orchestrator:
                     return {"node": node, "mode": "pending",
                             "resume_sid": ns.setdefault("sessions", {}).get("clarify", "")}
         if st["status"] == "awaiting_approval" and st.get("pending_approval"):
+            if st["pending_approval"].get("kind") in ("grade", "rebase"):
+                return None
             node = self.pipeline.node(st["pending_approval"]["node"])
             if node and node.clarify:
                 ns = st["node_states"][node.id]
@@ -2086,6 +2442,8 @@ class Orchestrator:
             ctx = self._clarify_context()
             if ctx is None or ctx["node"].id != node_id:
                 return {"ok": False, "error": f"节点 {node_id} 当前不在澄清窗口"}
+            if (st.get("pending_approval") or {}).get("kind") in ("grade", "rebase"):
+                return {"ok": False, "error": "当前是定级或基线签批，不能用结束澄清跳过"}
             node, mode = ctx["node"], ctx["mode"]
             self._record("clarify_done", node=node.id, mode=mode)
             if mode == "pending":
@@ -2138,6 +2496,11 @@ class Orchestrator:
             print("当前没有待处理的人工准入。")
             return False
         node = self.pipeline.node(st["pending_approval"]["node"])
+        kind = st["pending_approval"].get("kind") or "node"
+        if kind == "grade":
+            return self._resolve_grade(node, approved, feedback)
+        if kind == "rebase":
+            return self._resolve_rebase(node, approved, feedback)
         snap = dict(st["pending_approval"].get("artifact_snapshot") or {})
         # P1-5：守卫按快照是否在场判定（与交互路径一致）——legacy 实例的
         # pending_approval 无 artifact_snapshot（快照与 clarify 同版本引入），
@@ -2216,7 +2579,9 @@ class Orchestrator:
         # 反馈永不送达、retry 永久砖化。区分：feedbacks 里有本节点的打回
         # 反馈 = 主体有债要还，必须重跑主体（working）；干净 exit_retry
         # （纯门禁故障，无 pending 反馈）才只重验门禁。
-        if ns["phase"] == "exit_retry":
+        if ns["phase"] == "adversarial_retry":
+            pass  # 只重跑对抗会话，不重跑测试主体
+        elif ns["phase"] == "exit_retry":
             has_feedback = bool((st.get("feedbacks") or {}).get(owner.id))
             if has_feedback:
                 ns["phase"] = "working"  # 真打回：反馈须送达主体重做
