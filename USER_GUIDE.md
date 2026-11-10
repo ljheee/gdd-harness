@@ -316,3 +316,53 @@ Agent 环境变量（`GDD_AGENT_BIN` / `GDD_AGENT_PRE_ARGS` 等）在启动 UI �
 ### 10.4 安全
 
 仅监听 `127.0.0.1`（不对外）；任务名/模板名白名单校验，杜绝路径穿越；内置模板只读不可删。
+
+---
+
+## 11. Mac app（GDD Console，Tauri 2 壳）
+
+不想开终端时，用 `GDD Console.app` 一键打开同一个 Web 控制台。app 只是壳：窗口里是
+`python3 -m gdd.ui` 的页面，界面与浏览器打开完全一致；**Web 更新不需要重新发布 app**。
+
+### 11.1 前置依赖
+
+- macOS；
+- 本机 **Python ≥3.10**（`python3 --version` 确认；系统自带 3.9 不可用）；
+- 本机 **GDD 源码**（本仓库）；
+- 只有“构建 app”才需要 Rust 工具链与 Tauri CLI，日常使用不需要。
+
+app 不打包 Python 和 GDD 源码，也不内置 Chromium/Electron。
+
+### 11.2 构建与首次启动
+
+```bash
+cargo install tauri-cli --version "^2" --locked
+cargo tauri build --bundles app
+open "src-tauri/target/release/bundle/macos/GDD Console.app"
+```
+
+首次启动会在 `~/Library/Application Support/com.gdd.console/config.json`
+（权限 0600）生成配置：`gddHome`（GDD 源码根目录）、`python`（≥3.10 解释器绝对路径）、
+`workbenchRoot`（默认 `~/gdd-workbench`，其下每个子目录是一个任务）、可选的 `path`/`env`。
+自动探测不正确时直接编辑该文件，然后重启 app。
+
+### 11.3 行为与日志
+
+- **已在运行则复用**：启动时只读探测 `http://127.0.0.1:8765/api/overview`；已有控制台
+  就直接打开，不重复启动。8765 无监听时才用配置的 Python 拉起：
+  `<python> -m gdd.ui --root <工作台> --port 8765 --no-open`。
+- **只支持默认端口 8765**：非默认端口的控制台不会被发现；8765 被其他服务占用时
+  app 报错并停止，不会换端口或启动第二个实例。
+- **窗口与退出**：关闭窗口只是隐藏，app 仍在 Dock；点击 Dock 图标可重新打开。
+  退出 app 不会终止控制台（长任务继续跑），下次启动自动复用。
+- **日志**：`~/Library/Logs/com.gdd.console/app.log`（app 事件）与
+  `console.log`（控制台 stdout/stderr）。启动失败时错误框会给出这两个路径。
+- **停止控制台**：`pkill -f "gdd.ui"` 或在活动监视器结束进程（app 不提供停止按钮）。
+
+### 11.4 更新 Web 页面
+
+1. 更新 GDD 源码；
+2. 停止旧控制台（确保 8765 无监听）；
+3. 重新启动 app，让它拉起新代码。
+
+全程不需要重新构建/发布 app。app 默认复用已运行的控制台，因此只重启 app 不会加载新代码。
