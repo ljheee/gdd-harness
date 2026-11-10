@@ -10,5 +10,9 @@ __pycache__/
 *$py.class
 .pytest_cache/
 
+# rust / tauri
+src-tauri/target/
+src-tauri/gen/
+
 .idea
 .DS_Store

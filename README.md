@@ -46,6 +46,66 @@ PYTHONPATH=/path/to/GDD python3 -m gdd.ui --root .   # 打开 http://127.0.0.1:8
 任务列表、节点流程图（当前节点/待审批高亮/门禁重试/完成态）、审批与重试一键操作、blocked 原因置顶。
 仅监听 127.0.0.1；详见 USER_GUIDE.md 第 10 章。
 
+### Mac app（Tauri 2 壳，`src-tauri/`）
+
+`GDD Console.app` 是控制台的 macOS 桌面入口：窗口直接用系统 **WKWebView** 加载
+`http://127.0.0.1:8765/`，不重写界面、不打包第二份前端，也不内置 Chromium/Electron。
+Web 页面更新只需更新外部 GDD 源码，**不需要重新构建 app**。
+
+前置依赖（app 不打包这些）：
+
+- macOS；
+- 本机 **Python ≥3.10**（系统 `/usr/bin/python3` 为 3.9 时不可用）；
+- 本机 **GDD 源码**（本仓库，配置项 `gddHome`）；
+- 构建 app 需要 Rust 工具链与 Tauri CLI（运行 app 不需要）。
+
+构建：
+
+```bash
+cargo install tauri-cli --version "^2" --locked
+cargo tauri build --bundles app
+# 产物：src-tauri/target/release/bundle/macos/GDD Console.app
+```
+
+首次启动自动生成配置（0600）：
+
+`~/Library/Application Support/com.gdd.console/config.json`
+
+```json
+{
+  "version": 1,
+  "gddHome": "/abs/path/to/gdd-harness",
+  "python": "/abs/path/to/python3.12",
+  "workbenchRoot": "/Users/<you>/gdd-workbench",
+  "path": ["/opt/homebrew/bin"],
+  "env": {}
+}
+```
+
+- `gddHome` 必须包含 `gdd/ui.py`；`python` 必须是 ≥3.10 的绝对路径；`workbenchRoot`
+  默认 `~/gdd-workbench`（不存在时自动创建），其下每个子目录是一个任务。
+- `path`/`env` 可选，用于让 GUI 启动的控制台找到 `claude`/`codex` 等 Agent CLI
+  （如 `GDD_AGENT_BIN`）。配置中的 `env` 值不会写入日志。
+
+行为与边界：
+
+- 启动时只读探测 `GET /api/overview`：已有 GDD 控制台则直接复用（不产生第二个进程）；
+  8765 无监听才用 `<python> -m gdd.ui --root <workbench> --port 8765 --no-open` 拉起。
+- 只支持默认端口 8765；8765 被非 GDD 服务占用时报错，不退让到其他端口。
+- 关闭窗口只隐藏，app 继续运行；点 Dock 重新打开会重新探测并显示窗口。
+  退出 app（Cmd+Q）不会终止控制台；下次启动通过 8765 复用。
+- 日志：`~/Library/Logs/com.gdd.console/app.log`、`console.log`。
+- 停止控制台：`pkill -f "gdd.ui"` 或在活动监视器中结束进程（app 不提供停止按钮）。
+- 更新 Web：更新 GDD 源码 → 停止旧控制台（确保 8765 无监听）→ 重新启动 app
+  （app 无需重新构建/发布）。
+- 不承诺在未安装 Python/GDD 的机器上独立运行；本迭代不含签名/公证/Mac App Store、
+  自动更新、非默认端口发现。
+
+开发者/测试钩子（不构成产品对外契约）：`GDD_CONSOLE_CONFIG_DIR`、`GDD_CONSOLE_LOG_DIR`、
+`GDD_CONSOLE_TEST_HEADLESS`、`GDD_CONSOLE_TEST_NO_DIALOG`、`GDD_CONSOLE_TEST_PORT`、
+`GDD_CONSOLE_TEST_EXIT_AFTER_READY`、`GDD_CONSOLE_TEST_DUMP_PAGE`、
+`GDD_CONSOLE_TEST_CLOSE_AFTER_READY`。
+
 ## 自定义编排（pipeline JSON）
 
 模板与内置模板完全同源（`gdd/templates/delivery.json` 可复制修改自用）。完整字段说明、校验规则与设计建议见 **`docs/template-format.md`**。
@@ -151,7 +211,19 @@ python3 tests/test_ui.py     # 图形控制台（含 CSRF/穿越/并发写防护
 python3 tests/test_clarify.py # 主体会话 resume / 要点澄清通道 / legacy 指纹迁移
 python3 tests/test_steer.py   # working 补充：hook 消费 / 不占锁 / 结束补送一次
 python3 tests/test_node_ext.py # 节点多个 MCP/skill：只挂主体，门禁不继承
+
+# Mac app（Tauri 2 壳）
+cd src-tauri && cargo test          # 配置校验 / 探测 / 进程监管单元与集成测试
+bash scripts/verify_app.sh          # D1/D14 静态检查（Tauri 配置、资源、ATS、文档）
+python3.12 scripts/verify_headless.py  # D2/D3/D5/D6/D7/D9/D11/D12/D13 应用级隔离验证
+python3.12 scripts/verify_headless.py --port 8765  # 8765 空闲时做真实端口验证
+python3.12 scripts/verify_gui.py       # D4 真实窗口（URL + WKWebView DOM 证据）
 ```
+
+> 8765 被用户正在使用的控制台占用时，应用级脚本用测试钩子 `GDD_CONSOLE_TEST_PORT`
+> 选择空闲端口做隔离验证；生产端口固定 8765 由 `supervisor::DEFAULT_PORT` 单元测试守护。
+> `verify_gui.py` 在本机缺少「屏幕录制」权限时无法截屏，会以 WKWebView 实际 URL 与
+> DOM 文本作为窗口内容证据。
 
 stub agent（`tests/stub_agent.py` + `GDD_STUB_SCRIPT`）可无模型跑全链路。
 
@@ -170,6 +242,15 @@ gdd/
   templates/      # 内置 pipeline 模板（delivery.json——唯一权威源，可复制修改自用）
   cli.py           # gdd init/run/status/chat/approve/retry/abort/reset
   ui.py            # 本地图形控制台（127.0.0.1 HTTP + 内嵌页面）
+src-tauri/         # macOS 桌面壳（Tauri 2 + 系统 WKWebView，加载 127.0.0.1:8765）
+  src/config.rs    # 配置模型/校验/首启生成（0600）
+  src/http_probe.rs# 只读 GET /api/overview 识别控制台
+  src/console.rs   # argv 数组拉起 python -m gdd.ui（不经过 shell）
+  src/supervisor.rs# 探测/复用/拉起/就绪轮询/超时回收
+  src/app.rs       # Tauri 窗口、Dock 重开、关闭隐藏、原生错误对话框
+  src/headless.rs  # 无 GUI 测试入口
+scripts/           # verify_app.sh / verify_headless.py / verify_gui.py
+assets/            # app 图标源文件（icons 由 cargo tauri icon 生成）
 ```
 
 ## 边界（MVP 已知限制）
