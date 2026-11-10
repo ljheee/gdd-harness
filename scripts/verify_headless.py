@@ -599,8 +599,9 @@ def d7(tmp: Path, app_bin: Path, python: str) -> str:
         create_task(port, task1)
         names1 = [item["name"] for item in get_json(port, "/api/overview")["tasks"]]
         check(names1 == [task1], f"R1 任务列表异常：{names1}")
-        # 页面由同一 /api/overview 数据驱动（任务名在前端渲染，不在静态 HTML 中）。
-        check("/api/overview" in get_text(port, "/"), "页面应通过 /api/overview 加载任务列表")
+        # 页面由同一 overview 数据驱动（任务名在前端渲染，不在静态 HTML 中；
+        # 页面 JS 使用相对路径 api('api/overview')）。
+        check("api/overview" in get_text(port, "/"), "页面应通过 overview 接口加载任务列表")
     finally:
         terminate(pid1)
         wait_port_free(port)

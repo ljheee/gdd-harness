@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 use tauri::{AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
-use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
 use crate::config::{self, RuntimePaths, ValidatedConfig};
 use crate::log;
@@ -25,7 +24,6 @@ struct AppState {
 
 pub fn run() -> i32 {
     let builder = tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             quitting: AtomicBool::new(false),
             ensuring: AtomicBool::new(false),
@@ -278,7 +276,7 @@ fn maybe_close_window(window: &tauri::WebviewWindow) {
     }
     let window = window.clone();
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(4000));
+        std::thread::sleep(Duration::from_millis(6000));
         log::event("event=test_close_requested");
         if let Err(e) = window.close() {
             log::event(format!("event=error error=test_close_failed detail={e}"));
@@ -326,10 +324,49 @@ fn fail(app: &AppHandle, paths: &RuntimePaths, message: &str) {
         app.exit(1);
         return;
     }
-    app.dialog()
-        .message(full)
-        .title("GDD 控制台启动失败")
-        .kind(MessageDialogKind::Error)
-        .blocking_show();
+    show_error_dialog(app, full);
+}
+
+/// 在 app 主线程显示应用级 NSAlert（不属于任何窗口，因此配置错误时无需先创建窗口），
+/// 用户确认后退出 app。后台线程通过 `run_on_main_thread` 调度。
+#[cfg(target_os = "macos")]
+fn show_error_dialog(app: &AppHandle, message: String) {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSAlert, NSAlertStyle, NSApplication, NSApplicationActivationPolicy};
+    use objc2_foundation::NSString;
+
+    let handle = app.clone();
+    let scheduled = app.run_on_main_thread(move || {
+        log::event("event=dialog_shown");
+        let Some(mtm) = MainThreadMarker::new() else {
+            log::event("event=error error=dialog_not_on_main_thread");
+            handle.exit(1);
+            return;
+        };
+        let ns_app = NSApplication::sharedApplication(mtm);
+        // 确保无窗口时 app 也能成为前台应用，让 modal 对话框可见。
+        let _ = ns_app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+        ns_app.activate();
+
+        let alert = NSAlert::new(mtm);
+        alert.setAlertStyle(NSAlertStyle::Critical);
+        alert.setMessageText(&NSString::from_str("GDD 控制台启动失败"));
+        alert.setInformativeText(&NSString::from_str(&message));
+        alert.addButtonWithTitle(&NSString::from_str("好"));
+        let response = alert.runModal();
+        log::event(format!("event=dialog_closed response={response}"));
+        handle.exit(1);
+    });
+    if let Err(e) = scheduled {
+        log::event(format!(
+            "event=error error=dialog_schedule_failed detail={e}"
+        ));
+        app.exit(1);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn show_error_dialog(app: &AppHandle, message: String) {
+    eprintln!("{message}");
     app.exit(1);
 }

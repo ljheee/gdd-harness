@@ -217,7 +217,9 @@ cd src-tauri && cargo test          # 配置校验 / 探测 / 进程监管单元
 bash scripts/verify_app.sh          # D1/D14 静态检查（Tauri 配置、资源、ATS、文档）
 python3.12 scripts/verify_headless.py  # D2/D3/D5/D6/D7/D9/D11/D12/D13 应用级隔离验证
 python3.12 scripts/verify_headless.py --port 8765  # 8765 空闲时做真实端口验证
-python3.12 scripts/verify_gui.py       # D4 真实窗口（URL + WKWebView DOM 证据）
+python3.12 scripts/verify_gui.py       # D4 真实窗口（URL + WKWebView DOM + 截图）
+python3.12 scripts/verify_gui.py --check-error-dialogs  # D9/D11 错误对话框可见性（截图）
+python3.12 scripts/verify_gui.py --check-8765-reuse     # 8765 有控制台时做只读复用验证
 ```
 
 > 8765 被用户正在使用的控制台占用时，应用级脚本用测试钩子 `GDD_CONSOLE_TEST_PORT`
@@ -249,7 +251,7 @@ src-tauri/         # macOS 桌面壳（Tauri 2 + 系统 WKWebView，加载 127.0
   src/supervisor.rs# 探测/复用/拉起/就绪轮询/超时回收
   src/app.rs       # Tauri 窗口、Dock 重开、关闭隐藏、原生错误对话框
   src/headless.rs  # 无 GUI 测试入口
-scripts/           # verify_app.sh / verify_headless.py / verify_gui.py
+scripts/           # verify_app.sh / verify_headless.py / verify_gui.py / window_list.swift
 assets/            # app 图标源文件（icons 由 cargo tauri icon 生成）
 ```
 
