@@ -1837,14 +1837,16 @@ class Orchestrator:
             return None
         if graph.error:
             self._record("task_graph_invalid", node=node.id, reason=graph.error[:200])
+            self._reset_task_progress(ns)
             return self._bounce_to_previous(node, gates.Verdict(
                 passed=False, reason=graph.error,
                 feedback="方案附录「任务依赖」需要改成无环的依赖拆分后再开发：" + graph.error))
-        done = set(ns.get("tasks_done") or [])
+        done = self._reconcile_done_tasks(ns, graph)
         ready = graph.ready(done)
         if not ready:
             if len(done) < len(graph.tasks):
                 self._record("task_graph_stuck", node=node.id)
+                self._reset_task_progress(ns)
                 return self._bounce_to_previous(node, gates.Verdict(
                     passed=False, reason="任务依赖无法继续",
                     feedback="还有任务没做，但它们的依赖没有全部完成。请检查附录里的依赖。"))
@@ -1911,21 +1913,44 @@ class Orchestrator:
             steer_mod.mark_subject(self.root, False)
 
         failed = []
+        continued = []
+        missing_note = []
+        continues = dict(ns.get("task_continues") or {})
+        misses = dict(ns.get("task_note_misses") or {})
+        sig = dict(ns.get("task_sig") or {})
         for task, session in zip(ready, results):
             if session.session_id:
                 sessions[f"task:{task.id}"] = session.session_id
-            self._record("task_done" if session.ok else "task_fail",
-                         node=node.id, task=task.id, ok=bool(session.ok),
-                         error=(session.error or "")[:160])
-            if session.ok:
+            if session.ok and self._task_note(task.id):
+                self._record("task_done", node=node.id, task=task.id, ok=True)
                 done.add(task.id)
+                sig[task.id] = self._task_signature(task)
+                continues.pop(task.id, None)
+                misses.pop(task.id, None)
                 session = self._steer_fallback(
                     node, type(runner)(self.root), session, lambda: base_cb)
                 if session.session_id:
                     sessions[f"task:{task.id}"] = session.session_id
+            elif session.ok:
+                misses[task.id] = misses.get(task.id, 0) + 1
+                missing_note.append(task)
+                self._record("task_note_missing", node=node.id, task=task.id,
+                             n=misses[task.id])
+            elif (session.turns_exhausted and session.session_id
+                    and os.environ.get("GDD_SUBJECT_RESUME", "on") != "off"
+                    and continues.get(task.id, 0) < SUBJECT_AUTO_CONTINUES_MAX):
+                continues[task.id] = continues.get(task.id, 0) + 1
+                continued.append(task)
+                self._record("task_auto_continue", node=node.id, task=task.id,
+                             round=continues[task.id], turns=session.turns)
             else:
                 failed.append((task, session))
+                self._record("task_fail", node=node.id, task=task.id, ok=False,
+                             error=(session.error or "")[:160])
         ns["tasks_done"] = [task.id for task in graph.tasks if task.id in done]
+        ns["task_sig"] = {tid: sig[tid] for tid in ns["tasks_done"] if tid in sig}
+        ns["task_continues"] = continues
+        ns["task_note_misses"] = misses
         self._check_tamper("subject")
         self._save()
         if failed:
@@ -1934,6 +1959,15 @@ class Orchestrator:
                 passed=False, gate_error=True,
                 reason=f"任务 {task.id} 会话失败: {session.error}",
                 feedback=f"任务 {task.id} 没有完成（{str(session.error)[:200]}）。已完成的任务不用重做。"))
+        if any(misses.get(task.id, 0) >= 2 for task in missing_note):
+            task = next(task for task in missing_note if misses.get(task.id, 0) >= 2)
+            return self._bounce_current(node, gates.Verdict(
+                passed=False, reason=f"任务 {task.id} 没有写下核销行",
+                feedback=(f"任务 {task.id} 的会话结束了，但 .gdd/task-results/{task.id}.md 仍是空的。"
+                          "请写上：ID｜处理结果｜代码位置｜证据｜待办。没有核销行不能算完成。")))
+        if missing_note or continued:
+            return True
+        self._clear_gate_error_streak()
         routed = None
         for task, session in zip(ready, results):
             if not session.ok:
@@ -1968,19 +2002,52 @@ class Orchestrator:
         prompt = gates.build_subject_prompt(node, self.pipeline, upstream, feedback, raw_req)
         return self._decorate_subject_prompt(node, prompt + focus)
 
+    def _task_signature(self, task) -> str:
+        return f"{task.title}|{','.join(task.deps)}"
+
+    def _task_note(self, task_id: str) -> str:
+        path = os.path.join(self.root, ".gdd", "task-results", f"{task_id}.md")
+        if not os.path.isfile(path):
+            return ""
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                return " ".join(f.read().split())
+        except OSError:
+            return ""
+
+    def _reset_task_progress(self, ns: Dict) -> None:
+        """附录要重写时，旧任务 ID 不能继续当成已完成。"""
+        ns.pop("tasks_done", None)
+        ns.pop("task_sig", None)
+        ns.pop("task_continues", None)
+        ns.pop("task_note_misses", None)
+        sessions = ns.get("sessions") or {}
+        for key in list(sessions):
+            if str(key).startswith("task:"):
+                sessions.pop(key, None)
+
+    def _reconcile_done_tasks(self, ns: Dict, graph) -> set:
+        """同一个 ID 的标题或依赖变了，就不再算做完。"""
+        done = set(ns.get("tasks_done") or [])
+        sig = dict(ns.get("task_sig") or {})
+        sessions = ns.setdefault("sessions", {})
+        current = {task.id: self._task_signature(task) for task in graph.tasks}
+        for tid in list(done):
+            if tid not in current or (tid in sig and sig.get(tid) != current[tid]):
+                done.discard(tid)
+                sig.pop(tid, None)
+                sessions.pop(f"task:{tid}", None)
+        ns["tasks_done"] = [task.id for task in graph.tasks if task.id in done]
+        ns["task_sig"] = {tid: sig[tid] for tid in ns["tasks_done"] if tid in sig}
+        return done
+
     def _assemble_task_ledger(self, tasks) -> None:
         rows = []
         for task in tasks:
-            path = os.path.join(self.root, ".gdd", "task-results", f"{task.id}.md")
-            line = ""
-            if os.path.isfile(path):
-                try:
-                    with open(path, encoding="utf-8", errors="replace") as f:
-                        line = " ".join(f.read().split())
-                except OSError:
-                    line = ""
+            line = self._task_note(task.id)
             if not line:
-                line = f"{task.id}｜已完成｜（任务会话未写核销行）｜见 .gdd/logs｜无"
+                line = (f"{task.id}｜未核销｜缺少核销行｜｜"
+                        f"需要补写 .gdd/task-results/{task.id}.md")
             rows.append(line)
         os.makedirs(os.path.join(self.root, "docs"), exist_ok=True)
         with open(os.path.join(self.root, "docs", "impl-ledger.md"), "w", encoding="utf-8") as f:

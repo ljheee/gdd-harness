@@ -11,7 +11,7 @@ from typing import List, Optional, Set
 
 SECTION = "## 附录：任务依赖"
 _ITEM = re.compile(
-    r"^[-*]\s+([A-Za-z][A-Za-z0-9_-]{0,31})\s*\|\s*([^|]*)\|\s*(\S.*?)\s*$"
+    r"^(?:[-*]\s+)?([A-Za-z][A-Za-z0-9_-]{0,31})\s*\|\s*([^|]*)\|\s*(\S.*?)\s*$"
 )
 _NONE = {"", "-", "无", "无依赖", "none"}
 
@@ -60,8 +60,11 @@ def parse(text: str) -> TaskGraph:
     tasks: List[Task] = []
     seen = set()
     for raw in body.splitlines():
-        line = raw.strip()
+        line = _normalize_line(raw.strip())
         if not line or line.startswith("#"):
+            continue
+        # 说明文字没有竖线，不参与拆分。有竖线却对不上格式，才是写坏的任务行。
+        if "|" not in line:
             continue
         matched = _ITEM.match(line)
         if not matched:
@@ -87,6 +90,11 @@ def parse(text: str) -> TaskGraph:
     if cycle:
         return TaskGraph(error=f"任务依赖成环：{' → '.join(cycle)}")
     return TaskGraph(tasks=tasks)
+
+
+def _normalize_line(line: str) -> str:
+    line = line.replace("｜", "|").replace("│", "|")
+    return re.sub(r"^\d+\s*[\.\)、]\s*", "", line)
 
 
 def _section(text: str) -> str:
