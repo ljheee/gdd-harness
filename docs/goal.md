@@ -35,7 +35,7 @@
 - 在未安装 Python/GDD 的机器上独立运行，或由 app 捆绑 Python/GDD。
 - GUI 工作台目录选择器、GUI 设置面板。
 - 从 app 内停止/重启控制台的按钮或菜单。
-- Windows/Linux 版本、Mac App Store 分发、签名与公证。
+- Windows/Linux 版本、Mac App Store 分发、Developer ID 签名与公证。
 - app 自动更新、多 app 实例协调、控制台异常退出后的自动重启。
 
 ## 验收标准（DoD）

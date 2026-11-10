@@ -124,7 +124,7 @@ app 启动（以及从 Dock 重新打开窗口）时按以下顺序执行：
 | C5 | app 自行启动的控制台在窗口关闭/app 退出后继续运行；下次启动复用；app 不终止外部启动的控制台 | 回答待澄清问题 4（`docs/requirement.md:18`） |
 | C6 | 通过只读 `GET /api/overview` 识别已有控制台；启动就绪上限不超过 30 秒；超时只终止本次拉起的子进程 | 控制台已有该只读接口（`gdd/ui.py:1086-1089`）；避免误判和孤儿进程 |
 | C7 | 配置必须持久化 GDD 源码、Python、工作台，并支持额外 PATH/环境变量；配置无效时拒绝启动并报错 | 解决 GUI 启动环境与 `PYTHONPATH` 问题（`gdd/runner.py:296-306`、`gdd/ui.py:1258-1260`） |
-| C8 | 不提供停止控制台 GUI、不自动重启控制台、不做签名/公证/Mac App Store 分发 | 本迭代边界；避免扩大范围 |
+| C8 | 不提供停止控制台 GUI、不自动重启控制台、不做 Developer ID 签名/公证/Mac App Store 分发 | 本迭代边界；避免扩大范围 |
 
 > C2–C8 是本节点对待澄清问题与实现边界的提议；在本节点审批通过后作为已确认决定。若审批驳回，按 feedback 修订 `docs/goal.md`、`docs/spec.md` 与 DoD。
 
@@ -134,5 +134,5 @@ app 启动（以及从 Dock 重新打开窗口）时按以下顺序执行：
 - 在未安装 Python/GDD 的机器上独立运行、捆绑 Python/GDD。
 - GUI 工作台目录选择器、GUI 设置面板、停止/重启控制台按钮。
 - 控制台异常退出后的自动重启、多 app 实例协调。
-- Windows/Linux 版本、Mac App Store、签名与公证、app 自动更新。
+- Windows/Linux 版本、Mac App Store、Developer ID 签名与公证、app 自动更新。
 - 修改 GDD 控制台的页面、API 或任务状态机。
