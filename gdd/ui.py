@@ -680,7 +680,7 @@ async function api(path,opts){
   if(!r.ok&&!j.error)j.error='HTTP '+r.status; return j;}
 
 async function refreshNav(){
-  const [ov]=await Promise.all([api('/api/overview')]);
+  const [ov]=await Promise.all([api('api/overview')]);
   if(!ov.ok)return;
   $('#navTasks').innerHTML=ov.tasks.map(t=>{
     const cls=t.running?'run':t.status==='completed'?'ok':t.awaiting?'wait':t.blocked?'block':t.status==='aborted'?'abort':t.status==='corrupt'?'block':'';
@@ -701,7 +701,7 @@ function bindLive(name){
   if(liveTask===name && liveEs) return;
   if(liveEs){liveEs.close();liveEs=null}
   liveTask=name; liveEvents=[]; liveScrollTop=0; liveStick=true;
-  const es=new EventSource('/api/task/'+encodeURIComponent(name)+'/live');
+  const es=new EventSource('api/task/'+encodeURIComponent(name)+'/live');
   liveEs=es;
   es.onmessage=(msg)=>{
     let ev; try{ev=JSON.parse(msg.data)}catch(e){return}
@@ -761,7 +761,7 @@ function paintLive(force){
 
 async function showNew(){
   stopPoll();view={mode:'new'};
-  const ov=await api('/api/overview');
+  const ov=await api('api/overview');
   const tpls=(ov.templates||[]).map(t=>`<option value="${esc(t.name)}">${esc(t.name)}${t.builtin?'（内置）':''}</option>`).join('');
   $('#main').innerHTML=`<h2>从模板启动新任务</h2><div class="card">
     <div class="two"><div class="row"><label>任务名（子目录）</label><input id="nName" placeholder="my-task"></div>
@@ -773,7 +773,7 @@ async function showNew(){
 }
 async function createTask(){
   const name=$('#nName').value.trim();
-  const j=await api('/api/tasks',{method:'POST',body:JSON.stringify({name,template:$('#nTpl').value,requirement:$('#nReq').value})});
+  const j=await api('api/tasks',{method:'POST',body:JSON.stringify({name,template:$('#nTpl').value,requirement:$('#nReq').value})});
   if(!j.ok){$('#nErr').innerHTML=`<div class="alert err">${esc(j.error)}</div>`;return}
   showTask(enc(name));
 }
@@ -789,7 +789,7 @@ async function renderTask(name){
   const rejEl=document.getElementById('rejFb'), clEl=document.getElementById('clInput'), stEl=document.getElementById('steerInput');
   if((rejEl&&document.activeElement===rejEl)||(clEl&&document.activeElement===clEl)||(stEl&&document.activeElement===stEl))return;
   const rejVal=rejEl?rejEl.value:'', clVal=clEl?clEl.value:'', stVal=stEl?stEl.value:'';
-  const j=await api('/api/task/'+encodeURIComponent(name));
+  const j=await api('api/task/'+encodeURIComponent(name));
   if(!j.ok){$('#main').innerHTML=`<div class="alert err">${esc(j.error)}</div>
     <div class="actions"><button class="warn" onclick="act('reset')">↺ 重置任务（删除 .gdd，不可恢复）</button></div>`;stopPoll();return}
   // await 期间用户可能又在输入框打了字：以请求返回时的现值为准，防旧快照覆盖新输入
@@ -880,7 +880,7 @@ async function renderTask(name){
 async function act(op){
   if(op==='reset'&&!confirm('确认重置？将删除 .gdd 全部状态，不可恢复。'))return;
   const fb=op==='reject'?(document.getElementById('rejFb')?.value||''):'';
-  const j=await api('/api/task/'+encodeURIComponent(view.name)+'/action',{method:'POST',body:JSON.stringify({op,feedback:fb})});
+  const j=await api('api/task/'+encodeURIComponent(view.name)+'/action',{method:'POST',body:JSON.stringify({op,feedback:fb})});
   if(!j.ok){alert(j.error||'操作失败');return}
   if(view.mode==='task')renderTask(view.name);
   refreshNav();
@@ -894,7 +894,7 @@ async function sendChat(nodeId){
   if(box.dataset.busy==='1')return;  // 防连点重复提交
   box.dataset.busy='1';
   try{
-    const j=await api('/api/task/'+encodeURIComponent(view.name)+'/action',{method:'POST',body:JSON.stringify({op:'chat',node:nodeId,message:msg})});
+    const j=await api('api/task/'+encodeURIComponent(view.name)+'/action',{method:'POST',body:JSON.stringify({op:'chat',node:nodeId,message:msg})});
     if(!j.ok){alert(j.error||'发送失败（输入内容已保留，请复制后重试）');return}
     if(!j.started){alert('发送未被受理（任务可能已在运行）：'+(j.error||'输入内容已保留，请稍后重试'));return}
     // 仅在后台对话线程确认受理（started）后清空：窗口关闭/完整性拒绝等
@@ -912,7 +912,7 @@ async function sendSteer(){
   if(box.dataset.busy==='1')return;
   box.dataset.busy='1';
   try{
-    const j=await api('/api/task/'+encodeURIComponent(view.name)+'/action',{method:'POST',body:JSON.stringify({op:'steer',message:msg})});
+    const j=await api('api/task/'+encodeURIComponent(view.name)+'/action',{method:'POST',body:JSON.stringify({op:'steer',message:msg})});
     if(!j.ok){alert(j.error||'未入队（输入已保留）');return}
     box.value=''; box.blur();
     renderTask(view.name);
@@ -924,7 +924,7 @@ async function clarifyDone(nodeId){
   const isReview=lastDetail&&lastDetail.clarify&&lastDetail.clarify.mode==='review';
   if(!confirm('结束澄清？'+(isReview?'产出将重过 exit 门禁。':'')))return;
   try{
-    const j=await api('/api/task/'+encodeURIComponent(view.name)+'/action',{method:'POST',body:JSON.stringify({op:'clarify_done',node:nodeId})});
+    const j=await api('api/task/'+encodeURIComponent(view.name)+'/action',{method:'POST',body:JSON.stringify({op:'clarify_done',node:nodeId})});
     if(!j.ok){alert(j.error||'操作失败');return}
     if(j.note)alert(j.note);
     renderTask(view.name);refreshNav();
@@ -934,7 +934,7 @@ async function clarifyDone(nodeId){
 async function showTplA(b64){showTpl(dec(b64))}
 async function showTpl(name){
   stopPoll();view={mode:'tpl',name};
-  const j=await api('/api/template/'+encodeURIComponent(name));
+  const j=await api('api/template/'+encodeURIComponent(name));
   if(!j.ok){$('#main').innerHTML=`<div class="alert err">${esc(j.error)}</div>`;return}
   const editable=!j.builtin;
   const cur=j.content;
@@ -956,20 +956,20 @@ function tplMode(m){
 }
 async function saveTpl(name){
   const content=$('#tplEdit').value;
-  const j=await api('/api/template/'+encodeURIComponent(name),{method:'PUT',body:JSON.stringify({content})});
+  const j=await api('api/template/'+encodeURIComponent(name),{method:'PUT',body:JSON.stringify({content})});
   if(!j.ok){$('#tplErr').innerHTML=`<div class="alert err">${esc(j.error)}</div>`;return}
   window._tpl=content; showTpl(name);
 }
 async function delTpl(name){
   if(!confirm('删除模板 '+name+'？'))return;
-  const j=await api('/api/template/'+encodeURIComponent(name),{method:'DELETE'});
+  const j=await api('api/template/'+encodeURIComponent(name),{method:'DELETE'});
   if(!j.ok){alert(j.error);return}
   view={mode:'home'};refreshNav();showNew();
 }
 async function forkTpl(name){
   const nn=(prompt('新模板名：','')||'').trim();
   if(!nn)return;
-  const j=await api('/api/template/'+encodeURIComponent(name),{method:'PUT',body:JSON.stringify({content:window._tpl,fork:nn})});
+  const j=await api('api/template/'+encodeURIComponent(name),{method:'PUT',body:JSON.stringify({content:window._tpl,fork:nn})});
   if(!j.ok){$('#tplErr').innerHTML=`<div class="alert err">${esc(j.error)}</div>`;return}
   showTpl(nn);refreshNav();
 }
@@ -1040,11 +1040,19 @@ class Handler(BaseHTTPRequestHandler):
         except (json.JSONDecodeError, UnicodeDecodeError):
             return {}
 
+    def _allowed_hosts(self) -> tuple:
+        """同源白名单：本机回环 + GDD_UI_EXTRA_HOSTS（逗号分隔，用于 IDE 代理等反向链路，
+        默认空 = 仅本机，fail-closed）。"""
+        extra = tuple(
+            h.strip() for h in os.environ.get("GDD_UI_EXTRA_HOSTS", "").split(",") if h.strip()
+        )
+        return ("127.0.0.1", "localhost") + extra
+
     def _guard_mutating(self) -> bool:
         """防 CSRF/DNS rebinding：变更类请求要求同源 Host + 自定义头
         （跨站 no-cors fetch 无法携带自定义头/JSON Content-Type）。"""
         host = (self.headers.get("Host") or "").split(":")[0]
-        if host not in ("127.0.0.1", "localhost"):
+        if host not in self._allowed_hosts():
             return False
         if not self.headers.get("X-GDD-Request"):
             return False
@@ -1063,7 +1071,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         # DNS rebinding 防护：GET 也校验同源 Host（rebound 域名的 Host 非本机即拒）
         host = (self.headers.get("Host") or "").split(":")[0]
-        if host not in ("127.0.0.1", "localhost"):
+        if host not in self._allowed_hosts():
             return self._json({"ok": False, "error": "拒绝：Host 非法"}, 403)
         try:
             self._route_get()
