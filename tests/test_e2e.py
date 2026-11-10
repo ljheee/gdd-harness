@@ -92,7 +92,7 @@ def test_t0_builtin_template_file():
     check(builtins.DELIVERY_PIPELINE == raw, "builtins 导出与文件内容一致（权威源）")
     fp = hashlib.sha256(json.dumps(builtins.DELIVERY_PIPELINE, sort_keys=True,
                                     ensure_ascii=False).encode()).hexdigest()[:16]
-    check(fp == "50e90f43e0046601", "模板内容指纹稳定（防误改）")
+    check(fp == "b0ea640e7f1d2348", "模板内容指纹稳定（防误改）")
 
     # 同源：两路 init 实例指纹一致（--pipeline delivery ≡ 传文件路径）
     d = fresh_project()
@@ -142,7 +142,7 @@ def test_a_happy_with_exit_bounce():
         "docs/survey.md": "# S\n## 现状分析\n## 影响面\n## 相关方与依赖\n## 风险与未知项\n",
         "docs/goal.md": "# G\n## 目标\n## 验收标准（DoD）\n",
         "docs/spec.md": "# S\n## 规格\n",
-        "docs/plan.md": "# P\n## 实现步骤\n## ADR\n",
+        "docs/plan.md": "# P\n## 实现步骤\n## ADR\n## 附录：任务依赖\n- T1 | - | 实现\n",
         "docs/acceptance.feature": "Feature: 验收\n  Scenario: 主路径\n    Given 就绪\n    When 执行\n    Then 通过\n",
         "docs/decisions.md": "# D\n## 决策记录\n",
         "docs/impl-ledger.md": "# L\n## 核销台账\n",

@@ -14,7 +14,9 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
 from . import approval as approval_mod
@@ -1671,6 +1673,11 @@ class Orchestrator:
             if os.path.isfile(os.path.join(self.root, _cl)) and _cl not in upstream:
                 upstream.append(_cl)
         raw_req = self.input_path if os.path.exists(self.input_path) else ""
+        if self._impl_node(node):
+            # 开发节点按方案附录的依赖并行。没有附录时仍走下面的单会话。
+            routed = self._run_impl_tasks(node, ns, runner, feedback, upstream, raw_req)
+            if routed is not None:
+                return routed
 
         def _subject_stream_cb():
             # 每次 run 新建打印机：resume 失败后再 fresh 时不得继承 text_n/omitted
@@ -1813,6 +1820,173 @@ class Orchestrator:
         routed = self._after_subject(node, ns, runner, session)
         if routed is not None:
             return routed
+        return self._run_exit_gate(node, ns, runner)
+
+    def _impl_node(self, node: NodeSpec) -> bool:
+        return bool(node.baseline_marker or node.id == "implement")
+
+    def _run_impl_tasks(self, node: NodeSpec, ns: Dict, runner: AgentRunner,
+                        feedback: str, upstream: List[str], raw_req: str) -> Optional[bool]:
+        """按附录把已就绪的任务并行做完。返回 None 表示改走单会话。"""
+        from . import taskgraph
+        from .node_ext import prepare
+        from .runner import SessionResult
+
+        graph = taskgraph.load_graph(os.path.join(self.root, "docs", "plan.md"))
+        if graph is None:
+            return None
+        if graph.error:
+            self._record("task_graph_invalid", node=node.id, reason=graph.error[:200])
+            return self._bounce_to_previous(node, gates.Verdict(
+                passed=False, reason=graph.error,
+                feedback="方案附录「任务依赖」需要改成无环的依赖拆分后再开发：" + graph.error))
+        done = set(ns.get("tasks_done") or [])
+        ready = graph.ready(done)
+        if not ready:
+            if len(done) < len(graph.tasks):
+                self._record("task_graph_stuck", node=node.id)
+                return self._bounce_to_previous(node, gates.Verdict(
+                    passed=False, reason="任务依赖无法继续",
+                    feedback="还有任务没做，但它们的依赖没有全部完成。请检查附录里的依赖。"))
+            if feedback:
+                # 出口打回时任务已经跑完，回到单会话按反馈改，避免把做完的任务再并行一遍。
+                return None
+            self._assemble_task_ledger(graph.tasks)
+            return self._run_exit_gate(node, ns, runner)
+
+        self._present("ui_phase", phase="subject", node=node.id, name=node.name,
+                      tasks=",".join(task.id for task in ready))
+        self._record("task_wave", node=node.id, tasks=[task.id for task in ready])
+        sessions = ns.setdefault("sessions", {})
+        ext = None
+        try:
+            ext = prepare(self.root, node)
+        except (ValueError, OSError) as e:
+            return self._handle_gate_error(node, gates.Verdict(
+                passed=False, gate_error=True,
+                reason=f"节点 MCP/skill 无法加载: {e}",
+                feedback="节点扩展没有加载成功，请修复后重试。"))
+        stream_lock = threading.Lock()
+        base_cb = None
+        if self.on_stream:
+            try:
+                base_cb = self.on_stream("subject")
+            except Exception:
+                base_cb = None
+
+        def _one(task):
+            task_runner = type(runner)(self.root)
+            task_runner.steer_subject = True
+            task_runner.node_extensions = ext
+            sid = sessions.get(f"task:{task.id}", "") if os.environ.get(
+                "GDD_SUBJECT_RESUME", "on") != "off" else ""
+            prompt = self._task_prompt(node, task, feedback, upstream, raw_req, bool(sid))
+            cb = None
+            if base_cb is not None:
+                def cb(ev, tid=task.id):
+                    if isinstance(ev, dict) and ev.get("kind") == "text":
+                        ev = dict(ev)
+                        ev["text"] = f"[{tid}] {ev.get('text') or ''}"
+                    with stream_lock:
+                        base_cb(ev)
+            try:
+                return task_runner.run(
+                    prompt, allowed_tools=gates.SUBJECT_TOOLS,
+                    max_turns=node.subject.max_turns,
+                    log_path=logs[task.id],
+                    resume_sid=sid,
+                    on_stream=cb,
+                )
+            except Exception as e:
+                return SessionResult(ok=False, error=str(e))
+
+        logs = {task.id: self._log_path(node, f"task-{task.id}") for task in ready}
+        from . import steer as steer_mod
+        steer_mod.mark_subject(self.root, True)
+        try:
+            with ThreadPoolExecutor(max_workers=len(ready)) as pool:
+                futures = [pool.submit(_one, task) for task in ready]
+                results = [future.result() for future in futures]
+        finally:
+            steer_mod.mark_subject(self.root, False)
+
+        failed = []
+        for task, session in zip(ready, results):
+            if session.session_id:
+                sessions[f"task:{task.id}"] = session.session_id
+            self._record("task_done" if session.ok else "task_fail",
+                         node=node.id, task=task.id, ok=bool(session.ok),
+                         error=(session.error or "")[:160])
+            if session.ok:
+                done.add(task.id)
+                session = self._steer_fallback(
+                    node, type(runner)(self.root), session, lambda: base_cb)
+                if session.session_id:
+                    sessions[f"task:{task.id}"] = session.session_id
+            else:
+                failed.append((task, session))
+        ns["tasks_done"] = [task.id for task in graph.tasks if task.id in done]
+        self._check_tamper("subject")
+        self._save()
+        if failed:
+            task, session = failed[0]
+            return self._handle_gate_error(node, gates.Verdict(
+                passed=False, gate_error=True,
+                reason=f"任务 {task.id} 会话失败: {session.error}",
+                feedback=f"任务 {task.id} 没有完成（{str(session.error)[:200]}）。已完成的任务不用重做。"))
+        routed = None
+        for task, session in zip(ready, results):
+            if not session.ok:
+                continue
+            decided = self._after_subject(node, ns, runner, session)
+            if decided is not None and routed is None:
+                routed = decided
+        if routed is not None:
+            return routed
+        if graph.ready(done):
+            return True
+        self._assemble_task_ledger(graph.tasks)
+        return self._run_exit_gate(node, ns, runner)
+
+    def _task_prompt(self, node: NodeSpec, task, feedback: str,
+                     upstream: List[str], raw_req: str, resume: bool) -> str:
+        deps = "、".join(task.deps) if task.deps else "无"
+        focus = (
+            f"\n\n[[GDD-TASK:{task.id}]]\n"
+            f"本轮只实现这一个已经就绪的任务，不要做附录里的其他任务。\n"
+            f"任务 {task.id}：{task.title}\n"
+            f"依赖：{deps}。这些依赖都已经完成。\n"
+            f"做完后把一行核销写到 .gdd/task-results/{task.id}.md，"
+            f"格式：ID｜处理结果｜代码位置｜证据｜待办。\n"
+        )
+        if resume:
+            extra = f"\n上轮反馈：\n{feedback}\n" if feedback else ""
+            return (f"[[GDD-ROLE:subject node:{node.id}]]\n"
+                    f"你是 GDD 流水线「{node.name}」节点的执行主体。\n"
+                    f"继续完成任务 {task.id}，不要重做已经完成的任务。"
+                    f"{extra}{focus}")
+        prompt = gates.build_subject_prompt(node, self.pipeline, upstream, feedback, raw_req)
+        return self._decorate_subject_prompt(node, prompt + focus)
+
+    def _assemble_task_ledger(self, tasks) -> None:
+        rows = []
+        for task in tasks:
+            path = os.path.join(self.root, ".gdd", "task-results", f"{task.id}.md")
+            line = ""
+            if os.path.isfile(path):
+                try:
+                    with open(path, encoding="utf-8", errors="replace") as f:
+                        line = " ".join(f.read().split())
+                except OSError:
+                    line = ""
+            if not line:
+                line = f"{task.id}｜已完成｜（任务会话未写核销行）｜见 .gdd/logs｜无"
+            rows.append(line)
+        os.makedirs(os.path.join(self.root, "docs"), exist_ok=True)
+        with open(os.path.join(self.root, "docs", "impl-ledger.md"), "w", encoding="utf-8") as f:
+            f.write("# 核销台账\n\n## 核销台账\n\n" + "\n".join(rows) + "\n")
+
+    def _run_exit_gate(self, node: NodeSpec, ns: Dict, runner: AgentRunner) -> bool:
         # 上轮打回项：随 exit 门禁逐项核验；**核验通过才消费**（pop 后移）——
         # 门禁自身故障（exit_retry）或进程崩溃时反馈保留在 state，重试/重启后不丢失核验项
         pending_fb = self.state["feedbacks"].get(node.id, "")
