@@ -574,7 +574,7 @@ def _go_event_printer(event: str, **kw) -> None:
 def _go_guide_init(o: Orchestrator) -> bool:
     """未初始化时的交互引导：选模板 → 输需求 → init。"""
     print("未初始化。选择模板：")
-    print("  1) delivery（内置：需求交付流水线，9 节点）")
+    print("  1) delivery（内置：需求交付流水线，8 节点）")
     print("  2) 输入模板文件路径（JSON/YAML）")
     try:
         choice = input("> ").strip()
