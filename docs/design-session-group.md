@@ -82,10 +82,11 @@ _subject_group_sid(group) -> str   # 扫描所有 node_states[*].sessions.subjec
 
 ## 4. 内置模板
 
-delivery（ 九节点）套 `clarify-design` 预设：project_init→survey→clarify→plan
+delivery（九节点）套 `clarify-design` 预设：project_init→survey→clarify→plan
 四个相邻 clarify 节点归入 gdd_design 组，implement 及以后独立——其中 implement
-靠显式 `session_group: impl_standalone` 自述语义（不受预设影响）。内置模板现为
-文件化定义（gdd/templates/delivery.json，唯一权威源），无其他内置模板。
+靠显式 `session_group: impl_standalone` 自述语义（不受预设影响）。review 不写
+session_group，每次进入新建只读会话，不复用 implement 或上一轮评审会话。
+内置模板现为文件化定义（gdd/templates/delivery.json，唯一权威源），无其他内置模板。
 
 ## 5. 迁移
 

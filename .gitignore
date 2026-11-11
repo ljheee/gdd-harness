@@ -2,11 +2,14 @@
 
 # dependencies
 /node_modules
-package-lock.json
 
 # gdd runtime state
 .gdd/
-iterations
+
+# delivery artifacts intentionally ignored in the working tree; exit-declared
+# artifacts are force-added by the harness (see _deliver_git)
+package-lock.json
+iterations/
 
 # python
 __pycache__/

@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 from . import acceptance as acceptance_mod
 from . import approval as approval_mod
 from . import gates
+from . import review as review_mod
 from . import revision as revision_mod
 from . import taskgraph
 from .models import ArtifactCheck, NodeSpec, PipelineSpec, _parse_bool
@@ -904,16 +905,6 @@ class Orchestrator:
             # 分支名相同但 tip 已变（主体在 side 分支 commit 后切回交付分支再 exit）：
             # cur==branch 使 rev-list 散落检测不运行——对比 init 时分支快照补检
             stray_ref = self._stray_from_branch_snapshot(cfg.branch)
-        # P2-5 / P1-3：排除根级与任意深度嵌套 .gdd 及其下文件（见 _GIT_ADD_PATHSPEC）
-        add = self._git_add_all()
-        if add is None or add.returncode != 0:
-            # add 失败（index.lock/权限）→ 静默空索引会把交付记成“无改动”丢失
-            _fail(node.id, (((add.stderr if add else "") or "git add 失败（index.lock/权限？）").strip())[:200])
-            return
-        # 只看真正暂存的内容（status --porcelain 会把未跟踪的 .gdd/ 也列出，误判为有暂存）
-        staged = self._git_proc("diff", "--cached", "--name-only")
-        staged_files = ([ln for ln in staged.stdout.splitlines() if ln.strip()]
-                        if (staged is not None and staged.returncode == 0) else None)
         # 声明产物展开到具体文件（glob 是一等语义，与门禁/快照同一匹配语义）：
         # 展开后逐文件核对 ignore，防 glob 声明的产物被 .gitignore 挡住时静默不交付
         # （stray_ref 已警示：产物可能随分支切换被回收，missing 时归因滞留而非误报“被删”）
@@ -936,6 +927,26 @@ class Orchestrator:
                 declared.extend(os.path.relpath(m, self.root) for m in hits)
             else:
                 missing.append(str(a.path))
+        # P2-5 / P1-3：排除根级与任意深度嵌套 .gdd 及其下文件（见 _GIT_ADD_PATHSPEC）
+        add = self._git_add_all()
+        if add is None or add.returncode != 0:
+            # add 失败（index.lock/权限）→ 静默空索引会把交付记成“无改动”丢失
+            _fail(node.id, (((add.stderr if add else "") or "git add 失败（index.lock/权限？）").strip())[:200])
+            return
+        # D23：.gitignore 保留 iterations/package-lock 忽略项时，exit 声明的产物
+        # 仍要入库。只对声明产物 git add -f；未被声明的 ignored 文件不得进索引。
+        ignored_declared = self._ignored_of(declared)
+        if ignored_declared:
+            forced = self._git_proc("add", "-f", "--", *ignored_declared)
+            if forced is None or forced.returncode != 0:
+                _fail(node.id, ("声明产物强制加入失败: "
+                                + (((forced.stderr if forced else "") or "").strip()[:150])))
+                return
+            self._record("git_force_add", node=node.id, paths=ignored_declared[:10])
+        # 只看真正暂存的内容（status --porcelain 会把未跟踪的 .gdd/ 也列出，误判为有暂存）
+        staged = self._git_proc("diff", "--cached", "--name-only")
+        staged_files = ([ln for ln in staged.stdout.splitlines() if ln.strip()]
+                        if (staged is not None and staged.returncode == 0) else None)
         if outside:
             # P2-11：声明产物在任务根外过门禁曾被静默不交付（../outside.md
             # 转 ../ relpath 后 add -A 永不可暂存，记假「无改动」+「✅ done
@@ -1863,6 +1874,127 @@ class Orchestrator:
                 "请对照以下失败用例检查并同步修正：\n"
                 + revision_mod.format_failed(code_fails))
 
+    # ------------------------------------------------------------ 代码评审
+
+    def _review_path(self) -> str:
+        return os.path.join(self.root, self._output_dir(), "review.md")
+
+    def _review_baseline(self) -> str:
+        """代码评审的 diff 基线：implement 节点 entry 时记录的 commit。"""
+        impl = self._implement_node()
+        if impl is None:
+            return ""
+        return str(self.state.get(f"baseline_commit:{impl.id}") or "")
+
+    def _review_change_summary(self, baseline: str) -> str:
+        """本次 implement 基线以来的 diff/status 摘要。
+
+        评审会话只有 Read/Grep/Glob（无 Bash），跑不了 git；diff 由 harness
+        附进 prompt。未跟踪文件在 status 里列出，评审可用 Read 自行核实。
+        """
+        parts: List[str] = []
+        stat = self._git("diff", "--stat", baseline)
+        if stat:
+            parts.append(f"git diff --stat {baseline[:10]}:\n{stat}")
+        diff = self._git("diff", baseline)
+        if diff:
+            limit = 120000
+            body = diff if len(diff) <= limit else (
+                diff[:limit] + "\n...（diff 已截断；其余改动请用 Read/Grep 核实）")
+            parts.append(f"git diff {baseline[:10]}（含已提交与未提交改动）:\n{body}")
+        else:
+            parts.append("git diff 为空：本次 implement 基线以来没有可核实的改动。"
+                         "若确实应有改动，按无法核实处理，不得判通过。")
+        status = self._git("status", "--short")
+        if status:
+            parts.append(f"git status --short（未跟踪文件可用 Read 查看）:\n{status}")
+        return "\n\n".join(parts)
+
+    def _phase_review(self, node: NodeSpec, ns: Dict, runner: AgentRunner) -> bool:
+        """代码评审主体：每次进入都新建只读会话，不复用 implement/上一轮评审会话。"""
+        baseline = self._review_baseline()
+        if not baseline:
+            return self._handle_gate_error(node, gates.Verdict(
+                passed=False, gate_error=True,
+                reason="代码评审找不到 implement 基线 commit，无法确定本次改动范围",
+                feedback=("请确认 implement 节点是 baseline_marker 且已通过 entry 门禁；"
+                          "找不到基线时评审按无法核实处理，不得判通过。")))
+        self._present("ui_phase", phase="review", node=node.id, name=node.name)
+        feedback = self.state["feedbacks"].get(node.id, "")
+        prompt = gates.build_review_prompt(
+            node, self._output_dir(), self._review_change_summary(baseline), feedback)
+        session = runner.run(
+            prompt, allowed_tools=gates.REVIEW_TOOLS,
+            max_turns=node.subject.max_turns,
+            log_path=self._log_path(node, "review"))
+        self._check_tamper("review")
+        parsed = review_mod.parse_review(session.text or "") if session.ok else None
+        if not session.ok or parsed is None:
+            reason = ("评审会话执行失败: " + (session.error or "")) if not session.ok else (
+                "评审会话未输出可解析的 GDD-REVIEW 哨兵")
+            return self._handle_gate_error(node, gates.Verdict(
+                passed=False, gate_error=True, reason=reason[:500],
+                feedback=("请重新运行评审，并在回复最后一行只输出一条合法 "
+                          "GDD-REVIEW 哨兵；不可解析按故障重试，不得按通过处理。")))
+        self._clear_gate_error_streak()
+        try:
+            review_mod.write_report(self._review_path(), parsed)
+        except OSError as e:
+            return self._handle_gate_error(node, gates.Verdict(
+                passed=False, gate_error=True,
+                reason=f"评审报告落盘失败: {e}"[:500],
+                feedback="请检查产物目录可写后重试。"))
+        blocking = review_mod.has_blocking(parsed)
+        issues = list(parsed.get("issues") or [])
+        self._record("review_result", node=node.id, verdict=parsed.get("verdict"),
+                     blocking=blocking, issues=len(issues),
+                     blockers=sum(1 for i in issues if i.get("severity") == "blocker"))
+        if blocking:
+            return self._return_to_implement_from_review(node, ns, parsed)
+        return self._run_exit_gate(node, ns, runner)
+
+    def _return_to_implement_from_review(self, review_node: NodeSpec, ns: Dict,
+                                         parsed: Dict) -> bool:
+        """评审不通过：打回 implement，保留任务进度，按 implement 的 bounces 计预算。"""
+        impl = self._implement_node()
+        problems = review_mod.render_problems(parsed)
+        text = ("代码评审未通过。请按以下问题清单修改实现（逐条处理；只改本次实现范围内的"
+                "代码，不要重做未受影响的历史实现；修改后更新核销台账）：\n" + problems)
+        if impl is None:
+            return self._bounce_current(review_node, gates.Verdict(
+                passed=False, reason="代码评审未通过", feedback=text))
+        ins = self.state["node_states"][impl.id]
+        ins["bounces"] = ins.get("bounces", 0) + 1
+        self.state["feedbacks"][impl.id] = text
+        self.state.setdefault("feedback_kinds", {})[impl.id] = "review"
+        self._record("review_bounce", node=impl.id, from_node=review_node.id,
+                     issues=len(parsed.get("issues") or []))
+        if ins["bounces"] >= impl.max_bounces:
+            self.state["status"] = "blocked"
+            self.state["blocked_reason"] = (
+                f"实现环节因代码评审打回已达上限 {impl.max_bounces}：{text[:300]}")
+            self.state["blocked_owner"] = impl.id
+            self._record("blocked", node=impl.id, reason="review")
+            self._save()
+            return False
+        ins["phase"] = "working"
+        passed = False
+        for n in self.pipeline.nodes:
+            if n.id == impl.id:
+                passed = True
+                continue
+            if passed:
+                later = self.state["node_states"][n.id]
+                later["phase"] = "pending"
+                later.pop("adversarial_done", None)
+                later.pop("env_retries", None)
+        # 评审每次进入都新建会话：清掉本节点存档（若存在）
+        ns.get("sessions", {}).pop("subject", None)
+        self.state["current"] = impl.id
+        self._record("review_fail", node=review_node.id, bounces=ins["bounces"])
+        self._save()
+        return True
+
     def _rerun_test(self, node: NodeSpec, ns: Dict, cases: List[dict]) -> bool:
         fails = revision_mod.failed_cases(cases)
         env_only = bool(fails) and all(c.get("cause") == "env" for c in fails)
@@ -1924,6 +2056,10 @@ class Orchestrator:
         fb_kind = self.state.get("feedback_kinds", {}).get(node.id, "")
         ns["attempts"] = ns.get("attempts", 0) + 1  # 极老 state 兼容
         self._save()
+
+        if node.review:
+            # 代码评审：独立只读会话，不复用主体会话组；失败按内容打回 implement
+            return self._phase_review(node, ns, runner)
 
         upstream = gates.collect_upstream_artifacts(self.pipeline, node, self.root)
         # 本节点澄清结论固化产物：仅 clarify 节点注入 CLARIFY_<node>.md（澄清会话专用固化文档）。

@@ -29,6 +29,8 @@ from .runner import AgentRunner, SessionResult
 
 GATE_TOOLS = ["Read", "Grep", "Glob", "Bash"]
 SUBJECT_TOOLS = ["Read", "Write", "Edit", "MultiEdit", "Grep", "Glob", "Bash"]
+# 代码评审只读：不提供 Write/Edit/MultiEdit/Bash，从工具层保证不能改仓库
+REVIEW_TOOLS = ["Read", "Grep", "Glob"]
 
 
 def _env_int(name: str, default: int) -> int:
@@ -552,6 +554,53 @@ def build_subject_prompt(
 4. 完成工作后写节点报告：{report_rel}，包含三节：完成情况 / 证据（命令与关键输出摘要）/ 未决项。
 
 现在开始工作。"""
+
+
+def build_review_prompt(
+    node: NodeSpec,
+    output_dir: str,
+    change_summary: str,
+    feedback: str = "",
+) -> str:
+    """代码评审主体 prompt：独立只读会话 + GDD-REVIEW 哨兵。
+
+    评审不能复用 implement 的会话/结论；diff 摘要由 harness 附上（review 工具
+    白名单无 Bash，会话自己跑不了 git）。报告由 harness 落盘，评审会话不写文件。
+    """
+    marker = f"[[GDD-ROLE:review node:{node.id}]]"
+    fb_part = ""
+    if feedback:
+        fb_part = f"\n上一轮评审未通过或被门禁打回，反馈（逐项核实是否已处理）：\n{feedback}\n"
+    return f"""{marker}
+你是 GDD 流水线「{node.name}」节点的执行主体，负责本次实现的代码评审。
+本节点使用独立、只读的评审会话：不复用开发实现节点的会话或结论。
+
+节点ID: {node.id}
+工作目录：当前项目根目录。
+本次产物目录：{output_dir}
+
+评审依据（必须自己读文件核实，不采信开发节点的自评、impl-ledger 的结论或开发会话的历史）：
+- {output_dir}/goal.md：已确认的目标与验收标准
+- {output_dir}/spec.md：已确认的规格、边界与决定
+- {output_dir}/plan.md：已确认的实现方案与任务拆分
+- {output_dir}/impl-ledger.md：开发核销台账（只作线索，不作为结论）
+- 本次 implement 基线以来的改动（见下方 git diff/status 摘要）
+
+只读纪律：
+1. 只允许 Read/Grep/Glob；不提供 Write/Edit/Bash。不要尝试修改任何文件。
+2. 评审范围只限本次 implement 基线以来的改动；未改动的历史实现只作上下文，不作为新缺陷来源。
+3. 只评审本次实现是否满足已确认的 goal/spec/plan；不重新设计、不扩大范围、不替代测试节点的 DoD 验证。
+4. 无法核实的事项写进问题清单，不得默认通过；找不到 implement 基线或 diff 时按无法核实处理，不得判通过。
+
+本次 implement 基线以来的改动摘要：
+{change_summary or '（未找到 implement 基线或 diff；按无法核实处理，不得判通过。）'}
+{fb_part}
+输出要求：
+- 每个问题写清 severity（blocker/major/minor）、文件、行号、对应的 goal/spec/plan 条款和问题描述；
+- 最后一行只输出一次哨兵（其后不得有任何内容）：
+GDD-REVIEW: {{"verdict":"pass|fail","issues":[{{"severity":"blocker|major|minor","file":"path/to/file","line":123,"clause":"goal/spec/plan 条款","problem":"问题描述"}}]}}
+- verdict=fail 或存在 blocker/major 即不通过；minor 可保留不阻塞。
+- harness 只采信最后一条合法哨兵，并据它落盘 review.md。"""
 
 
 # ---------------------------------------------------------------- 门禁执行

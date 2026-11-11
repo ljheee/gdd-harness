@@ -20,7 +20,7 @@ export PYTHONPATH=/path/to/GDD        # 或 pip install -e /path/to/GDD
 (cd /path/to/GDD && npm ci)           # 在 GDD 仓库根安装 pi 执行端依赖（Node >= 22.19）
 # 启动控制台后在「设置」页配置端点 / API key / 模型；也可直接编辑 ~/.gdd/pi-settings.json
 
-# 用内置需求交付流水线初始化（七阶段+，8 节点，3 个人工确认点）
+# 用内置需求交付流水线初始化（七阶段+，9 节点，3 个人工确认点）
 gdd init --name my-change --requirement requirement.md
 
 gdd go           # 单命令交互：init→推进（主体流式）→审批→澄清（全文流式）→终态（推荐）
@@ -163,12 +163,13 @@ cargo tauri build --bundles app
 
 ## 内置 pipeline：delivery（需求交付，七阶段+）
 
-`project_init → survey → clarify → plan → implement → test → delivery → release_checklist`
+`project_init → survey → clarify → plan → implement → review → test → delivery → release_checklist`
 
 - 人工确认 3 节点：**clarify**（DoD）、**plan**（方案）、**test**（上线前测试结论）。
 - 每个节点内置基础 entry（上游产物机器检查 + AI 门禁语义验证——注意：内置模板每个 entry 都带 goal，即每节点最多 3 个 AI 会话：entry 门禁 + 主体 + exit 门禁）与 exit（本节点产物 + AI 判据）。
-- implement 为 baseline_marker 节点；test 的 exit 为 change_aware（AI 基于改动补充验证）。
-- 各节点产物都在 `iterations/<名字>/`：`requirement.md`、`survey.md`、`goal.md`（DoD）、`spec.md`、`plan.md`（ADR）、`acceptance.feature`、`decisions.md`、`impl-ledger.md`（核销台账）、`test-report.md`、`verify.md`、`delivery.md`、`RELEASE-CHECKLIST.md`。不写项目的 `docs/`，也不写仓库根目录。已有迭代的 `spec.md` 和 `decisions.md` 在下次初始化时列为只读基线。同名目录已有文件则拒绝再初始化。
+- implement 为 baseline_marker 节点；**review** 是独立只读代码评审节点：每次进入新建会话、工具仅 Read/Grep/Glob，核对本次 implement 基线以来的改动是否满足 goal/spec/plan；不通过打回 implement（计入 implement 的 bounces），通过才进入 test；不新增人工审批，报告由 harness 落盘为 `review.md`。
+- test 的 exit 为 change_aware（AI 基于改动补充验证）。
+- 各节点产物都在 `iterations/<名字>/`：`requirement.md`、`survey.md`、`goal.md`（DoD）、`spec.md`、`plan.md`（ADR）、`acceptance.feature`、`decisions.md`、`impl-ledger.md`（核销台账）、`review.md`（评审结论 + 问题清单）、`test-report.md`、`verify.md`、`delivery.md`、`RELEASE-CHECKLIST.md`。不写项目的 `docs/`，也不写仓库根目录。已有迭代的 `spec.md` 和 `decisions.md` 在下次初始化时列为只读基线。同名目录已有文件则拒绝再初始化。
 
 ## Agent 执行端配置（环境变量）
 

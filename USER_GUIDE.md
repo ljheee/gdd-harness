@@ -16,7 +16,7 @@ GDD 是一个**本地节点流水线编排引擎**：你定义节点（做什么
 - 流转、打回、审批、git 交付全部由 harness 代码决定
 - 会话篡改 `.gdd/` 状态会被内存权威副本自动恢复
 
-内置一条 8 节点需求交付流水线（ 七阶段+）：一句需求 → 文档 → 实现 → 测试 → 上线检查单。
+内置一条 9 节点需求交付流水线（七阶段+）：一句需求 → 文档 → 实现 → 代码评审 → 测试 → 上线检查单。
 
 ---
 
@@ -69,7 +69,7 @@ GDD 是一个**本地节点流水线编排引擎**：你定义节点（做什么
 # 1. 写需求（一句话也行）
 echo "实现一个 TODO CLI，支持增删查，带 pytest 测试" > req.md
 
-# 2. 初始化（delivery = 内置 8 节点流水线）
+# 2. 初始化（delivery = 内置 9 节点流水线，含 implement→review→test）
 python3 -m gdd.cli init --root ./myproj --name my-change --pipeline delivery --requirement req.md
 
 # 3. 开跑（会自动推进，停在人工审批点）

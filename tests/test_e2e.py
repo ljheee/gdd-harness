@@ -34,6 +34,7 @@ from gdd.orchestrator import Orchestrator  # noqa: E402
 STUB = os.path.join(ROOT, "tests", "pi_stub.py")
 PASS = 'GDD-VERDICT: {"verdict": "pass", "reason": "stub通过", "evidence": ["stub-evidence"], "feedback": ""}'
 FAIL = 'GDD-VERDICT: {"verdict": "fail", "reason": "stub不合格", "evidence": [], "feedback": "请补充X后重试"}'
+PASS_REVIEW = 'GDD-REVIEW: {"verdict":"pass","issues":[]}'
 
 
 def make_script(rules):
@@ -103,7 +104,7 @@ def test_t0_builtin_template_file():
     check(builtins.DELIVERY_PIPELINE == raw, "builtins 导出与文件内容一致（权威源）")
     fp = hashlib.sha256(json.dumps(builtins.DELIVERY_PIPELINE, sort_keys=True,
                                     ensure_ascii=False).encode()).hexdigest()[:16]
-    check(fp == "c8af80545defae25", "模板内容指纹稳定（防误改）")
+    check(fp == "c7fd0430d32bc526", "模板内容指纹稳定（防误改）")
 
     # 同源：绑定同一迭代名后，内置名与文件路径 init 出的实例指纹一致
     d = fresh_project()
@@ -129,6 +130,12 @@ def test_t0_builtin_template_file():
 def test_a_happy_with_exit_bounce():
     print("[A] 全流程 + exit 首轮打回")
     d = fresh_project()
+    # review 节点需要 implement 的 baseline commit；空仓库先建一个基线提交
+    subprocess.run(["git", "init", "-q"], cwd=d, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=d, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=d, check=True)
+    subprocess.run(["git", "commit", "--allow-empty", "-qm", "baseline"],
+                   cwd=d, check=True)
     script = os.path.join(d, "stub.json")
     # 主体按节点关键词产出文件（用 bash 触碰产物）；exit 门禁首轮 fail、之后 pass
     rules = [
@@ -239,6 +246,10 @@ def test_a_happy_with_exit_bounce():
                             f.write(files[rel])
                         break
                 return SessionResult(ok=True, text="subject done", session_id="s", turns=2)
+            if "[[GDD-ROLE:review" in prompt:
+                return SessionResult(
+                    ok=True, text='GDD-REVIEW: {"verdict":"pass","issues":[]}',
+                    session_id="rev", turns=1)
             if "[[GDD-ROLE:adversarial" in prompt:
                 return SessionResult(
                     ok=True,
@@ -2091,8 +2102,12 @@ def test_w_approve_tamper_fail_closed():
 
 
 def test_x_gitignore_artifact_flagged():
-    """X: 产物被 .gitignore 挡住 → 显式警示而非静默“无改动”（P1-1 钉住）."""
-    print("[X] gitignore 产物丢失检出")
+    """X: exit 声明产物被 .gitignore 挡住 → 交付层 force-add（D23，本轮 L0 决定）.
+
+    旧行为（记 commit_failed、产物不入分支）已被「保留 ignored + 强制加入声明产物」
+    取代；未声明的 ignored 文件仍不得入库。
+    """
+    print("[X] gitignore 声明产物 force-add")
     d = fresh_project()
 
     from gdd.runner import SessionResult, AgentRunner
@@ -2110,9 +2125,11 @@ def test_x_gitignore_artifact_flagged():
             if "[[GDD-ROLE:subject" in prompt:
                 with open(os.path.join(self.root, "a.md"), "w") as f:
                     f.write("ok\n")
+                with open(os.path.join(self.root, "b.md"), "w") as f:
+                    f.write("未声明\n")
                 # 主体会话写了 .gitignore 把产物挡住（add -A 跳过 ignored）
                 with open(os.path.join(self.root, ".gitignore"), "w") as f:
-                    f.write("a.md\n")
+                    f.write("a.md\nb.md\n")
                 return SessionResult(ok=True, text="ok", turns=1)
             return SessionResult(ok=True, text=PASS)
 
@@ -2125,18 +2142,16 @@ def test_x_gitignore_artifact_flagged():
         status = o.run()
         st = state_of(d)
         check(status == "completed", f"X: 流水线照常完成（{status}）")
-        cf = st.get("commit_failed")
-        check(cf and "a.md" in (cf.get("reason") or ""),
-              f"X: commit_failed 警示指向被忽略产物（{cf}）")
+        check(not st.get("commit_failed"),
+              f"X: 声明产物被 force-add 后无交付失败（{st.get('commit_failed')}）")
         evts = [e["event"] for e in st["history"]]
-        check("git_commit_fail" in evts, "X: 失败事件入 history")
-        check(not any(e["event"] == "git_commit_skip" and "无改动" in (e.get("reason") or "")
-                      for e in st["history"]),
-              "X: 不再误记“无改动”")
+        check("git_force_add" in evts, "X: 记录 git_force_add")
+        check("git_commit_fail" not in evts, "X: 无交付失败事件")
         import subprocess as sp
         ls = sp.run(["git", "ls-tree", "-r", "--name-only", "gdd/delivery"], cwd=d,
-                    capture_output=True, text=True).stdout
-        check("a.md" not in ls.split(), "X: 产物确未进入交付分支")
+                    capture_output=True, text=True).stdout.split()
+        check("a.md" in ls, "X: 声明产物进入交付分支")
+        check("b.md" not in ls, "X: 未声明的 ignored 文件不进入交付分支")
     finally:
         orch.AgentRunner = orig
     shutil.rmtree(d)
@@ -3059,6 +3074,11 @@ def test_s2_pi_stub_full_delivery():
 
     d = tempfile.mkdtemp(prefix="gdd-e2e-s2-")
     subprocess.run(["git", "init", "-q"], cwd=d, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=d, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=d, check=True)
+    # implement 的 baseline_marker 需要 HEAD；review 的 diff 以该基线为起点
+    subprocess.run(["git", "commit", "--allow-empty", "-qm", "baseline"],
+                   cwd=d, check=True)
     out = "iterations/s2"
     plan_md = (
         "# 方案\n## 实现步骤\n1. T1\n2. T2\n"
@@ -3108,6 +3128,7 @@ def test_s2_pi_stub_full_delivery():
          "write_files": wf(f"{out}/requirement.md")},
         {"patterns": ["[[GDD-ROLE:subject node:survey]]"],
          "write_files": wf(f"{out}/survey.md")},
+        {"patterns": ["[[GDD-ROLE:review"], "text": PASS_REVIEW},
         {"patterns": ["[[GDD-ROLE:subject node:test]]"],
          "write_files": wf(f"{out}/test-report.md", f"{out}/verify.md")},
         {"patterns": ["[[GDD-ROLE:subject node:delivery]]"],
@@ -3142,6 +3163,7 @@ def test_s2_pi_stub_full_delivery():
         st = state_of(d)
         events = [e.get("event") for e in st["history"]]
         check("adversarial_code" in events, "S2: 发生一次 code 失败打回")
+        check("review_result" in events, "S2: review 节点参与全链路")
         routes = [e for e in st["history"] if e.get("event") == "task_route"]
         check(routes and set(routes[-1].get("tasks") or []) == {"T1", "T2"},
               f"S2: 按关联任务与下游闭包打回（{routes[-1] if routes else None}）")
@@ -3155,8 +3177,13 @@ def test_s2_pi_stub_full_delivery():
         with open(ledger, encoding="utf-8") as f:
             body = f.read()
         check("## 核销台账" in body and "T1" in body and "T2" in body, "S2: 台账内容")
-        for rel in ("test-report.md", "verify.md", "delivery.md", "RELEASE-CHECKLIST.md"):
+        for rel in ("review.md", "test-report.md", "verify.md", "delivery.md",
+                    "RELEASE-CHECKLIST.md"):
             check(os.path.isfile(os.path.join(d, out, rel)), f"S2: {rel} 产出")
+        with open(os.path.join(d, out, "review.md"), encoding="utf-8") as f:
+            review_body = f.read()
+        check("## 评审结论" in review_body and "## 问题清单" in review_body,
+              "S2: review.md 含规定章节")
     finally:
         for k, v in saved.items():
             if v is None:
