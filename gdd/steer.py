@@ -13,6 +13,7 @@ import json
 import os
 import shlex
 import sys
+import threading
 import time
 from typing import List
 
@@ -104,10 +105,17 @@ def prepare(root: str) -> None:
     os.makedirs(_dir(root), exist_ok=True)
     doc = json.dumps(_hooks_document(root), ensure_ascii=False, indent=2)
     for path in (claude_settings_path(root), codex_hooks_path(root)):
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(doc)
-        os.replace(tmp, path)
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(doc)
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
 
 
 def _lock(path: str):

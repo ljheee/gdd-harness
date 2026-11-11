@@ -17,6 +17,7 @@ import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+os.environ["GDD_AGENT"] = "pi"
 os.environ.setdefault("PYTHONPATH", ROOT)
 
 # pi 执行端设置与隔离目录：所有 e2e 会话都要求端点/模型就绪

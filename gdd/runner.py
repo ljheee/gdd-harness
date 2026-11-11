@@ -1,56 +1,43 @@
-"""本地 pi agent 适配器。
+"""本地 agent 适配器。执行端由 GDD_AGENT 选择，默认 pi。
 
 每次调用 = 一个会话（entry 门禁 / exit 门禁 / 节点主体 互相隔离）。
-主体会话支持 `--session-id` 复用（打回后继续上下文）。
-pi 进程由 harness 在本机启动，模型推理走设置页配置的 OpenAI 兼容云端端点。
+协议在 gdd/agents 里，一种执行端一个类。这里只负责本机进程：
+拉起、超时、杀进程组、把提示词写入 stdin。
+pi：本机进程，模型走设置页的 OpenAI 兼容端点，续跑用 --session-id。
+claude：本机 `claude -p` headless，使用本机登录态，续跑用 --resume。
+不在两种协议之间自动回退。
 
 环境变量：
-  GDD_AGENT_BIN            pi 可执行文件覆盖；否则 <仓库根>/node_modules/.bin/pi，
-                           再否则 PATH 上的 pi
-  GDD_AGENT_PRE_ARGS       插在 bin 之后、pi 参数之前的参数（shlex 切分）
-  GDD_AGENT_MODEL          设置页模型的高级覆盖（同一 custom provider 的模型 ID）
+  GDD_AGENT                pi 或 claude。未设置时看 GDD_AGENT_BIN 的文件名：
+                           以 claude 开头则是 claude，否则 pi
+  GDD_AGENT_BIN            该执行端的可执行文件。pi 未设置时找 node_modules/.bin/pi
+                           再找 PATH 上的 pi；claude 未设置时用 PATH 上的 claude
+  GDD_AGENT_PRE_ARGS       插在 bin 之后、协议参数之前（shlex 切分）
+  GDD_AGENT_MODEL          pi：覆盖设置页模型。claude：传给 --model
   GDD_AGENT_EXTRA_ARGS     附加 CLI 参数（shlex 切分）
   GDD_AGENT_TIMEOUT        单会话超时秒数，默认 7200
-  GDD_PI_AGENT_DIR         pi agent 目录覆盖（models.json/auth.json/mcp.json）
-  GDD_PI_SESSION_DIR       pi 会话目录覆盖
-  GDD_SUBJECT_RESUME=off   不复用会话（不传 --session-id）
-
-输出：pi `--mode json` 的 JSONL 事件流。文本取最后一条 assistant message_end；
-`message_update.assistantMessageEvent.type=="text_delta"` 与 `tool_execution_start`
-驱动流式呈现；turn_end 计数作为 turn 预算。
+  GDD_PI_AGENT_DIR         仅 pi：agent 目录覆盖
+  GDD_PI_SESSION_DIR       仅 pi：会话目录覆盖
+  GDD_SUBJECT_RESUME=off   不复用会话
 """
 from __future__ import annotations
 
 import json
 import os
 import queue
-import shlex
-import shutil
 import signal
 import subprocess
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
 from . import pi_settings
 
 # 流式读行：stdout.readline 阻塞时墙钟超时仍须生效
 _STREAM_EOF = object()
 _STREAM_POLL_S = 0.5
-
-TOOL_MAP = {
-    "read": "read",
-    "write": "write",
-    "edit": "edit",
-    "multiedit": "edit",
-    "grep": "grep",
-    "glob": "find",
-    "find": "find",
-    "bash": "bash",
-    "ls": "ls",
-}
 
 
 def _drain_line_queue(line_q: "queue.Queue", out_lines: List[str]) -> None:
@@ -87,27 +74,10 @@ _AUTH_HINTS = (
     "authentication", "no valid credentials", "session expired",
 )
 
-# 端点/模型配置错误特征（非凭证）。404 通常来自错误的 baseUrl 路径或模型名，
-# 属于设置页可处置的问题；D10 要求这类错误同样指向设置页并保留原始摘要。
-_CONFIG_HINTS = (
-    "404", "model not found", "model_not_found", "unknown model",
-    "no such model",
-)
-
-
 def _auth_hint(*texts: str) -> str:
     for t in texts:
         low = (t or "").lower()
         for h in _AUTH_HINTS:
-            if h in low:
-                return h
-    return ""
-
-
-def _config_hint(*texts: str) -> str:
-    for t in texts:
-        low = (t or "").lower()
-        for h in _CONFIG_HINTS:
             if h in low:
                 return h
     return ""
@@ -129,24 +99,6 @@ def _merge_captured(already: str, reread) -> str:
     if not already or extra.startswith(already):
         return extra
     return already + extra
-
-
-def _settings_hint() -> str:
-    return "打开 Web UI 设置页检查端点 / API key / 模型"
-
-
-def _auth_error(hint: str) -> str:
-    return (f"pi 端点凭证或鉴权失败（命中特征 '{hint}'）。"
-            f"请{_settings_hint()}，然后 gdd retry 续跑。")
-
-
-def _config_error(hint: str, detail: str) -> str:
-    summary = (detail or "").strip()
-    if len(summary) > 300:
-        summary = summary[:300] + "…"
-    return (f"pi 端点或模型配置错误（命中特征 '{hint}'）。"
-            f"请{_settings_hint()}，然后 gdd retry 续跑。"
-            f"原始错误：{summary}")
 
 
 def _tool_summary(name: str, inp: Any) -> str:
@@ -187,97 +139,6 @@ class _SessionState:
         self.seen_tools: set = set()
 
 
-def _message_text(message: Any) -> str:
-    if not isinstance(message, dict):
-        return ""
-    content = message.get("content")
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return ""
-    parts = []
-    for block in content:
-        if isinstance(block, dict) and block.get("type") == "text":
-            parts.append(str(block.get("text") or ""))
-    return "".join(parts)
-
-
-def _observe_message_end(state: _SessionState, message: Any) -> None:
-    if not isinstance(message, dict):
-        return
-    if message.get("role") == "assistant":
-        text = _message_text(message)
-        if text:
-            state.last_text = text
-        stop = str(message.get("stopReason") or "")
-        if stop in ("error", "aborted"):
-            state.aborted = state.aborted or stop == "aborted"
-            if not state.error_message:
-                state.error_message = str(message.get("errorMessage") or f"stopReason={stop}")
-        usage = message.get("usage")
-        if isinstance(usage, dict):
-            cost = usage.get("cost")
-            if isinstance(cost, dict):
-                try:
-                    state.cost = float(cost.get("total") or 0.0)
-                except (TypeError, ValueError):
-                    pass
-
-
-def _dispatch_event(obj: dict, state: _SessionState,
-                    on_stream: Optional[Callable[[Dict[str, Any]], None]]) -> None:
-    """把一条 pi JSONL 事件归一为 text/tool 回调并累计会话状态。异常吞掉。"""
-    try:
-        kind = obj.get("type")
-        state.saw_event = True
-        if kind == "session":
-            sid = obj.get("id")
-            if isinstance(sid, str) and sid:
-                state.session_id = sid
-            return
-        if kind == "message_update":
-            ev = obj.get("assistantMessageEvent") or {}
-            if ev.get("type") == "text_delta":
-                delta = str(ev.get("delta") or "")
-                if delta:
-                    state.text_streamed = True
-                    if on_stream:
-                        on_stream({"kind": "text", "text": delta})
-            return
-        if kind == "tool_execution_start":
-            name = str(obj.get("toolName") or "?")
-            tid = str(obj.get("toolCallId") or "")
-            if tid and tid in state.seen_tools:
-                return
-            if tid:
-                state.seen_tools.add(tid)
-            summary = _tool_summary(name, obj.get("args"))
-            if on_stream:
-                on_stream({"kind": "tool", "name": name, "summary": summary})
-            return
-        if kind == "message_end":
-            _observe_message_end(state, obj.get("message"))
-            return
-        if kind == "turn_end":
-            state.turns += 1
-            return
-        if kind == "agent_end":
-            state.saw_agent_end = True
-            if not state.last_text:
-                for message in reversed(obj.get("messages") or []):
-                    if isinstance(message, dict) and message.get("role") == "assistant":
-                        _observe_message_end(state, message)
-                        if state.last_text:
-                            break
-            return
-        if kind == "agent_settled":
-            if obj.get("aborted"):
-                state.aborted = True
-            return
-    except Exception:
-        pass
-
-
 class AgentRunner:
     def __init__(self, root: str):
         self.root = root
@@ -295,27 +156,6 @@ class AgentRunner:
         self.node_extensions = None
 
     # ------------------------------------------------------------ 路径与命令
-
-    def _resolve_pi_bin(self) -> str:
-        override = (os.environ.get("GDD_AGENT_BIN") or "").strip()
-        if override:
-            return override
-        candidates = [
-            os.path.join(self.root, "node_modules", ".bin", "pi"),
-            os.path.join(self._repo_root(), "node_modules", ".bin", "pi"),
-        ]
-        for local in candidates:
-            if os.path.isfile(local) and os.access(local, os.X_OK):
-                return local
-        for name in ("pi", "pi.cmd"):
-            found = shutil.which(name)
-            if found:
-                return found
-        return ""
-
-    @staticmethod
-    def _repo_root() -> str:
-        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     def _agent_dir(self) -> str:
         override = os.environ.get("GDD_PI_AGENT_DIR")
@@ -410,89 +250,20 @@ class AgentRunner:
                 pass
         return agent_dir
 
-    def _map_tools(self, allowed_tools: List[str], subject: bool) -> List[str]:
-        mapped: List[str] = []
-        unknown: List[str] = []
-        for tool in allowed_tools or []:
-            name = TOOL_MAP.get(str(tool).lower())
-            if not name:
-                if str(tool).lower() not in ("subagent",):
-                    unknown.append(str(tool))
-                continue
-            if name not in mapped:
-                mapped.append(name)
-        if unknown and self.on_event:
-            try:
-                self.on_event("tool_map_unknown", tools=unknown)
-            except Exception:
-                pass
-        if subject and "subagent*" not in mapped:
-            mapped.append("subagent*")
-        return mapped
-
-    def _pi_extensions(self, subject: bool) -> List[str]:
-        if not subject:
-            return []
-        out: List[str] = []
-        from . import steer as steer_mod
-        if steer_mod.enabled():
-            ext_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                    "steer_pi_extension.mjs")
-            if os.path.isfile(ext_path):
-                out.append(ext_path)
-        for base in (self.root, self._repo_root()):
-            subagents = os.path.join(base, "node_modules", "pi-subagents",
-                                     "bundle", "index.js")
-            if os.path.isfile(subagents):
-                out.append(subagents)
-                break
-        return out
-
     def _build_cmd(self, allowed_tools: List[str], max_turns: int,
                    resume_sid: str = "", *, stream: bool = False,
                    steer: bool = False) -> List[str]:
-        """构造 pi 命令。设置缺失/二进制缺失时抛 ConfigError。"""
-        pi_bin = self._resolve_pi_bin()
-        if not pi_bin:
-            raise ConfigError(
-                "pi 可执行文件不可用：请执行 npm ci，或用 GDD_AGENT_BIN 指定 pi 路径")
-        try:
-            settings = pi_settings.load()
-        except pi_settings.SettingsError as e:
-            raise ConfigError(str(e)) from e
-        ready = pi_settings.ready_error(settings)
-        if ready:
-            raise ConfigError(ready)
-        model = pi_settings.resolve_model(settings)
-        if model.startswith("custom/"):
-            model = model[len("custom/"):]
+        """按 GDD_AGENT 构造命令。设置或二进制缺失时抛 ConfigError。"""
+        from .agents import resolve_agent
         subject = bool(steer or getattr(self, "steer_subject", False))
-        cmd = [pi_bin]
-        pre = os.environ.get("GDD_AGENT_PRE_ARGS", "")
-        if pre:
-            cmd += shlex.split(pre)
-        cmd += ["--print", "--mode", "json", "--model", f"custom/{model}"]
-        tools = self._map_tools(allowed_tools, subject)
-        if tools:
-            cmd += ["--tools", ",".join(tools)]
-        if resume_sid and os.environ.get("GDD_SUBJECT_RESUME", "on") != "off":
-            cmd += ["--session-id", resume_sid]
-        cmd += ["--session-dir", self._session_dir()]
-        ext = getattr(self, "node_extensions", None)
-        if ext is not None:
-            for skill_dir in getattr(ext, "skill_dirs", []) or []:
-                cmd += ["--skill", skill_dir]
-        for extension in self._pi_extensions(subject):
-            cmd += ["--extension", extension]
-        extra = os.environ.get("GDD_AGENT_EXTRA_ARGS", "")
-        if extra:
-            cmd += shlex.split(extra)
-        return cmd
+        return resolve_agent().build_cmd(
+            self, allowed_tools, max_turns, resume_sid,
+            stream=stream, steer=subject)
 
-    def _prepare_env(self, subject: bool) -> dict:
+    def _prepare_env(self, subject: bool, kind: str = "pi") -> dict:
+        from .agents import adapter_for
         env = dict(os.environ)
-        env["PI_CODING_AGENT_DIR"] = self._agent_dir()
-        env["PI_CODING_AGENT_SESSION_DIR"] = self._session_dir()
+        env.update(adapter_for(kind).extra_env(self, subject))
         if subject:
             from . import steer as steer_mod
             env["GDD_STEER_ROOT"] = os.path.abspath(self.root)
@@ -517,18 +288,14 @@ class AgentRunner:
     ) -> SessionResult:
         stream = on_stream is not None
         subject = bool(steer or getattr(self, "steer_subject", False))
+        agent = None
         try:
-            settings = pi_settings.load()
-            ready = pi_settings.ready_error(settings)
-            if ready:
-                raise ConfigError(ready)
-            model = pi_settings.resolve_model(settings)
-            if model.startswith("custom/"):
-                model = model[len("custom/"):]
-            self._prepare_agent_dir(str(settings.get("baseUrl") or ""),
-                                    str(settings.get("apiKey") or ""), model)
-            cmd = self._build_cmd(allowed_tools, max_turns, resume_sid=resume_sid,
-                                  stream=stream, steer=steer)
+            from .agents import resolve_agent
+            agent = resolve_agent()
+            agent.prepare(self)
+            cmd = agent.build_cmd(
+                self, allowed_tools, max_turns, resume_sid=resume_sid,
+                stream=stream, steer=subject)
         except pi_settings.SettingsError as e:
             res = SessionResult(ok=False, error=str(e), config_error=True)
             self._dump_log(log_path, prompt, [], "", res)
@@ -543,7 +310,8 @@ class AgentRunner:
             self._dump_log(log_path, prompt, [], "", res)
             return res
         except OSError as e:
-            res = SessionResult(ok=False, error=f"pi agent 目录准备失败: {e}",
+            who = agent.name if agent is not None else "本地"
+            res = SessionResult(ok=False, error=f"{who} agent 目录准备失败: {e}",
                                 config_error=True)
             self._dump_log(log_path, prompt, [], "", res)
             return res
@@ -559,31 +327,32 @@ class AgentRunner:
                 encoding="utf-8",
                 errors="replace",
                 cwd=self.root,
-                env=self._prepare_env(subject),
+                env=self._prepare_env(subject, agent.name),
                 start_new_session=True,
             )
         except OSError as e:
+            hint = agent.launch_hint()
             res = SessionResult(
                 ok=False,
-                error=(f"pi 无法执行: {cmd[0]}（{e}；请执行 npm ci 或设置 GDD_AGENT_BIN）"),
+                error=f"执行端无法启动: {cmd[0]}（{e}；{hint}）",
                 config_error=True)
             self._dump_log(log_path, prompt, cmd, "", res)
             return res
 
         res = self._run_process(proc, prompt, cmd, log_path, started, max_turns,
-                                on_stream)
+                                on_stream, agent)
         res.streamed = stream
         return res
 
     def _run_process(self, proc, prompt: str, cmd: List[str], log_path,
                      started: float, max_turns: int,
-                     on_stream: Optional[Callable[[Dict[str, Any]], None]]) -> SessionResult:
+                     on_stream: Optional[Callable[[Dict[str, Any]], None]],
+                     agent) -> SessionResult:
         err_chunks: List[str] = []
         line_q: "queue.Queue" = queue.Queue()
         out_lines: List[str] = []
         state = _SessionState()
         timed_out = False
-        budget_exhausted = False
 
         def _drain_err() -> None:
             try:
@@ -643,9 +412,8 @@ class AgentRunner:
                     continue
                 if not isinstance(obj, dict):
                     continue
-                _dispatch_event(obj, state, on_stream)
-                if max_turns and max_turns > 0 and state.turns >= max_turns:
-                    budget_exhausted = True
+                agent.on_event(obj, state, on_stream)
+                if agent.should_stop(state, max_turns):
                     break
         except KeyboardInterrupt:
             self._kill(proc)
@@ -659,7 +427,7 @@ class AgentRunner:
             out_thr.join(timeout=2)
             err_thr.join(timeout=2)
             _drain_line_queue(line_q, out_lines)
-            res = SessionResult(ok=False, error=f"pi 会话 IO 异常: {e}",
+            res = SessionResult(ok=False, error=f"执行端会话 IO 异常: {e}",
                                 duration_s=time.time() - started)
             self._dump_log(log_path, prompt, cmd, "".join(out_lines), res)
             return res
@@ -675,22 +443,14 @@ class AgentRunner:
             pass
         out = "".join(out_lines)
         err = "".join(err_chunks)
-        res = self._parse_output(out, err, proc.returncode, state)
+        res = agent.parse(out, err, proc.returncode, state, max_turns=max_turns)
         res.duration_s = time.time() - started
         if on_stream and res.ok and not state.text_streamed and res.text:
             try:
                 on_stream({"kind": "text", "text": res.text})
             except Exception:
                 pass
-        if budget_exhausted:
-            if state.session_id:
-                res.ok = False
-                res.turns_exhausted = True
-                res.error = (f"pi 会话 turns 达到上限（{max_turns}），"
-                             "保留会话可续跑")
-            else:
-                res.ok = False
-                res.error = f"pi 会话 turns 达到上限（{max_turns}），且未取得 session_id"
+        res = agent.apply_turn_cap(res, state, max_turns)
         if timed_out:
             res = SessionResult(ok=False, error=f"会话超时（>{self.timeout}s）",
                                 session_id=state.session_id,
@@ -712,72 +472,14 @@ class AgentRunner:
 
         state 由流式循环实时累计；直接调用（单测）时从 stdout 重放构建。
         """
-        if state is None:
-            state = _SessionState()
-            for raw in (stdout or "").splitlines():
-                raw = raw.strip()
-                if not raw.startswith("{"):
-                    continue
-                try:
-                    obj = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(obj, dict):
-                    _dispatch_event(obj, state, None)
+        from .agents.pi import PiAgent
+        return PiAgent().parse(stdout, stderr, returncode, state, max_turns=0)
 
-        err_tail = (stderr or "").strip()[-1000:]
-        if returncode != 0:
-            detail = (state.error_message or err_tail or "无错误输出").strip()
-            res = SessionResult(
-                ok=False,
-                text=state.last_text,
-                error=f"pi 会话退出码 {returncode}：{detail}",
-                session_id=state.session_id,
-                turns=state.turns,
-                cost_usd=state.cost,
-                raw=stdout or "",
-            )
-        elif state.aborted or state.error_message:
-            detail = (state.error_message or err_tail or "会话被中止").strip()
-            res = SessionResult(
-                ok=False,
-                text=state.last_text,
-                error=f"pi 会话失败：{detail}",
-                session_id=state.session_id,
-                turns=state.turns,
-                cost_usd=state.cost,
-                raw=stdout or "",
-            )
-        elif not state.saw_event:
-            res = SessionResult(
-                ok=False,
-                error=(f"pi 输出不可解析（returncode={returncode}），未收到 JSON 事件；"
-                       f"stderr: {err_tail[:500]}"),
-                session_id=state.session_id,
-                raw=stdout or "",
-            )
-        else:
-            res = SessionResult(
-                ok=True,
-                text=state.last_text,
-                session_id=state.session_id,
-                turns=state.turns,
-                cost_usd=state.cost,
-                raw=stdout or "",
-            )
-        if not res.ok:
-            hint = _auth_hint(res.error, err_tail) if len(res.error) <= 500 else ""
-            if hint:
-                res.error = _auth_error(hint)
-            else:
-                config_hint = (_config_hint(res.error, err_tail)
-                               if len(res.error) <= 500 else "")
-                if config_hint:
-                    # D10：错误的 baseUrl/模型同样属于设置页可处置的问题，
-                    # 保留原始摘要并给出明确指向，不静默回退 Claude。
-                    res.error = _config_error(config_hint, res.error or err_tail)
-                    res.config_error = True
-        return res
+    @staticmethod
+    def _parse_claude_output(stdout: str, stderr: str, returncode: int) -> SessionResult:
+        """解析 claude -p 的 result JSON。stream-json 取最后一条 type=result。"""
+        from .agents.claude import ClaudeAgent
+        return ClaudeAgent().parse(stdout, stderr, returncode, None, max_turns=0)
 
     @staticmethod
     def _dump_log(log_path: Optional[str], prompt: str, cmd: List[str],

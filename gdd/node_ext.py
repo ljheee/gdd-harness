@@ -1,11 +1,12 @@
-"""把节点声明的 MCP / skill 变成一次 pi 主体会话的配置。
+"""把节点声明的 MCP / skill 暂存到仓库外，供两种执行端按各自方式挂载。
 
 配置写在仓库外。门禁会话不调用 prepare，因此不会继承。
 空声明返回 None，命令行不追加任何参数。
 
-- MCP：生成 `{"mcpServers": {...}}` 文件，由 runner 复制进隔离 agent 目录的 mcp.json；
-- skills：把含 SKILL.md 的目录暂存到隔离目录，交给 pi `--skill` 加载；
-- `.claude-plugin` 形式的插件目录不再支持，遇到时明确报配置错误。
+- MCP：生成 `{"mcpServers": {...}}`。pi 复制进隔离 agent 目录的 mcp.json；claude 用 `--mcp-config`。
+- skills：把含 SKILL.md 的目录暂存到隔离目录。pi 对每个目录加 `--skill`；
+  claude 在同一暂存根上写 `.claude-plugin/plugin.json`，用 `--plugin-dir` 挂这个临时插件。
+- 用户给出的 `.claude-plugin` 目录不直接挂载，遇到时明确报配置错误。
 """
 from __future__ import annotations
 
@@ -23,6 +24,7 @@ from .models import McpSpec, NodeSpec, SkillSpec, _MCP_NAME_RE, _no_inject, _str
 class NodeExtensions:
     mcp_config: str = ""
     skill_dirs: List[str] = field(default_factory=list)
+    plugin_dir: str = ""
 
 
 def ext_home() -> str:
@@ -95,6 +97,31 @@ def _skill_name(spec: SkillSpec, path: str, used: set) -> str:
 
 def _is_plugin(path: str) -> bool:
     return os.path.isfile(os.path.join(path, ".claude-plugin", "plugin.json"))
+
+
+def _remove_generated_plugin(dest: str) -> None:
+    manifest = os.path.join(dest, ".claude-plugin")
+    if os.path.isdir(manifest):
+        shutil.rmtree(manifest)
+
+
+def _write_generated_plugin(dest: str, node_id: str) -> str:
+    """在暂存根写一份只指向 ./skills 的临时插件。返回插件根。"""
+    manifest = os.path.join(dest, ".claude-plugin")
+    _mkdir_private(manifest)
+    raw = "".join(c if c.isalnum() or c in "-_" else "-" for c in f"gdd-{node_id}")
+    name = raw.strip("-")[:64] or "gdd-skills"
+    plugin = {
+        "name": name,
+        "version": "0.0.1",
+        "description": f"GDD node {node_id} skills",
+        "skills": "./skills",
+    }
+    _write_private(
+        os.path.join(manifest, "plugin.json"),
+        json.dumps(plugin, ensure_ascii=False, indent=2),
+    )
+    return dest
 
 
 def _assert_skill_links(skill_dir: str) -> None:
@@ -224,6 +251,7 @@ def prepare(root: str, node: NodeSpec) -> Optional[NodeExtensions]:
         _remove_file(cfg + ".tmp")
         if os.path.isdir(skill_root):
             shutil.rmtree(skill_root)
+        _remove_generated_plugin(dest)
         return None
     home = ext_home()
     _mkdir_private(home)
@@ -279,6 +307,9 @@ def prepare(root: str, node: NodeSpec) -> Optional[NodeExtensions]:
                     with open(md, "w", encoding="utf-8") as f:
                         f.write(rewritten)
             ext.skill_dirs.append(target)
+        ext.plugin_dir = _write_generated_plugin(dest, node.id)
+    else:
+        _remove_generated_plugin(dest)
     if not ext.mcp_config and not ext.skill_dirs:
         return None
     return ext

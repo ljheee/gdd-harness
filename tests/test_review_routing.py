@@ -19,6 +19,8 @@ from gdd.models import PipelineSpec  # noqa: E402
 from gdd.orchestrator import Orchestrator  # noqa: E402
 from gdd.runner import AgentRunner  # noqa: E402
 
+os.environ["GDD_AGENT"] = "pi"
+
 STUB = os.path.join(ROOT, "tests", "pi_stub.py")
 PASS_GATE = 'GDD-VERDICT: {"verdict": "pass", "reason": "stub通过", "evidence": ["e"], "feedback": ""}'
 PASS_REVIEW = 'GDD-REVIEW: {"verdict":"pass","issues":[]}'

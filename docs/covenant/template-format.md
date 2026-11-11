@@ -143,8 +143,8 @@ skills:
 
 - 相对路径的每一段都不能是 `..`。解析符号链接之后也必须留在项目根里。绝对路径可以，用来指向仓库外的共用 skill。
 - 名字字母或数字开头，只含字母数字、`_`、`-`。同一节点里 MCP 名字不能重复。mcp 文件里的 server 走同一套规则：`command` 与 `url` 两种都检查 `args` / `env` / `headers` 里的换行；只保留这些字段和 `timeout`。`url` 必须带 `type`（`http` 或 `sse`），缺了这一轮主体会话失败。
-- 主体进程启动时，gdd 在仓库外生成一份仅所有者可读的 `mcp.json`，由 runner 复制进隔离 agent 目录（`PI_CODING_AGENT_DIR`），pi 从 `mcpServers` 读取。这是**追加**：用户自己已经配的 MCP 仍然在。节点删掉声明后，仓库外的旧配置会清掉。
-- skill 目录暂存到仓库外，交给 pi `--skill` 加载；skill 目录里的符号链接如果指向该目录之外，这一轮主体会话失败，避免把目录外的文件拷进暂存副本。
+- 主体进程启动时，gdd 在仓库外生成一份仅所有者可读的 `mcp.json`。pi 把它复制进隔离 agent 目录（`PI_CODING_AGENT_DIR`），从 `mcpServers` 读取；claude 用 `--mcp-config` 指向同一份文件。这是**追加**：用户自己已经配的 MCP 仍然在。节点删掉声明后，仓库外的旧配置会清掉。
+- skill 目录暂存到仓库外。pi 对每个目录加 `--skill`；claude 在同一暂存根写 `.claude-plugin/plugin.json`（`"skills": "./skills"`），用 `--plugin-dir` 挂这个临时插件。skill 目录里的符号链接如果指向该目录之外，这一轮主体会话失败，避免把目录外的文件拷进暂存副本。
 - 目录不存在或 skill 缺少 `SKILL.md` 时，这一轮主体会话失败，不静默跳过，也不把已保存的主体会话当成失效。
 - `.claude-plugin` 形式的插件目录不再支持；遇到时明确报配置错误，不静默忽略。
 - 没声明 mcp/skills 的节点不写这两个键，已有流水线的指纹不变。

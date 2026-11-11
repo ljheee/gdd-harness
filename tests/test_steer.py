@@ -21,6 +21,7 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ.setdefault("PYTHONPATH", ROOT)
+os.environ["GDD_AGENT"] = "pi"
 
 STUB = os.path.join(ROOT, "tests", "pi_stub.py")
 PASS = 'GDD-VERDICT: {"verdict": "pass", "reason": "stub通过", "evidence": ["e1"], "feedback": ""}'

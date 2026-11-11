@@ -24,7 +24,7 @@ GDD 是一个**本地节点流水线编排引擎**：你定义节点（做什么
 
 **依赖**：Python 3.10+、git、Node.js >= 22.19（在 GDD 仓库根执行 `npm ci` 安装 pi 执行端）。
 
-**模型配置**：启动 `python3 -m gdd.ui` 后，在左侧「设置」页填写端点（OpenAI 兼容 Base URL）、API key、模型，保存后对新建会话生效；不需要本机 Claude 登录态或本地模型。
+**模型配置**：默认执行端是 pi。启动 `python3 -m gdd.ui` 后，在左侧「设置」页填写端点（OpenAI 兼容 Base URL）、API key、模型，保存后对新建会话生效。改用本机 Claude 时，启动前设置 `GDD_AGENT=claude`（可执行文件可用 `GDD_AGENT_BIN` 覆盖，默认 `claude`），并先完成本机 `claude` 登录；这条路径不读设置页。
 
 **无第三方 Python 依赖**；YAML 模板可选装 PyYAML（`pip3 install pyyaml`）。
 
@@ -33,15 +33,16 @@ GDD 是一个**本地节点流水线编排引擎**：你定义节点（做什么
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `GDD_AGENT_BIN` | 自动 | pi 可执行文件覆盖；未设置时找 `<项目根>/node_modules/.bin/pi` 或 PATH 上的 `pi` |
-| `GDD_AGENT_PRE_ARGS` | - | 插在 pi 路径后、pi 参数前的参数（shlex 切分） |
-| `GDD_AGENT_MODEL` | - | 设置页模型的高级覆盖（同一 custom provider 的模型 ID） |
+| `GDD_AGENT` | `pi` | `pi` 或 `claude`。未设置时，可执行文件名以 `claude` 开头则是 `claude`。显式值优先。不在两种协议之间自动回退 |
+| `GDD_AGENT_BIN` | 随家族 | 该执行端的可执行文件。pi 未设置时找 `<项目根>/node_modules/.bin/pi` 或 PATH 上的 `pi`；claude 未设置时用 PATH 上的 `claude` |
+| `GDD_AGENT_PRE_ARGS` | - | 插在可执行文件后、协议参数前（shlex 切分） |
+| `GDD_AGENT_MODEL` | - | pi：覆盖设置页模型。claude：传给 `--model` |
 | `GDD_AGENT_EXTRA_ARGS` | - | 附加参数（shlex 切分） |
 | `GDD_AGENT_TIMEOUT` | 7200 | 单会话超时秒（默认 2h；plan/implement 重节点勿设短） |
-| `GDD_SUBJECT_RESUME` | on | 打回重跑/组内后续节点是否复用主体会话（`--session-id`）；`off` 强制全新会话（全局逃生舱） |
-| `GDD_AGENT_MAX_TURNS_GATE` | 40 | 门禁会话 turn 预算（统计 pi `turn_end`） |
+| `GDD_SUBJECT_RESUME` | on | 打回重跑/组内后续节点是否复用主体会话（pi：`--session-id`，claude：`--resume`）；`off` 强制全新会话 |
+| `GDD_AGENT_MAX_TURNS_GATE` | 40 | 门禁会话 turn 预算。pi 统计 `turn_end`；claude 传给 `--max-turns` |
 | `GDD_CHECK_TIMEOUT` | 600 | 机器检查命令超时秒 |
-| `GDD_SUBJECT_AUTO_CONTINUES_MAX` | 4 | 主体会话 turn 预算打满后自动 `--session-id` 续跑轮数上限；超限才 blocked |
+| `GDD_SUBJECT_AUTO_CONTINUES_MAX` | 4 | 主体会话 turn 预算打满后自动续跑轮数上限（pi：`--session-id`，claude：`--resume`）；超限才 blocked |
 | `GDD_PI_SETTINGS` | `~/.gdd/pi-settings.json` | 设置文件覆盖（端点/API key/模型） |
 | `GDD_PI_AGENT_DIR` | `~/.gdd/pi-agent/<项目键>` | pi 隔离 agent 目录覆盖 |
 | `GDD_PI_SESSION_DIR` | `~/.gdd/pi-sessions/<项目键>` | pi 会话目录覆盖 |
@@ -272,7 +273,7 @@ harness 会检出滞留提交并显式报 `git_commit_fail`（非静默丢失）
 ## 9. 已知边界
 
 - 节点之间顺序执行；implement 内部按方案附录「任务依赖」并行，失败的 `code` 用例按 `@task:` 关联只重跑相关任务及下游。
-- 执行端只有 pi；`.claude-plugin` 插件目录不再支持（`SKILL.md` 与 MCP 仍支持）。
+- 执行端由 `GDD_AGENT` 选择，默认 pi；`claude` 使用本机 `claude -p`。同一份节点声明两边都会挂上：pi 把 MCP 写入隔离目录的 `mcp.json`，每个 `SKILL.md` 目录加 `--skill`；claude 用 `--mcp-config`，并把 skill 列表打成临时插件后加 `--plugin-dir`。用户给出的 `.claude-plugin` 目录不直接挂载。
 - 门禁会话带 Bash（软约束），语义判据可能被自造证据欺骗——关键判据尽量写成机器检查（artifacts/commands）
 - 本地单人场景：无签名密钥，同时篡改 pipeline.json 与 state.json 指纹可绕过校验
 - 真实远端 push/分叉恢复未实测（本地无 remote 环境为正确 push_skip）

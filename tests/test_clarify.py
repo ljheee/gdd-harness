@@ -21,6 +21,8 @@ import tempfile
 import urllib.error
 import urllib.request
 
+os.environ["GDD_AGENT"] = "pi"
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ.setdefault("PYTHONPATH", ROOT)

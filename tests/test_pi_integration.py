@@ -14,6 +14,8 @@ sys.path.insert(0, ROOT)
 
 from gdd.runner import AgentRunner  # noqa: E402
 
+os.environ["GDD_AGENT"] = "pi"
+
 PI_BIN = os.path.join(ROOT, "node_modules", ".bin", "pi")
 
 
