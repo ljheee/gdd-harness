@@ -172,6 +172,19 @@ def test_turn_budget_and_errors():
         check("设置页" in res.error, f"凭证错误提示设置页（{res.error}）")
 
         _script(d, [{
+            "patterns": ["model404"], "text": "", "is_error": True,
+            "stop_reason": "error",
+            "error": ('404: {"message":"model not found: mock-model",'
+                      '"type":"invalid_request_error","code":"model_not_found"}'),
+        }])
+        res = AgentRunner(d).run("model404", allowed_tools=[], max_turns=5)
+        check(not res.ok, "404 会话失败")
+        check("设置页" in res.error, f"404 配置错误提示设置页（{res.error}）")
+        check("404" in res.error and "model not found" in res.error,
+              f"404 错误保留原始摘要（{res.error}）")
+        check(res.config_error, "404 标记为配置错误")
+
+        _script(d, [{
             "patterns": ["abort"], "text": "partial", "aborted": True,
         }])
         res = AgentRunner(d).run("abort", allowed_tools=[], max_turns=5)

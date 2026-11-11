@@ -10,7 +10,8 @@ delivery（id）见 gdd/templates/delivery.json：
 + 项目初始化 + 独立 review 代码评审 + 独立测试节点 = 9 节点；3 个人工准入节点
 （clarify/plan/test）；implement 为 baseline_marker；review 为独立只读评审，
 不设人工审批；test 的 exit 为 change_aware；init --name 后产物写入
-iterations/<名字>/，exit 通过后提交到 gdd/<名字>（可用 --branch / --base 改）。
+iterations/<名字>/。名字不能与项目目录同名；同一项目的下一次迭代换一个名字，
+已有目录保持不动。exit 通过后提交到 gdd/<名字>（可用 --branch / --base 改）。
 """
 from __future__ import annotations
 

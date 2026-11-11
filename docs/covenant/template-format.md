@@ -116,7 +116,7 @@ gdd init --pipeline my-delivery.yaml                    # 不含占位符的自�
 | `branch` | `"gdd/delivery"` | 开发交付分支。内置 delivery 写成 `gdd/{{name}}`，初始化时换成 `gdd/<名字>` |
 | `remote` | `""` | 空 = 自动探测首个 remote；无 remote 则仅本地提交 |
 
-内置 delivery 的产物路径写成 `{{output}}/<文件名>`。`gdd init --name <名字>` 把 `{{output}}` 换成 `iterations/<名字>`，把 `{{name}}` 换成这个名字，并记下已有 `iterations/*/spec.md` 与 `decisions.md` 作为只读基线。只要模板里出现 `{{output}}` 或 `{{name}}`，交付分支都会换成 `gdd/<名字>`；写成 `feature/{{name}}` 也会被换成这个默认分支，要保留别的分支名就传 `--branch`。`--base` 指定从哪条已有分支拉出。只有出现 `{{output}}` 才占用 `iterations/<名字>/` 并拒绝该目录里已有文件；只出现 `{{name}}` 时产物路径保持模板原样。两个占位符都没有时，路径保持模板原样。
+内置 delivery 的产物路径写成 `{{output}}/<文件名>`。`gdd init --name <名字>` 把 `{{output}}` 换成 `iterations/<名字>`，把 `{{name}}` 换成这个名字，并记下已有 `iterations/*/spec.md` 与 `decisions.md` 作为只读基线。只要模板里出现 `{{output}}` 或 `{{name}}`，交付分支都会换成 `gdd/<名字>`；写成 `feature/{{name}}` 也会被换成这个默认分支，要保留别的分支名就传 `--branch`。`--base` 指定从哪条已有分支拉出。只有出现 `{{output}}` 才占用 `iterations/<名字>/` 并拒绝该目录里已有文件。这个名字不能与项目目录同名；同一项目的下一次迭代换一个名字，已有目录保持不动。只出现 `{{name}}` 时产物路径保持模板原样。两个占位符都没有时，路径保持模板原样。
 
 ### 3.7 mcp / skills（仅主体会话）
 

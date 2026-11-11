@@ -61,6 +61,17 @@ class MockEndpoint(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
             return
+        if MockEndpoint.mode == "404":
+            data = json.dumps({"error": {
+                "message": "model not found: mock-model",
+                "type": "invalid_request_error", "code": "model_not_found",
+            }}).encode()
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if not body.get("stream"):
             data = json.dumps({
                 "id": "chatcmpl-1", "object": "chat.completion",
@@ -209,6 +220,16 @@ def main():
         res = AgentRunner(d).run("hi", allowed_tools=[], max_turns=10)
         check(not res.ok, "401 会话失败")
         check("设置页" in res.error, f"错误指向设置页（{res.error[:160]}）")
+        MockEndpoint.mode = "ok"
+
+        print("[C7-3b] 404 端点/模型配置错误可处置（D10）")
+        MockEndpoint.mode = "404"
+        res = AgentRunner(d).run("hi", allowed_tools=[], max_turns=10)
+        check(not res.ok, "404 会话失败")
+        check("设置页" in res.error, f"404 错误指向设置页（{res.error[:200]}）")
+        check("404" in res.error and "model not found" in res.error,
+              f"404 错误保留原始摘要（{res.error[:200]}）")
+        check(res.config_error, "404 标记为配置错误（不当作会话失效重试）")
         MockEndpoint.mode = "ok"
 
         print("[C7-4] 缺少可执行文件")

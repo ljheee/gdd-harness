@@ -277,7 +277,7 @@ harness 会检出滞留提交并显式报 `git_commit_fail`（非静默丢失）
 - 本地单人场景：无签名密钥，同时篡改 pipeline.json 与 state.json 指纹可绕过校验
 - 真实远端 push/分叉恢复未实测（本地无 remote 环境为正确 push_skip）
 
-详见 README.md「设计边界」章节；自定义流水线示例可参考内置模板 `gdd/templates/delivery.json`——复制为副本（如 `my-delivery.json`）后修改，`gdd init --name <名字> --pipeline my-delivery.json` 即可使用。内置模板文件本身是唯一权威源（`--pipeline delivery` 与直接传该文件路径等价）。内置 delivery 必须带 `--name`，过程文档写入 `iterations/<名字>/`。
+详见 README.md「设计边界」章节；自定义流水线示例可参考内置模板 `gdd/templates/delivery.json`——复制为副本（如 `my-delivery.json`）后修改，`gdd init --name <名字> --pipeline my-delivery.json` 即可使用。内置模板文件本身是唯一权威源（`--pipeline delivery` 与直接传该文件路径等价）。内置 delivery 必须带 `--name`。这个名字不能与项目目录同名，过程文档写入 `iterations/<名字>/`；同一项目的下一次迭代换一个名字，已有目录保持不动。
 
 ---
 
@@ -306,7 +306,7 @@ Agent 环境变量（`GDD_AGENT_BIN` / `GDD_AGENT_PRE_ARGS` 等）在启动 UI �
 | 能力 | 说明 |
 |---|---|
 | 模板管理 | 内置 `delivery` 只读可复制（fork）为新模板；自定义模板新建/编辑（YAML/JSON，保存即校验）/删除 |
-| 新建任务 | 选模板 + 一句话需求 → 创建并初始化；任务页点「启动」即跑 |
+| 新建任务 | 选模板 + 任务名（项目目录）+ 迭代名 + 一句话需求 → 创建并初始化。迭代名不能与任务名相同，产物写入 `iterations/<迭代名>/`；任务页点「启动」即跑 |
 | 任务监控 | 侧边栏任务列表实时刷新状态（运行中/待审批/阻塞/完成）；任务页展示节点流程图——当前节点蓝色脉冲、**待审批节点琥珀色高亮 +「需人工」旗标**、门禁重试橙色、完成绿色；blocked 原因与 push 失败置顶警示 |
 
 ### 10.3 操作

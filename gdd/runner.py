@@ -87,11 +87,27 @@ _AUTH_HINTS = (
     "authentication", "no valid credentials", "session expired",
 )
 
+# 端点/模型配置错误特征（非凭证）。404 通常来自错误的 baseUrl 路径或模型名，
+# 属于设置页可处置的问题；D10 要求这类错误同样指向设置页并保留原始摘要。
+_CONFIG_HINTS = (
+    "404", "model not found", "model_not_found", "unknown model",
+    "no such model",
+)
+
 
 def _auth_hint(*texts: str) -> str:
     for t in texts:
         low = (t or "").lower()
         for h in _AUTH_HINTS:
+            if h in low:
+                return h
+    return ""
+
+
+def _config_hint(*texts: str) -> str:
+    for t in texts:
+        low = (t or "").lower()
+        for h in _CONFIG_HINTS:
             if h in low:
                 return h
     return ""
@@ -122,6 +138,15 @@ def _settings_hint() -> str:
 def _auth_error(hint: str) -> str:
     return (f"pi 端点凭证或鉴权失败（命中特征 '{hint}'）。"
             f"请{_settings_hint()}，然后 gdd retry 续跑。")
+
+
+def _config_error(hint: str, detail: str) -> str:
+    summary = (detail or "").strip()
+    if len(summary) > 300:
+        summary = summary[:300] + "…"
+    return (f"pi 端点或模型配置错误（命中特征 '{hint}'）。"
+            f"请{_settings_hint()}，然后 gdd retry 续跑。"
+            f"原始错误：{summary}")
 
 
 def _tool_summary(name: str, inp: Any) -> str:
@@ -744,6 +769,14 @@ class AgentRunner:
             hint = _auth_hint(res.error, err_tail) if len(res.error) <= 500 else ""
             if hint:
                 res.error = _auth_error(hint)
+            else:
+                config_hint = (_config_hint(res.error, err_tail)
+                               if len(res.error) <= 500 else "")
+                if config_hint:
+                    # D10：错误的 baseUrl/模型同样属于设置页可处置的问题，
+                    # 保留原始摘要并给出明确指向，不静默回退 Claude。
+                    res.error = _config_error(config_hint, res.error or err_tail)
+                    res.config_error = True
         return res
 
     @staticmethod

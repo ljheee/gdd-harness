@@ -169,7 +169,7 @@ cargo tauri build --bundles app
 - 每个节点内置基础 entry（上游产物机器检查 + AI 门禁语义验证——注意：内置模板每个 entry 都带 goal，即每节点最多 3 个 AI 会话：entry 门禁 + 主体 + exit 门禁）与 exit（本节点产物 + AI 判据）。
 - implement 为 baseline_marker 节点；**review** 是独立只读代码评审节点：每次进入新建会话、工具仅 Read/Grep/Glob，核对本次 implement 基线以来的改动是否满足 goal/spec/plan；不通过打回 implement（计入 implement 的 bounces），通过才进入 test；不新增人工审批，报告由 harness 落盘为 `review.md`。
 - test 的 exit 为 change_aware（AI 基于改动补充验证）。
-- 各节点产物都在 `iterations/<名字>/`：`requirement.md`、`survey.md`、`goal.md`（DoD）、`spec.md`、`plan.md`（ADR）、`acceptance.feature`、`decisions.md`、`impl-ledger.md`（核销台账）、`review.md`（评审结论 + 问题清单）、`test-report.md`、`verify.md`、`delivery.md`、`RELEASE-CHECKLIST.md`。不写项目的 `docs/`，也不写仓库根目录。已有迭代的 `spec.md` 和 `decisions.md` 在下次初始化时列为只读基线。同名目录已有文件则拒绝再初始化。
+- 各节点产物都在 `iterations/<名字>/`：`requirement.md`、`survey.md`、`goal.md`（DoD）、`spec.md`、`plan.md`（ADR）、`acceptance.feature`、`decisions.md`、`impl-ledger.md`（核销台账）、`review.md`（评审结论 + 问题清单）、`test-report.md`、`verify.md`、`delivery.md`、`RELEASE-CHECKLIST.md`。不写项目的 `docs/`，也不写仓库根目录。迭代名不能与项目目录同名。同一项目的下一次迭代换一个名字，新产物写入新目录，已有 `iterations/<名字>/` 保持不动。已有迭代的 `spec.md` 和 `decisions.md` 在下次初始化时列为只读基线。同名目录已有文件则拒绝再初始化。
 
 ## Agent 执行端配置（环境变量）
 

@@ -31,7 +31,7 @@ from urllib.parse import unquote, urlparse
 
 from .builtins import DELIVERY_PIPELINE
 from .cli import _load_pipeline_file
-from .iteration import prepare as prepare_iteration
+from .iteration import needs_iteration, prepare as prepare_iteration
 from .models import PipelineSpec
 from .orchestrator import Orchestrator
 from . import pi_settings
@@ -770,8 +770,10 @@ async function showNew(){
   const ov=await api('api/overview');
   const tpls=(ov.templates||[]).map(t=>`<option value="${esc(t.name)}">${esc(t.name)}${t.builtin?'（内置）':''}</option>`).join('');
   $('#main').innerHTML=`<h2>从模板启动新任务</h2><div class="card">
-    <div class="two"><div class="row"><label>任务名（子目录）</label><input id="nName" placeholder="my-task"></div>
+    <div class="two"><div class="row"><label>任务名（项目目录）</label><input id="nName" placeholder="my-task"></div>
     <div class="row"><label>模板</label><select id="nTpl">${tpls}</select></div></div>
+    <div class="row"><label>迭代名（不能与任务名相同）</label><input id="nIter" placeholder="round-1">
+    <span class="hint">内置 delivery 必填。产物写入 iterations/&lt;迭代名&gt;/；同一项目下次换一个名字，已有目录保持不动。</span></div>
     <div class="row"><label>需求（一句话也行）</label><textarea id="nReq" placeholder="实现一个 TODO CLI，支持增删查，带 pytest 测试"></textarea></div>
     <div class="actions"><button class="pri" onclick="createTask()">创建并初始化</button>
     <span class="hint" style="align-self:center">创建后到任务页点「启动」</span></div>
@@ -779,7 +781,8 @@ async function showNew(){
 }
 async function createTask(){
   const name=$('#nName').value.trim();
-  const j=await api('api/tasks',{method:'POST',body:JSON.stringify({name,template:$('#nTpl').value,requirement:$('#nReq').value})});
+  const iteration=$('#nIter').value.trim();
+  const j=await api('api/tasks',{method:'POST',body:JSON.stringify({name,iteration,template:$('#nTpl').value,requirement:$('#nReq').value})});
   if(!j.ok){$('#nErr').innerHTML=`<div class="alert err">${esc(j.error)}</div>`;return}
   showTask(enc(name));
 }
@@ -1216,6 +1219,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True, **result})
             if p == "/api/tasks":
                 name = str(body.get("name", "")).strip()
+                iteration = str(body.get("iteration", "")).strip()
                 tpl = str(body.get("template", "")).strip()
                 req = str(body.get("requirement", "")).strip()
                 if not _safe_name(name):
@@ -1232,6 +1236,15 @@ class Handler(BaseHTTPRequestHandler):
                         return self._json({"ok": False, "error": f"模板不存在: {tpl}"}, 404)
                     pipeline = _load_pipeline_file(tp)
                 d = os.path.join(self.root, name)
+                # 任务目录是项目。迭代名单独指定，不能再等于项目目录名。
+                bind_name = name
+                if needs_iteration(pipeline):
+                    if not iteration:
+                        return self._json({
+                            "ok": False,
+                            "error": "这条流水线按迭代落产物，必须填写迭代名，且不能与任务名相同",
+                        }, 400)
+                    bind_name = iteration
                 # 同名创建串行化（双击/双 tab 并发）：锁内重查已存在再初始化；
                 # 锁外首个检查仅作快速失败，不作为唯一防线
                 with _create_lock:
@@ -1240,7 +1253,7 @@ class Handler(BaseHTTPRequestHandler):
                     preexisting = os.path.exists(d)  # 目录已存在（用户同名目录）→ 失败时绝不删除
                     os.makedirs(d, exist_ok=True)
                     try:
-                        pipeline = prepare_iteration(pipeline, d, name=name)
+                        pipeline = prepare_iteration(pipeline, d, name=bind_name)
                         o = Orchestrator(d)
                         o.init(pipeline, req)
                     except Exception:
