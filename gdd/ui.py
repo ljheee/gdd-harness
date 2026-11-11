@@ -31,6 +31,7 @@ from urllib.parse import unquote, urlparse
 
 from .builtins import DELIVERY_PIPELINE
 from .cli import _load_pipeline_file
+from .iteration import prepare as prepare_iteration
 from .models import PipelineSpec
 from .orchestrator import Orchestrator
 
@@ -40,7 +41,8 @@ _create_lock = threading.Lock()
 
 BUILTINS = {"delivery": DELIVERY_PIPELINE}
 
-_NAME_RE = re.compile(r"^[A-Za-z0-9_\-\u4e00-\u9fff]{1,64}$")
+_NAME_RE = re.compile(
+    r"^[A-Za-z0-9_\u4e00-\u9fff][A-Za-z0-9_\-\u4e00-\u9fff]{0,63}$")
 
 _running: dict = {}          # task -> Thread（在跑的 run）
 _running_lock = threading.Lock()
@@ -1164,6 +1166,7 @@ class Handler(BaseHTTPRequestHandler):
                     preexisting = os.path.exists(d)  # 目录已存在（用户同名目录）→ 失败时绝不删除
                     os.makedirs(d, exist_ok=True)
                     try:
+                        pipeline = prepare_iteration(pipeline, d, name=name)
                         o = Orchestrator(d)
                         o.init(pipeline, req)
                     except Exception:

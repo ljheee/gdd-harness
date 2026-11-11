@@ -9,7 +9,8 @@ delivery（id）见 gdd/templates/delivery.json：
  七阶段（survey/clarify/plan/implement(开发验证)/delivery/release_checklist）
 + 项目初始化 + 独立测试节点 = 8 节点；3 个人工准入节点
 （clarify/plan/test）；implement 为 baseline_marker；
-test 的 exit 为 change_aware；exit 通过后自动提交推送到 gdd/delivery 分支。
+test 的 exit 为 change_aware；init --name 后产物写入 iterations/<名字>/，
+exit 通过后提交到 gdd/<名字>（可用 --branch / --base 改）。
 """
 from __future__ import annotations
 

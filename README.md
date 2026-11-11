@@ -19,7 +19,7 @@ cd /path/to/your/project
 export PYTHONPATH=/path/to/GDD        # 或 pip install -e /path/to/GDD
 
 # 用内置需求交付流水线初始化（七阶段+，8 节点，3 个人工确认点）
-gdd init --requirement requirement.md
+gdd init --name my-change --requirement requirement.md
 
 gdd go           # 单命令交互：init→推进（主体流式）→审批→澄清（全文流式）→终态（推荐）
 gdd run          # 推进：门禁→主体→门禁→(审批)→下一节点
@@ -108,7 +108,7 @@ cargo tauri build --bundles app
 
 ## 自定义编排（pipeline JSON）
 
-模板与内置模板完全同源（`gdd/templates/delivery.json` 可复制修改自用）。完整字段说明、校验规则与设计建议见 **`docs/template-format.md`**。
+模板与内置模板完全同源（`gdd/templates/delivery.json` 可复制修改自用）。完整字段说明、校验规则与设计建议见 **`docs/covenant/template-format.md`**。决策定级和决策记录见 **`docs/covenant/decision-grade.md`**。验收用例、证据和对抗裁决见 **`docs/covenant/acceptance-cases.md`**。
 
 ```json
 {
@@ -152,7 +152,7 @@ cargo tauri build --bundles app
 - **baseline_marker**：进入该节点主体工作时记录 git 基线 commit。
 - **exit.change_aware**：exit 门禁注入 `git diff --stat baseline`（含未提交工作区改动）与 `git status`，**AI 门禁据此补充验证项并实际执行**（内置 pipeline 的 test 节点开启）。
 - **补充验证项固化（模板/实例分离）**：全局模板只在 `gdd init` 时实例化为 `.gdd/pipeline.json`，绑定本次运行。change_aware 门禁基于本轮改动推导出的补充验证项通过 verdict 的 `supplements` 字段返回，harness **只增不减**地写回运行实例：可命令化项沉淀为机器检查 `commands`（下次重试不经 LLM）、产物检查追加/收紧 `artifacts.must_contain`、不可机器化的语义项追加到 `ai_check`；按内容去重防膨胀。全局模板不受影响。
-- **git_delivery**（pipeline 级，默认启用）：每节点 exit 通过后，harness 自动把产出（.md/代码）提交并推送到开发分支（默认 `gdd/delivery`，可配 `branch`/`remote`）。`.gdd` 状态目录不入库；无 remote 仅本地提交；push 失败仅记录事件不阻塞流水线。commit 信息形如 `gdd(<node_id>): <节点名> exit 通过`。**停用场景**：项目目录位于另一个 git 仓库的子目录（外层仓存在）时，harness 会自动停用 git 交付（防外层仓劫持/误提交），在 `gdd status` 与控制台显式警示 `git_delivery_disabled`，产物仅在项目目录内、不入任何分支——此时需自行把产物同步到外层仓。
+- **git_delivery**（pipeline 级，默认启用）：每节点 exit 通过后，harness 自动把产出（.md/代码）提交并推送到开发分支。未写 `branch` 时默认 `gdd/delivery`；内置 delivery 在 `gdd init --name <名字>` 时使用 `gdd/<名字>`，可用 `--branch` 改，用 `--base` 指定从哪条已有分支拉出。`.gdd` 状态目录不入库；无 remote 仅本地提交；push 失败仅记录事件不阻塞流水线。commit 信息形如 `gdd(<node_id>): <节点名> exit 通过`。**停用场景**：项目目录位于另一个 git 仓库的子目录（外层仓存在）时，harness 会自动停用 git 交付（防外层仓劫持/误提交），在 `gdd status` 与控制台显式警示 `git_delivery_disabled`，产物仅在项目目录内、不入任何分支——此时需自行把产物同步到外层仓。
 
 ### 门禁两层判定（判定权在 harness）
 
@@ -166,7 +166,7 @@ cargo tauri build --bundles app
 - 人工确认 3 节点：**clarify**（DoD）、**plan**（方案）、**test**（上线前测试结论）。
 - 每个节点内置基础 entry（上游产物机器检查 + AI 门禁语义验证——注意：内置模板每个 entry 都带 goal，即每节点最多 3 个 AI 会话：entry 门禁 + 主体 + exit 门禁）与 exit（本节点产物 + AI 判据）。
 - implement 为 baseline_marker 节点；test 的 exit 为 change_aware（AI 基于改动补充验证）。
-- 各节点产物：`docs/requirement.md / survey.md / goal.md(DoD) / plan.md(ADR) / impl-ledger.md(核销台账) / test-report.md / delivery.md`、`RELEASE-CHECKLIST.md`、`docs/notify.md`。
+- 各节点产物都在 `iterations/<名字>/`：`requirement.md`、`survey.md`、`goal.md`（DoD）、`spec.md`、`plan.md`（ADR）、`acceptance.feature`、`decisions.md`、`impl-ledger.md`（核销台账）、`test-report.md`、`verify.md`、`delivery.md`、`RELEASE-CHECKLIST.md`。不写项目的 `docs/`，也不写仓库根目录。已有迭代的 `spec.md` 和 `decisions.md` 在下次初始化时列为只读基线。同名目录已有文件则拒绝再初始化。
 
 ## Agent 执行端配置（环境变量）
 

@@ -81,6 +81,7 @@ def test_t0_builtin_template_file():
     print("[T0] 内置模板文件化（gdd/templates/delivery.json 权威源）")
     import hashlib
     from gdd import builtins
+    from gdd.iteration import prepare
     from gdd.models import PipelineSpec
 
     tpl_path = os.path.join(ROOT, "gdd", "templates", "delivery.json")
@@ -92,19 +93,26 @@ def test_t0_builtin_template_file():
     check(builtins.DELIVERY_PIPELINE == raw, "builtins 导出与文件内容一致（权威源）")
     fp = hashlib.sha256(json.dumps(builtins.DELIVERY_PIPELINE, sort_keys=True,
                                     ensure_ascii=False).encode()).hexdigest()[:16]
-    check(fp == "b0ea640e7f1d2348", "模板内容指纹稳定（防误改）")
+    check(fp == "b739b490990fecbd", "模板内容指纹稳定（防误改）")
 
-    # 同源：两路 init 实例指纹一致（--pipeline delivery ≡ 传文件路径）
+    # 同源：绑定同一迭代名后，内置名与文件路径 init 出的实例指纹一致
     d = fresh_project()
     o = Orchestrator(d)
-    o.init(builtins.DELIVERY_PIPELINE, "r")
+    o.init(prepare(builtins.DELIVERY_PIPELINE, d, name="t0"), "r")
     fp1 = o.state["pipeline_fingerprint"]
     d2 = fresh_project()
     o2 = Orchestrator(d2)
-    o2.init(raw, "r")
+    o2.init(prepare(raw, d2, name="t0"), "r")
     check(fp1 == o2.state["pipeline_fingerprint"], "内置名与文件路径实例同源一致")
+    d3 = fresh_project()
+    try:
+        Orchestrator(d3).init(raw, "r")
+        raise AssertionError("未绑定占位符应拒绝")
+    except ValueError as e:
+        check("{{output}}" in str(e), "未绑定占位符被拒绝")
     shutil.rmtree(d)
     shutil.rmtree(d2)
+    shutil.rmtree(d3)
     print("[T0] PASS\n")
 
 
@@ -128,7 +136,8 @@ def test_a_happy_with_exit_bounce():
     write_script(script, rules)
 
     # init
-    p = run_gdd(d, "init", "--pipeline", "delivery", "--requirement", os.path.join(d, "req.md"))
+    p = run_gdd(d, "init", "--pipeline", "delivery", "--name", "run1",
+                "--requirement", os.path.join(d, "req.md"))
     check("已初始化" in p.stdout, "init 成功")
 
     # run：因为 stub 无法真正执行 bash，主体不产文件 → 机器检查 fail → 打回 3 次 → blocked。
@@ -138,21 +147,20 @@ def test_a_happy_with_exit_bounce():
 
     # 手动放置全部产物（模拟主体完成）
     files = {
-        "docs/requirement.md": "# R\n## 需求背景\n## 需求描述\n内容\n",
-        "docs/survey.md": "# S\n## 现状分析\n## 影响面\n## 相关方与依赖\n## 风险与未知项\n",
-        "docs/goal.md": "# G\n## 目标\n## 验收标准（DoD）\n",
-        "docs/spec.md": "# S\n## 规格\n",
-        "docs/plan.md": "# P\n## 实现步骤\n## ADR\n## 附录：任务依赖\n- T1 | - | 实现\n",
-        "docs/acceptance.feature": "Feature: 验收\n  Scenario: 主路径\n    Given 就绪\n    When 执行\n    Then 通过\n",
-        "docs/decisions.md": "# D\n## 决策记录\n",
-        "docs/impl-ledger.md": "# L\n## 核销台账\n",
-        "docs/test-report.md": "# T\n## 验证结果\n",
-        "docs/verify.md": "# V\n使用的数据\n过程日志\n落盘数据\n",
-        "docs/delivery.md": "# D\n## 验收证据\n",
-        "RELEASE-CHECKLIST.md": "# C\n## 发布前确认\n## 本次变更\n## 上线步骤\n## 异常处理\n",
-        "docs/notify.md": "# N\n## 周知内容\n## 改动服务与 PR\n",
+        "iterations/run1/requirement.md": "# R\n## 需求背景\n## 需求描述\n内容\n",
+        "iterations/run1/survey.md": "# S\n## 现状分析\n## 影响面\n## 相关方与依赖\n## 风险与未知项\n",
+        "iterations/run1/goal.md": "# G\n## 目标\n## 验收标准（DoD）\n",
+        "iterations/run1/spec.md": "# S\n## 规格\n",
+        "iterations/run1/plan.md": "# P\n## 实现步骤\n## ADR\n## 附录：任务依赖\n- T1 | - | 实现\n",
+        "iterations/run1/acceptance.feature": "Feature: 验收\n  Scenario: 主路径\n    Given 就绪\n    When 执行\n    Then 通过\n",
+        "iterations/run1/decisions.md": "# D\n## 决策记录\n",
+        "iterations/run1/impl-ledger.md": "# L\n## 核销台账\n",
+        "iterations/run1/test-report.md": "# T\n## 验证结果\n",
+        "iterations/run1/verify.md": "# V\n使用的数据\n过程日志\n落盘数据\n",
+        "iterations/run1/delivery.md": "# D\n## 验收证据\n",
+        "iterations/run1/RELEASE-CHECKLIST.md": "# C\n## 发布前确认\n## 本次变更\n## 上线步骤\n## 异常处理\n",
     }
-    os.makedirs(os.path.join(d, "docs"), exist_ok=True)
+    os.makedirs(os.path.join(d, "iterations", "run1"), exist_ok=True)
     for rel, content in files.items():
         with open(os.path.join(d, rel), "w") as f:
             f.write(content)
@@ -172,7 +180,7 @@ def test_a_happy_with_exit_bounce():
             "node=None\n"
             "for nid in ['project_init','survey','需求澄清','方案设计','开发实现','测试验证','收尾交付','上线准备']:\n"
             "    if nid in prompt: node=nid; break\n"
-            "m={'project_init':'docs/requirement.md','需求澄清':'docs/goal.md','方案设计':'docs/plan.md','开发实现':'docs/impl-ledger.md','测试验证':'docs/test-report.md','收尾交付':'docs/delivery.md','上线准备':'RELEASE-CHECKLIST.md','上线周知':'docs/notify.md'}\n"
+            "m={'project_init':'iterations/run1/requirement.md','需求澄清':'iterations/run1/goal.md','方案设计':'iterations/run1/plan.md','开发实现':'iterations/run1/impl-ledger.md','测试验证':'iterations/run1/test-report.md','收尾交付':'iterations/run1/delivery.md','上线准备':'iterations/run1/RELEASE-CHECKLIST.md'}\n"
             "c={'project_init':'# R\\n## 需求背景\\n## 需求描述\\n内容\\n','survey':'# S\\n## 现状分析\\n## 影响面\\n## 相关方与依赖\\n## 风险与未知项\\n','需求澄清':'# G\\n## 目标\\n## 验收标准（DoD）\\n','方案设计':'# P\\n## 实现步骤\\n## ADR\\n','开发实现':'# L\\n## 核销台账\\n','测试验证':'# T\\n## 验证结果\\n','收尾交付':'# D\\n## 验收证据\\n','上线准备':'# C\\n## 发布前确认\\n## 本次变更\\n## 上线步骤\\n## 异常处理\\n'}\n"
             "if node and node in m:\n"
             "    open(m[node],'w').write(c[node])\n"
@@ -196,10 +204,10 @@ def test_a_happy_with_exit_bounce():
 
     class HybridRunner(AgentRunner):
         NODE_FILES = {
-            "项目初始化": "docs/requirement.md", "调研现状": "docs/survey.md",
-            "需求澄清": "docs/goal.md", "方案设计": "docs/plan.md",
-            "开发实现": "docs/impl-ledger.md", "测试验证": "docs/test-report.md",
-            "收尾交付": "docs/delivery.md", "上线准备": "RELEASE-CHECKLIST.md",
+            "项目初始化": "iterations/run1/requirement.md", "调研现状": "iterations/run1/survey.md",
+            "需求澄清": "iterations/run1/goal.md", "方案设计": "iterations/run1/plan.md",
+            "开发实现": "iterations/run1/impl-ledger.md", "测试验证": "iterations/run1/test-report.md",
+            "收尾交付": "iterations/run1/delivery.md", "上线准备": "iterations/run1/RELEASE-CHECKLIST.md",
         }
         _exit_calls = 0  # 类级：仅第一次 exit 门禁会话 fail（验证打回路径）
 
@@ -268,18 +276,17 @@ def test_b_approval_reject():
     print("[B] 审批驳回 → 打回 → 批准")
     d = fresh_project()
     files = {
-        "docs/requirement.md": "# R\n## 需求描述\n内容\n",
-        "docs/survey.md": "# S\n## 现状分析\n## 影响面\n## 相关方与依赖\n## 风险与未知项\n",
-        "docs/goal.md": "# G\n## 目标\n## 验收标准（DoD）\n",
-        "docs/spec.md": "# S\n## 规格\n",
+        "iterations/run1/requirement.md": "# R\n## 需求描述\n内容\n",
+        "iterations/run1/survey.md": "# S\n## 现状分析\n## 影响面\n## 相关方与依赖\n## 风险与未知项\n",
+        "iterations/run1/goal.md": "# G\n## 目标\n## 验收标准（DoD）\n",
+        "iterations/run1/spec.md": "# S\n## 规格\n",
     }
-    os.makedirs(os.path.join(d, "docs"), exist_ok=True)
+    p = run_gdd(d, "init", "--name", "run1", "--requirement", os.path.join(d, "req.md"))
+    check("已初始化" in p.stdout, "B: init 成功")
+    os.makedirs(os.path.join(d, "iterations", "run1"), exist_ok=True)
     for rel, content in files.items():
         with open(os.path.join(d, rel), "w") as f:
             f.write(content)
-
-    p = run_gdd(d, "init", "--requirement", os.path.join(d, "req.md"))
-    check("已初始化" in p.stdout, "B: init 成功")
 
     from gdd.runner import SessionResult
 
@@ -292,8 +299,8 @@ def test_b_approval_reject():
         def run(self, prompt, *, allowed_tools, max_turns, log_path=None, resume_sid="", on_stream=None):
             if "[[GDD-ROLE:subject" in prompt:
                 # 需求澄清主体：每次都确保 goal.md 存在
-                with open(os.path.join(self.root, "docs", "goal.md"), "w") as f:
-                    f.write(files["docs/goal.md"])
+                with open(os.path.join(self.root, "iterations", "run1", "goal.md"), "w") as f:
+                    f.write(files["iterations/run1/goal.md"])
                 return SessionResult(ok=True, text="ok", turns=1)
             if "[[GDD-ROLE:gate:entry" in prompt:
                 return SessionResult(ok=True, text=PASS)  # entry 门禁恒过
@@ -336,12 +343,11 @@ def test_b_approval_reject():
 def test_c_blocked_and_retry():
     print("[C] 连续 fail → blocked → retry")
     d = fresh_project()
-    os.makedirs(os.path.join(d, "docs"), exist_ok=True)
-    with open(os.path.join(d, "docs", "requirement.md"), "w") as f:
-        f.write("# R\n## 需求描述\n内容\n")
-
-    p = run_gdd(d, "init", "--requirement", os.path.join(d, "req.md"))
+    p = run_gdd(d, "init", "--name", "run1", "--requirement", os.path.join(d, "req.md"))
     check("已初始化" in p.stdout, "C: init 成功")
+    os.makedirs(os.path.join(d, "iterations", "run1"), exist_ok=True)
+    with open(os.path.join(d, "iterations", "run1", "requirement.md"), "w") as f:
+        f.write("# R\n## 需求描述\n内容\n")
 
     from gdd.runner import SessionResult
 
@@ -356,7 +362,7 @@ def test_c_blocked_and_retry():
             if "[[GDD-ROLE:gate:entry" in prompt:
                 return SessionResult(ok=True, text=PASS)
             # 主体：产出 survey.md
-            with open(os.path.join(self.root, "docs", "survey.md"), "w") as f:
+            with open(os.path.join(self.root, "iterations", "run1", "survey.md"), "w") as f:
                 f.write("# S\n## 现状分析\n## 影响面\n## 相关方与依赖\n## 风险与未知项\n")
             return SessionResult(ok=True, text="ok", turns=1)
 
@@ -2621,7 +2627,7 @@ def test_p2_pins_r6():
         os.makedirs(proj)
         reqf = os.path.join(d, "req.txt")
         open(reqf, "w").write("x")
-        r = run_gdd(proj, "init", "--requirement", reqf)
+        r = run_gdd(proj, "init", "--name", "p2", "--requirement", reqf)
         assert r.returncode == 0, r.stdout + r.stderr
         r2 = run_gdd(proj, "status")
         check("git 交付已停用" in r2.stdout,

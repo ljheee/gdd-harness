@@ -11,9 +11,9 @@ my-delivery.json                  # 用户副本：cp gdd/templates/delivery.jso
 使用：
 
 ```bash
-gdd init --pipeline delivery              # 内置名（≡ 直接传文件路径）
-gdd init --pipeline my-delivery.json      # 自定义副本
-gdd init --pipeline my-delivery.yaml      # YAML 亦可（需 pip3 install pyyaml）
+gdd init --name my-change --pipeline delivery          # 内置名（≡ 直接传文件路径）
+gdd init --name my-change --pipeline my-delivery.json   # 从内置模板复制的副本仍含占位符
+gdd init --pipeline my-delivery.yaml                    # 不含占位符的自定义模板可以不写 --name
 ```
 
 **实例化语义**：`init` 时模板内容写入任务 `.gdd/pipeline.json` 并记录指纹（canonical JSON 的 sha256 前 16 位）。之后修改/删除模板文件**不影响**已实例化任务；任务期望的 pipeline 与磁盘不一致时 fail-closed 拒绝运行。
@@ -104,15 +104,17 @@ gdd init --pipeline my-delivery.yaml      # YAML 亦可（需 pip3 install pyyam
 
 ### 3.5 完成周知（内置行为，非模板字段）
 
-流水线**末节点**审批通过后，harness 在 stdout 打印「done，可以上线」与各节点 exit 摘要（记 `notify_print`）。不接外部 IM；模板里的 `notify` 节点仅负责产出周知文案（如 `docs/notify.md`）。
+流水线**末节点**完成后，harness 在 stdout 打印「done，可以上线」与各节点 exit 摘要（记 `notify_print`）。不接外部 IM。内置 delivery 以 `release_checklist` 为末节点。
 
 ### 3.6 git_delivery（流水线级）
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `enabled` | `true` | 每节点 exit 通过后自动 commit 并推送（harness 执行，非 LLM） |
-| `branch` | `"gdd/delivery"` | 开发交付分支 |
+| `branch` | `"gdd/delivery"` | 开发交付分支。内置 delivery 写成 `gdd/{{name}}`，初始化时换成 `gdd/<名字>` |
 | `remote` | `""` | 空 = 自动探测首个 remote；无 remote 则仅本地提交 |
+
+内置 delivery 的产物路径写成 `{{output}}/<文件名>`。`gdd init --name <名字>` 把 `{{output}}` 换成 `iterations/<名字>`，把 `{{name}}` 换成这个名字，并记下已有 `iterations/*/spec.md` 与 `decisions.md` 作为只读基线。只要模板里出现 `{{output}}` 或 `{{name}}`，交付分支都会换成 `gdd/<名字>`；写成 `feature/{{name}}` 也会被换成这个默认分支，要保留别的分支名就传 `--branch`。`--base` 指定从哪条已有分支拉出。只有出现 `{{output}}` 才占用 `iterations/<名字>/` 并拒绝该目录里已有文件；只出现 `{{name}}` 时产物路径保持模板原样。两个占位符都没有时，路径保持模板原样。
 
 ### 3.7 mcp / skills（仅主体会话）
 
@@ -195,3 +197,8 @@ skills:
 3. **验证者独立**：implement/test 等验证角色节点不要与上游共享 session_group（独立会话判断才可信）
 4. **打回预算按节点调**：复杂主体节点可上调 `max_bounces`；机器判据弱的节点不要上调（防 AI 反复空转烧预算）
 5. **改模板的正确姿势**：复制为新文件再改——直接改内置文件等于改了所有未来任务的起点，且不影响已实例化任务
+
+## 相关契约
+
+- 决策定级与决策记录的追加：[decision-grade.md](decision-grade.md)
+- 验收用例、证据与对抗裁决：[acceptance-cases.md](acceptance-cases.md)

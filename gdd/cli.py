@@ -1,7 +1,7 @@
 """gdd 命令行入口。
 
 用法：
-  gdd init [--pipeline delivery|<file>] [--requirement <file|->]   初始化流水线
+  gdd init --name <迭代名> [--pipeline delivery|<file>] [--requirement <file|->] [--branch] [--base]
   gdd run [-v]          推进直到需要人工介入或结束
   gdd status            查看状态与节点进度
   gdd approve --yes | --reject --feedback "..."                    裁决人工准入
@@ -18,6 +18,7 @@ import os
 import sys
 
 from .builtins import DELIVERY_PIPELINE
+from .iteration import needs_iteration, prepare as prepare_iteration
 from .orchestrator import LockBusyError, Orchestrator
 
 BUILTINS = {"delivery": DELIVERY_PIPELINE}
@@ -62,6 +63,16 @@ def cmd_init(args) -> int:
             return 1
         builtin = False
 
+    try:
+        pipeline = prepare_iteration(
+            pipeline, args.root,
+            name=getattr(args, "name", "") or "",
+            branch=getattr(args, "branch", "") or "",
+            base=getattr(args, "base", "") or "")
+    except ValueError as e:
+        print(f"初始化失败: {e}")
+        return 1
+
     if args.requirement == "-":
         requirement = sys.stdin.read()
     elif args.requirement:
@@ -85,6 +96,12 @@ def cmd_init(args) -> int:
     n_approval = sum(1 for n in pipeline["nodes"] if n.get("approval", {}).get("required"))
     print(f"人工准入节点：{n_approval}")
     print(f"状态文件：{o.state_path}")
+    it = o.state.get("iteration") or {}
+    if it.get("output"):
+        print(f"迭代目录：{it['output']}")
+        prior = o.state.get("prior_contracts") or []
+        if prior:
+            print("只读基线：" + "、".join(prior))
     # P1-3：init 时即报 git 交付实况（README:94 承诺「控制台显式警示」——
     # 曾只在 status/_print_status 打印，init/go 两入口零提示，外层仓子目录
     # 用户全程以为在交付）
@@ -592,6 +609,19 @@ def _go_guide_init(o: Orchestrator) -> bool:
             return False
     else:
         requirement = req
+    name = ""
+    if needs_iteration(pipeline):
+        print("迭代名（本次产物写入 iterations/<名字>/，分支默认 gdd/<名字>）：")
+        try:
+            name = input("> ").strip()
+        except EOFError:
+            print("\n（EOF，取消引导）")
+            return False
+    try:
+        pipeline = prepare_iteration(pipeline, o.root, name=name)
+    except ValueError as e:
+        print(f"初始化失败: {e}")
+        return False
     try:
         o.init(pipeline, requirement)
     except (ValueError, TypeError, AttributeError, RuntimeError, KeyError) as e:
@@ -925,6 +955,9 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("init", help="初始化流水线")
     p.add_argument("--pipeline", default="delivery", help="内置名（delivery）或 pipeline JSON 文件路径")
+    p.add_argument("--name", default="", help="迭代名。内置 delivery 必填，产物写入 iterations/<名字>/")
+    p.add_argument("--branch", default="", help="交付分支，默认 gdd/<名字>")
+    p.add_argument("--base", default="", help="从这条已有分支拉出交付分支，默认当前分支")
     p.add_argument("--requirement", default=None, help="需求文本文件路径，- 表示 stdin")
     p.add_argument("--root", default=".", help="项目根目录（默认当前目录）")
     p.set_defaults(func=cmd_init)

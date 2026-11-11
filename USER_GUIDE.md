@@ -65,7 +65,7 @@ GDD 是一个**本地节点流水线编排引擎**：你定义节点（做什么
 echo "实现一个 TODO CLI，支持增删查，带 pytest 测试" > req.md
 
 # 2. 初始化（delivery = 内置 8 节点流水线）
-python3 -m gdd.cli init --root ./myproj --pipeline delivery --requirement req.md
+python3 -m gdd.cli init --root ./myproj --name my-change --pipeline delivery --requirement req.md
 
 # 3. 开跑（会自动推进，停在人工审批点）
 python3 -m gdd.cli run --root ./myproj
@@ -79,10 +79,10 @@ python3 -m gdd.cli approve --root ./myproj --yes
 
 全程你只需在 3 个审批点（需求澄清 / 方案 / 测试）按 `--yes` 或 `--reject --feedback "修改意见"`。
 
-**每节点 exit 通过后**：harness 自动把产出 commit 到 `gdd/delivery` 分支（配置了 remote 则 push）。想看交付历史：
+**每节点 exit 通过后**：harness 自动把产出 commit 到 `gdd/<名字>` 分支（配置了 remote 则 push）。想看交付历史：
 
 ```bash
-git -C ./myproj log --oneline gdd/delivery
+git -C ./myproj log --oneline gdd/my-change
 ```
 
 **例外**：若项目目录本身是另一个 git 仓库的子目录（外层仓存在），为防外层仓劫持/误提交，git 交付会被自动停用——`gdd status` 与控制台会警示 `git_delivery_disabled`，产物只留在项目目录内、不入任何分支，需自行同步到外层仓。
@@ -271,7 +271,7 @@ harness 会检出滞留提交并显式报 `git_commit_fail`（非静默丢失）
 - 本地单人场景：无签名密钥，同时篡改 pipeline.json 与 state.json 指纹可绕过校验
 - 真实远端 push/分叉恢复未实测（本地无 remote 环境为正确 push_skip）
 
-详见 README.md「设计边界」章节；自定义流水线示例可参考内置模板 `gdd/templates/delivery.json`——复制为副本（如 `my-delivery.json`）后修改，`gdd init --pipeline my-delivery.json` 即可使用。内置模板文件本身是唯一权威源（`--pipeline delivery` 与直接传该文件路径等价）。
+详见 README.md「设计边界」章节；自定义流水线示例可参考内置模板 `gdd/templates/delivery.json`——复制为副本（如 `my-delivery.json`）后修改，`gdd init --name <名字> --pipeline my-delivery.json` 即可使用。内置模板文件本身是唯一权威源（`--pipeline delivery` 与直接传该文件路径等价）。内置 delivery 必须带 `--name`，过程文档写入 `iterations/<名字>/`。
 
 ---
 

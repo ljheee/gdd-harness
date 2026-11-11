@@ -22,11 +22,13 @@ FINGERPRINT_FILES = (
 STAGE_ROOT = ".gdd/revision-stage"
 BASELINE_ROOT = ".gdd/revision-baseline"
 
+# 人类可读契约：docs/covenant/decision-grade.md
+# 下面这段注入主体会话；docs/ 下的四份路径由 contract_for 按当次迭代改写。
 CONTRACT = """决策定级契约（全局）：
 这次选择有没有改变已经确认的决定，以及这个改变要不要人负责。先核实事实，再定一个等级。
 同一件事沾到多条时取最高等级。核实后仍不能证明「不改变已确认的决定」，就按 L1 提交，不能当成 L2 继续做。
 
-L0：增加或推翻已确认的决定。必须写入决策记录，必须人工确认。正式文件是 docs/decisions.md；增量重跑时改写 .gdd/revision-stage/docs/decisions.md，不要改正式文件。包括：
+L0：增加或推翻已确认的决定。必须写入决策记录，必须人工确认。正式文件是 docs/decisions.md；增量重跑时只把新条目追加到 .gdd/revision-stage/docs/decisions.md，不要改正式文件，也不要改已有条目。包括：
 - 对外契约：接口、字段、错误语义、事件、权限，以及给其他系统的承诺。
 - 持久化形态：表、字段、类型、约束、迁移是否可逆、存量数据怎么处理。
 - 复用还是新建。
@@ -42,7 +44,7 @@ L1：目标仍然能达到，但做法偏离已确认决定，成本或风险有
 L2：已确认的目标、对外契约、数据形态、兼容策略、同步方式、实效性和一致性都不变。节点内自己决定，不提交定级。函数拆分、命名、目录、等价重构属于 L2。
 环境问题和依赖问题先自己处理（例如 mock 掉缺的依赖）。只有缺权限、缺资料，或必须由人做外部动作时，才一次说明：失败点、已经试过什么、排除了什么、推荐路径、最少需要什么帮助。环境缺口不能记成通过。
 
-方案开工前先扫描。只要出现 L0 或 L1 的选择，先追加到决策记录再往下设计。不在重跑时写 docs/decisions.md，重跑时写 .gdd/revision-stage/docs/decisions.md。决策记录只追加：等级、事实、对照的条款、备选、选定、原因。推翻旧决定时追加一条新记录指向旧条目，不改旧行。
+方案开工前先扫描。只要出现 L0 或 L1，先提交定级并停止，不要把决定写进决策记录，也不要继续把修订做完。人确认之后的重跑里，决策记录只追加到 .gdd/revision-stage/docs/decisions.md，不要改正式文件。决策记录只追加：等级、事实、对照的条款、备选、选定、原因。推翻旧决定时追加一条新记录指向旧条目，不改旧行。
 
 若判定为 L0 或 L1，在回复最末一行单独写出（其后不要再写别的内容）：
 GDD-GRADE: {"level":"L0 或 L1","clause":"对照的条款","fact":"核实到的事实","basis":"已确认文档里的原决定"}
@@ -57,10 +59,12 @@ RERUN_BLOCK = """[[GDD-RERUN]]
 上面契约里写到的 docs/goal.md、docs/spec.md、docs/plan.md、docs/decisions.md，这次一律改到 .gdd/revision-stage/ 下的同名路径。
 入口条件和出口条件都会重新验证。需要人工审批的节点，重跑之后仍然要审批。"""
 
+# 人类可读契约：docs/covenant/acceptance-cases.md
 ADVERSARIAL_INTRO = """[[GDD-ROLE:adversarial node:{node_id}]]
 你是独立于测试主体的对抗会话。不要复用测试主体的结论，也不要重跑测试。
 阅读 docs/acceptance.feature（Gherkin）和 docs/verify.md。
-verify.md 里每个用例应能复查：使用的数据、过程日志、落盘数据。
+每条用例的 id 是 docs/acceptance.feature 里 Scenario: 后面的标题，去掉首尾空白。
+docs/verify.md 里同一标题下应能复查：使用的数据、过程日志、落盘数据。
 对照 Gherkin 判定每个用例。证据支撑不了结论、或环境缺口被记成通过，都判 fail。
 cause 只能是 code、test、spec、env 之一：
 - code：实现没有满足用例
@@ -100,24 +104,88 @@ def _copy(src: str, dst: str) -> None:
     shutil.copy2(src, dst)
 
 
-def snapshot_baseline(root: str, state: Dict, outside_ids: List[str]) -> Dict:
+def _inside(rel: str) -> bool:
+    """修订读写的相对路径必须留在任务根内。"""
+    from .gates import path_escapes_root
+    return isinstance(rel, str) and bool(rel) and not path_escapes_root(rel)
+
+
+def contract_files(files: Optional[List[str]] = None) -> List[str]:
+    """这次迭代要守住的四份契约。未绑定迭代时仍是 docs/ 下的四份。"""
+    if not files:
+        return list(FINGERPRINT_FILES)
+    return list(files)
+
+
+def decisions_rel(files: Optional[List[str]] = None) -> str:
+    for rel in contract_files(files):
+        if rel.endswith("decisions.md") and _inside(rel):
+            return rel
+    return "docs/decisions.md"
+
+
+def _retarget(text: str, files: Optional[List[str]] = None) -> str:
+    """把契约正文里的默认路径换成这次迭代的路径。默认四份保持原文。"""
+    chosen = contract_files(files)
+    if chosen == list(FINGERPRINT_FILES):
+        return text
+    mapping = {
+        "docs/goal.md": "",
+        "docs/spec.md": "",
+        "docs/plan.md": "",
+        "docs/decisions.md": "",
+    }
+    for rel in chosen:
+        for old in mapping:
+            if rel.endswith(old.split("/", 1)[1]):
+                mapping[old] = rel
+    for old, new in mapping.items():
+        if new and new != old:
+            text = text.replace(old, new)
+    return text
+
+
+def contract_for(files: Optional[List[str]] = None) -> str:
+    return _retarget(CONTRACT, files)
+
+
+def rerun_for(files: Optional[List[str]] = None) -> str:
+    return _retarget(RERUN_BLOCK, files)
+
+
+def adversarial_intro(node_id: str, acceptance: str = "", verify: str = "") -> str:
+    text = ADVERSARIAL_INTRO.replace("{node_id}", node_id)
+    if acceptance and acceptance != "docs/acceptance.feature":
+        text = text.replace("docs/acceptance.feature", acceptance)
+    if verify and verify != "docs/verify.md":
+        text = text.replace("docs/verify.md", verify)
+    return text
+
+
+def snapshot_baseline(root: str, state: Dict, outside_ids: List[str],
+                      files: Optional[List[str]] = None) -> Dict:
     """把当前四份产物存成基线，并记下开发阶段之外的进度指纹。"""
-    files = {}
-    for rel in FINGERPRINT_FILES:
-        files[rel] = file_hash(root, rel)
+    saved = {}
+    for rel in contract_files(files):
+        if not _inside(rel):
+            continue
+        saved[rel] = file_hash(root, rel)
         src = os.path.join(root, rel)
         dst = os.path.join(root, BASELINE_ROOT, rel)
         if os.path.isfile(src):
             _copy(src, dst)
         elif os.path.isfile(dst):
             os.remove(dst)
-    return {"files": files, "progress": outside_progress(state, outside_ids)}
+    return {"files": saved, "progress": outside_progress(state, outside_ids)}
 
 
-def baseline_matches(root: str, state: Dict, baseline: Dict, outside_ids: List[str]) -> bool:
-    files = baseline.get("files") or {}
-    for rel in FINGERPRINT_FILES:
-        if file_hash(root, rel) != files.get(rel, ""):
+def baseline_matches(root: str, state: Dict, baseline: Dict, outside_ids: List[str],
+                     files: Optional[List[str]] = None) -> bool:
+    saved = baseline.get("files") or {}
+    for rel in contract_files(files):
+        if not _inside(rel):
+            return False
+        if file_hash(root, rel) != saved.get(rel, ""):
             return False
     return outside_progress(state, outside_ids) == baseline.get("progress")
 
@@ -133,10 +201,13 @@ def _appended(old: bytes, new: bytes) -> bool:
     return new[len(old):].startswith(b"\n")
 
 
-def staged_decisions_ok(root: str) -> bool:
+def staged_decisions_ok(root: str, files: Optional[List[str]] = None) -> bool:
     """决策记录只允许在已确认文本之后追加。没有修订稿或没有旧记录时不拦。"""
-    base = os.path.join(root, BASELINE_ROOT, "docs", "decisions.md")
-    stage = os.path.join(root, STAGE_ROOT, "docs", "decisions.md")
+    rel = decisions_rel(files)
+    if not _inside(rel):
+        return False
+    base = os.path.join(root, BASELINE_ROOT, rel)
+    stage = os.path.join(root, STAGE_ROOT, rel)
     if not os.path.isfile(stage) or not os.path.isfile(base):
         return True
     with open(base, "rb") as f:
@@ -146,10 +217,13 @@ def staged_decisions_ok(root: str) -> bool:
     return _appended(old, new)
 
 
-def live_decisions_rewritten(root: str) -> bool:
+def live_decisions_rewritten(root: str, files: Optional[List[str]] = None) -> bool:
     """正式决策记录相对基线副本改了旧内容，而不是只在后面追加。"""
-    base = os.path.join(root, BASELINE_ROOT, "docs", "decisions.md")
-    live = os.path.join(root, "docs", "decisions.md")
+    rel = decisions_rel(files)
+    if not _inside(rel):
+        return False
+    base = os.path.join(root, BASELINE_ROOT, rel)
+    live = os.path.join(root, rel)
     if not os.path.isfile(base):
         return False
     with open(base, "rb") as f:
@@ -163,9 +237,11 @@ def live_decisions_rewritten(root: str) -> bool:
     return not _appended(old, new)
 
 
-def restore_decisions(root: str) -> None:
+def restore_decisions(root: str, files: Optional[List[str]] = None) -> None:
     """把正式决策记录退回基线副本。"""
-    rel = "docs/decisions.md"
+    rel = decisions_rel(files)
+    if not _inside(rel):
+        return
     src = os.path.join(root, BASELINE_ROOT, rel)
     dst = os.path.join(root, rel)
     if os.path.isfile(src):
@@ -174,18 +250,22 @@ def restore_decisions(root: str) -> None:
         os.remove(dst)
 
 
-def clear_stage(root: str) -> None:
+def clear_stage(root: str, files: Optional[List[str]] = None) -> None:
     """丢掉暂存稿。基线已换或新一轮重跑开始时，旧稿不能再盖到正式文件上。"""
-    for rel in FINGERPRINT_FILES:
+    for rel in contract_files(files):
+        if not _inside(rel):
+            continue
         path = os.path.join(root, STAGE_ROOT, rel)
         if os.path.isfile(path):
             os.remove(path)
 
 
-def apply_staged(root: str) -> List[str]:
+def apply_staged(root: str, files: Optional[List[str]] = None) -> List[str]:
     """基线未变时，把暂存的修订稿复制到正式路径。返回实际复制的相对路径。"""
     copied = []
-    for rel in FINGERPRINT_FILES:
+    for rel in contract_files(files):
+        if not _inside(rel):
+            continue
         src = os.path.join(root, STAGE_ROOT, rel)
         if not os.path.isfile(src):
             continue
@@ -198,6 +278,8 @@ def restore_baseline_files(root: str, baseline: Dict) -> None:
     """签批拒绝时，把正式产物退回上次确认的基线。"""
     files = baseline.get("files") or {}
     for rel, digest in files.items():
+        if not isinstance(rel, str) or not _inside(rel):
+            continue
         dst = os.path.join(root, rel)
         src = os.path.join(root, BASELINE_ROOT, rel)
         if not digest:

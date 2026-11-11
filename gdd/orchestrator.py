@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional
 from . import approval as approval_mod
 from . import gates
 from . import revision as revision_mod
-from .models import ArtifactCheck, NodeSpec, PipelineSpec
+from .models import ArtifactCheck, NodeSpec, PipelineSpec, _parse_bool
 from .runner import AgentRunner
 
 
@@ -131,6 +131,9 @@ class Orchestrator:
     def init(self, pipeline_dict: Dict[str, Any], requirement: str = "") -> None:
         if os.path.exists(self.state_path):
             raise RuntimeError(f"已初始化：{self.state_path}（如需重来请先删除 .gdd 或 gdd reset）")
+        self._reject_unbound_iteration(pipeline_dict)
+        self._reject_existing_delivery_branch(pipeline_dict)
+        self._reject_escaping_iteration_paths(pipeline_dict)
         # 先解析模板再建目录：模板非法时不残留空 .gdd/logs、.gdd/nodes
         self.pipeline = PipelineSpec.from_dict(pipeline_dict)
         os.makedirs(self.logs_dir, exist_ok=True)
@@ -150,8 +153,78 @@ class Orchestrator:
         self.state["input_digest"] = hashlib.sha256(
             self._input_text.encode("utf-8", "replace")).hexdigest()
         self.state["pipeline_fingerprint"] = self._pipeline_fingerprint()
+        self._remember_iteration(pipeline_dict)
         self._git_delivery_setup()
         self._save()
+
+    def _reject_unbound_iteration(self, pipeline_dict: Dict[str, Any]) -> None:
+        """占位符必须在初始化前换成这次的目录和分支。"""
+        from .iteration import needs_iteration
+        if isinstance(pipeline_dict, dict) and needs_iteration(pipeline_dict):
+            raise ValueError(
+                "流水线仍含 {{output}} 或 {{name}}。先绑定迭代名再初始化。")
+
+    def _reject_existing_delivery_branch(self, pipeline_dict: Dict[str, Any]) -> None:
+        """指定了基线分支时，不能改切到一条已经存在的交付分支。"""
+        if not isinstance(pipeline_dict, dict):
+            return
+        it = pipeline_dict.get("iteration")
+        if not isinstance(it, dict):
+            return
+        base = str(it.get("base") or "").strip()
+        if not base:
+            return
+        branch = self._effective_delivery_branch(pipeline_dict)
+        if not branch or branch == base:
+            return
+        inside = self._git_proc("rev-parse", "--is-inside-work-tree")
+        if inside is None or inside.returncode != 0:
+            return
+        top = self._git_proc("rev-parse", "--show-toplevel")
+        toplevel = top.stdout.strip() if (top and top.returncode == 0) else ""
+        if toplevel and os.path.realpath(toplevel) != os.path.realpath(self.root):
+            return
+        has = self._git_proc("rev-parse", "--verify", f"refs/heads/{branch}")
+        if has is not None and has.returncode == 0:
+            raise RuntimeError(
+                f"交付分支 {branch} 已存在，不能按基线 {base} 重新拉出。"
+                f"换一个 --branch，或先处理掉旧分支后再初始化。")
+
+    def _effective_delivery_branch(self, pipeline_dict: Dict[str, Any]) -> str:
+        """这次初始化真正会 checkout 的分支。交付未启用时返回空串。"""
+        gd = pipeline_dict.get("git_delivery")
+        if gd is None:
+            return "gdd/delivery"
+        if not isinstance(gd, dict):
+            return ""
+        try:
+            enabled = _parse_bool(gd.get("enabled", True))
+        except ValueError:
+            return ""
+        if not enabled:
+            return ""
+        return str(gd.get("branch") or "gdd/delivery").strip() or "gdd/delivery"
+
+    def _reject_escaping_iteration_paths(self, pipeline_dict: Dict[str, Any]) -> None:
+        """修订要读写的相对路径必须留在任务根里。"""
+        if not isinstance(pipeline_dict, dict):
+            return
+        it = pipeline_dict.get("iteration")
+        if not isinstance(it, dict):
+            return
+        paths: List[str] = []
+        out = str(it.get("output") or "").strip()
+        if out:
+            paths.append(out)
+            for leaf in ("goal.md", "spec.md", "plan.md", "decisions.md",
+                         "acceptance.feature", "verify.md"):
+                paths.append(f"{out}/{leaf}")
+        prior = it.get("prior") or []
+        if isinstance(prior, list):
+            paths.extend(str(p) for p in prior if isinstance(p, str) and p)
+        for rel in paths:
+            if gates.path_escapes_root(rel):
+                raise ValueError(f"迭代路径不能越出任务根: {rel}")
 
     @staticmethod
     def _fresh_state(pipeline: PipelineSpec) -> Dict[str, Any]:
@@ -176,6 +249,36 @@ class Orchestrator:
             "history": [],
             "updated_at": None,
         }
+
+    def _remember_iteration(self, pipeline_dict: Dict[str, Any]) -> None:
+        """记下这次迭代的目录、契约路径和上一轮只读基线。"""
+        it = pipeline_dict.get("iteration") if isinstance(pipeline_dict, dict) else None
+        if not isinstance(it, dict):
+            return
+        out = str(it.get("output") or "")
+        self.state["iteration"] = {
+            "name": str(it.get("name") or ""),
+            "output": out,
+            "branch": str(it.get("branch") or ""),
+        }
+        if it.get("base"):
+            self.state["iteration_base"] = str(it["base"])
+        prior = it.get("prior") or []
+        if isinstance(prior, list):
+            self.state["prior_contracts"] = [str(p) for p in prior if isinstance(p, str) and p]
+        if not out:
+            return
+        self.state["contract_files"] = [
+            f"{out}/goal.md", f"{out}/spec.md", f"{out}/plan.md", f"{out}/decisions.md",
+        ]
+        self.state["acceptance_file"] = f"{out}/acceptance.feature"
+        self.state["verify_file"] = f"{out}/verify.md"
+
+    def _contract_files(self) -> List[str]:
+        raw = self.state.get("contract_files")
+        if isinstance(raw, list) and raw and all(isinstance(x, str) and x for x in raw):
+            return list(raw)
+        return list(revision_mod.FINGERPRINT_FILES)
 
     def load(self) -> bool:
         if not (os.path.exists(self.state_path) and os.path.exists(self.pipeline_path)):
@@ -649,6 +752,25 @@ class Orchestrator:
                     f"检测到外层 git 仓（toplevel {toplevel} ≠ 任务根 {self.root}）："
                     f"已永久停用 git 交付；如需启用请在任务根单独 git init 后 gdd reset 重开"))
                 return
+        base = str(self.state.get("iteration_base") or "").strip()
+        if base:
+            cur_base = self._git_proc("symbolic-ref", "--short", "HEAD")
+            cur_base_branch = cur_base.stdout.strip() if (cur_base and cur_base.returncode == 0) else ""
+            if cur_base_branch != base:
+                has_base = self._git_proc("rev-parse", "--verify", f"refs/heads/{base}")
+                if has_base is None or has_base.returncode != 0:
+                    self.state["git_delivery_disabled"] = True
+                    self.state["git_delivery_disabled_reason"] = f"基线分支 {base} 不存在"
+                    self._record("git_delivery_skip", reason=f"基线分支 {base} 不存在")
+                    return
+                onto = self._git_proc("checkout", base)
+                if onto is None or onto.returncode != 0:
+                    self.state["git_delivery_disabled"] = True
+                    self.state["git_delivery_disabled_reason"] = (
+                        f"切换基线分支 {base} 失败："
+                        f"{((onto.stderr if onto else '') or '不可执行/超时').strip()[:150]}")
+                    self._record("git_delivery_skip", reason=self.state["git_delivery_disabled_reason"])
+                    return
         cur = self._git_proc("symbolic-ref", "--short", "HEAD")
         cur_branch = cur.stdout.strip() if (cur and cur.returncode == 0) else ""
         if cur_branch != cfg.branch:
@@ -1301,13 +1423,22 @@ class Orchestrator:
     # ------------------------------------------------------------ 定级 / 重跑 / 对抗
 
     def _decorate_subject_prompt(self, node: NodeSpec, prompt: str) -> str:
-        extra = "\n\n" + revision_mod.CONTRACT
+        files = self._contract_files()
+        extra = "\n\n" + revision_mod.contract_for(files)
+        prior = self.state.get("prior_contracts") or []
+        if isinstance(prior, list) and prior:
+            extra += ("\n\n其他迭代已经写下的规格和决策，只读，不要修改这些文件：\n"
+                      + "\n".join(f"- {p}" for p in prior)
+                      + "\n若这次选择改变其中已经写下的决定，按决策定级契约提交。")
         rev = self.state.get("revision") or {}
         if rev.get("active") and node.id in (rev.get("nodes") or []):
-            extra += "\n\n" + revision_mod.RERUN_BLOCK
+            extra += "\n\n" + revision_mod.rerun_for(files)
             if rev.get("reason"):
                 extra += "\n\n这次修订要处理的已确认决定：\n" + str(rev["reason"])
         return prompt + extra
+
+    def _stage_decisions(self) -> str:
+        return ".gdd/revision-stage/" + revision_mod.decisions_rel(self._contract_files())
 
     def _revision_nodes(self) -> List[NodeSpec]:
         return revision_mod.revision_range(self.pipeline.nodes)
@@ -1336,10 +1467,10 @@ class Orchestrator:
         in_rev = bool(rev.get("active") and node.id in (rev.get("nodes") or []))
         if in_rev:
             outside = self._outside_ids(rev.get("nodes") or [])
-            if revision_mod.live_decisions_rewritten(self.root):
-                revision_mod.restore_decisions(self.root)
+            if revision_mod.live_decisions_rewritten(self.root, self._contract_files()):
+                revision_mod.restore_decisions(self.root, self._contract_files())
                 note = ("决策记录的正式文件改了已有条目，已退回基线。"
-                        "旧行不能改。要追加请写到 .gdd/revision-stage/docs/decisions.md。")
+                        f"旧行不能改。要追加请写到 {self._stage_decisions()}。")
                 ns["decision_rewrites"] = ns.get("decision_rewrites", 0) + 1
                 self._record("revision_decisions_rewrite", node=node.id,
                              n=ns["decision_rewrites"], where="live")
@@ -1352,11 +1483,12 @@ class Orchestrator:
                 self._save()
                 return True
             if not revision_mod.baseline_matches(
-                    self.root, self.state, rev.get("baseline") or {}, outside):
+                    self.root, self.state, rev.get("baseline") or {}, outside,
+                    self._contract_files()):
                 return self._pause_rebase(node)
-            if not revision_mod.staged_decisions_ok(self.root):
+            if not revision_mod.staged_decisions_ok(self.root, self._contract_files()):
                 note = ("决策记录只能在已有条目之后追加，不能改旧行。"
-                        "请把修订稿重新写到 .gdd/revision-stage/docs/decisions.md。")
+                        f"请把修订稿重新写到 {self._stage_decisions()}。")
                 ns["decision_rewrites"] = ns.get("decision_rewrites", 0) + 1
                 self._record("revision_decisions_rewrite", node=node.id,
                              n=ns["decision_rewrites"])
@@ -1370,9 +1502,10 @@ class Orchestrator:
                 return True
             if fresh_grade:
                 return self._pause_grade(node, grade)
-            revision_mod.apply_staged(self.root)
+            revision_mod.apply_staged(self.root, self._contract_files())
             ns.pop("decision_rewrites", None)
-            rev["baseline"] = revision_mod.snapshot_baseline(self.root, self.state, outside)
+            rev["baseline"] = revision_mod.snapshot_baseline(
+                self.root, self.state, outside, self._contract_files())
             self.state["revision"] = rev
             self._save()
         elif fresh_grade:
@@ -1439,7 +1572,7 @@ class Orchestrator:
         ns["phase"] = "working"
         self.state["status"] = "running"
         if (self.state.get("revision") or {}).get("active"):
-            revision_mod.clear_stage(self.root)
+            revision_mod.clear_stage(self.root, self._contract_files())
         note = "定级被否决，不启动修订。按 L2 继续完成本节点，不要再以同一事实提起 L0/L1。"
         if feedback:
             note += "\n" + feedback
@@ -1454,8 +1587,9 @@ class Orchestrator:
         baseline = rev.get("baseline") or {}
         outside = self._outside_ids(rev.get("nodes") or [])
         if approved:
-            revision_mod.clear_stage(self.root)
-            rev["baseline"] = revision_mod.snapshot_baseline(self.root, self.state, outside)
+            revision_mod.clear_stage(self.root, self._contract_files())
+            rev["baseline"] = revision_mod.snapshot_baseline(
+                self.root, self.state, outside, self._contract_files())
             self.state["revision"] = rev
             note = "基线已确认变化。旧暂存稿已作废。请按这份新基线重新准备修订稿，只写到 .gdd/revision-stage/，不要直接改正式产物。"
         else:
@@ -1496,7 +1630,7 @@ class Orchestrator:
             self._save()
             return True
         ids = [n.id for n in nodes]
-        revision_mod.clear_stage(self.root)
+        revision_mod.clear_stage(self.root, self._contract_files())
         outside = self._outside_ids(ids)
         passed_end = False
         end = ids[-1]
@@ -1517,7 +1651,8 @@ class Orchestrator:
         self.state["revision"] = {
             "active": True,
             "nodes": ids,
-            "baseline": revision_mod.snapshot_baseline(self.root, self.state, outside),
+            "baseline": revision_mod.snapshot_baseline(
+                self.root, self.state, outside, self._contract_files()),
             "reason": reason,
             "confirmed": list(confirmed or []),
         }
@@ -1526,7 +1661,10 @@ class Orchestrator:
         return True
 
     def _run_adversarial(self, node: NodeSpec, ns: Dict, runner: AgentRunner) -> Optional[bool]:
-        prompt = revision_mod.ADVERSARIAL_INTRO.replace("{node_id}", node.id)
+        prompt = revision_mod.adversarial_intro(
+            node.id,
+            str(self.state.get("acceptance_file") or ""),
+            str(self.state.get("verify_file") or ""))
         self._present("ui_phase", phase="adversarial", node=node.id, name=node.name)
         session = runner.run(
             prompt, allowed_tools=["Read", "Grep", "Glob"], max_turns=node.subject.max_turns,
@@ -1538,7 +1676,10 @@ class Orchestrator:
             return self._handle_gate_error(node, gates.Verdict(
                 passed=False, gate_error=True,
                 reason="对抗会话没有给出可解析的用例裁决",
-                feedback="请重新核对 docs/verify.md 与 docs/acceptance.feature，并给出 GDD-ADVERSARIAL 裁决。"))
+                feedback=("请重新核对 "
+                          f"{self.state.get('verify_file') or 'docs/verify.md'} 与 "
+                          f"{self.state.get('acceptance_file') or 'docs/acceptance.feature'}"
+                          "，并给出 GDD-ADVERSARIAL 裁决。")))
         cases = revision_mod.normalize_cases(
             [c for c in (parsed.get("cases") or []) if isinstance(c, dict)])
         if not cases:
@@ -1546,7 +1687,9 @@ class Orchestrator:
             return self._handle_gate_error(node, gates.Verdict(
                 passed=False, gate_error=True,
                 reason="对抗会话没有给出任何用例裁决",
-                feedback="请对照 docs/acceptance.feature 逐条裁决，cases 不能为空。"))
+                feedback=("请对照 "
+                          f"{self.state.get('acceptance_file') or 'docs/acceptance.feature'}"
+                          " 逐条裁决，cases 不能为空。")))
         route = revision_mod.route_cases(cases)
         self._record("adversarial", node=node.id, route=route)
         if route == "pass":
@@ -1610,7 +1753,8 @@ class Orchestrator:
         env_only = bool(fails) and all(c.get("cause") == "env" for c in fails)
         text = "对抗测试未通过，留在测试环节当前环境重跑：\n" + revision_mod.format_failed(fails)
         if any(c.get("cause") == "env" for c in fails):
-            text += ("\n环境问题能自己解决的就在当前环境解决，例如 mock 依赖，然后更新 docs/verify.md。"
+            verify = self.state.get("verify_file") or "docs/verify.md"
+            text += (f"\n环境问题能自己解决的就在当前环境解决，例如 mock 依赖，然后更新 {verify}。"
                      "确需用户提供权限、缺失资料或外部动作时，才一次说明：失败点、已经试过什么、"
                      "排除了什么、推荐路径、最少需要什么帮助。环境缺口不能记成通过。")
         if env_only and ns.get("env_retries", 0) < 1:

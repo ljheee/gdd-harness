@@ -91,11 +91,33 @@ def restore_runner(orig):
     orch.AgentRunner = orig
 
 
+def test_contract_docs():
+    print("[C] 契约文档")
+    grade = open(os.path.join(ROOT, "docs/covenant/decision-grade.md"), encoding="utf-8").read()
+    cases = open(os.path.join(ROOT, "docs/covenant/acceptance-cases.md"), encoding="utf-8").read()
+    check(parse_grade(grade) is None, "定级契约里的示例不会被当成定级")
+    check(parse_adversarial(cases) is None, "用例契约里的示例不会被当成裁决")
+    for phrase in ("L0", "L1", "L2", "## 决策记录", "指向：", "等级|条款|事实",
+                   "修订时把这条决定追加"):
+        check(phrase in grade, f"定级契约含 {phrase}")
+    check("把这条决定写入决策记录" not in grade, "批准本身不写决策记录")
+    for phrase in ("Scenario:", "使用的数据", "过程日志", "落盘数据", "GDD-ADVERSARIAL"):
+        check(phrase in cases, f"用例契约含 {phrase}")
+    print("[C] PASS\n")
+
+
 def test_parsers():
     print("[P] 解析与分流")
     check(parse_grade(CONTRACT) is None, "契约正文不会被当成定级")
     check(".gdd/revision-stage/docs/decisions.md" in CONTRACT
           and "不要改正式文件" in CONTRACT, "契约在重跑时改写暂存区")
+    check("先追加到决策记录再往下设计" not in CONTRACT
+          and "不要把决定写进决策记录" in CONTRACT,
+          "确认前不写决策记录")
+    check("改写 .gdd/revision-stage" not in CONTRACT
+          and "只把新条目追加到 .gdd/revision-stage/docs/decisions.md" in CONTRACT,
+          "重跑对决策记录只追加")
+    check("Scenario:" in ADVERSARIAL_INTRO, "对抗裁决用 Scenario 标题做用例 id")
     check(parse_adversarial(ADVERSARIAL_INTRO) is None, "对抗说明不会被当成裁决")
     g = parse_grade("前文\n" + GRADE + "\n")
     check(g["level"] == "L0" and g["fact"] == "要删字段", "取最后一条合法定级")
@@ -481,6 +503,7 @@ def test_grade_does_not_land_or_skip():
 
 
 if __name__ == "__main__":
+    test_contract_docs()
     test_parsers()
     test_cas_files()
     test_grade_and_rerun()

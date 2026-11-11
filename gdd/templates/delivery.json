@@ -5,7 +5,7 @@
   "session_preset": "clarify-design",
   "git_delivery": {
     "enabled": true,
-    "branch": "gdd/delivery"
+    "branch": "gdd/{{name}}"
   },
   "nodes": [
     {
@@ -14,7 +14,7 @@
       "name": "项目初始化",
       "description": "把原始一句话需求整理为结构化需求文档",
       "subject": {
-        "goal": "读取原始需求（.gdd/input.md），整理为 docs/requirement.md：包含「## 需求背景」「## 需求描述」「## 待澄清问题」（如无歧义则写「无」）。只做整理与澄清提问，不做方案设计。",
+        "goal": "读取原始需求（.gdd/input.md），整理为 {{output}}/requirement.md：包含「## 需求背景」「## 需求描述」「## 待澄清问题」（如无歧义则写「无」）。只做整理与澄清提问，不做方案设计。",
         "instructions": "若需求存在明显歧义或缺失关键信息，逐条列入「待澄清问题」，不要自行假设。"
       },
       "entry": {
@@ -27,7 +27,7 @@
         "goal": "需求文档产出且结构完整。",
         "artifacts": [
           {
-            "path": "docs/requirement.md",
+            "path": "{{output}}/requirement.md",
             "must_contain": "## 需求描述"
           }
         ],
@@ -40,13 +40,13 @@
       "name": "调研现状",
       "description": "调研现状代码/数据/调用链，输出现状分析",
       "subject": {
-        "goal": "基于 docs/requirement.md 调研本仓库（及周边可及信息）现状，输出 docs/survey.md：包含「## 现状分析」「## 影响面」「## 相关方与依赖」「## 风险与未知项」。相关方与依赖写清系统间交互、新功能还缺什么、需要谁提供。结论必须有代码或需求文档证据（给出文件与行号）；不知道谁提供就写入风险与未知项，禁止凭经验编造负责人。"
+        "goal": "基于 {{output}}/requirement.md 调研本仓库（及周边可及信息）现状，输出 {{output}}/survey.md：包含「## 现状分析」「## 影响面」「## 相关方与依赖」「## 风险与未知项」。相关方与依赖写清系统间交互、新功能还缺什么、需要谁提供。结论必须有代码或需求文档证据（给出文件与行号）；不知道谁提供就写入风险与未知项，禁止凭经验编造负责人。"
       },
       "entry": {
         "goal": "需求文档已就绪。",
         "artifacts": [
           {
-            "path": "docs/requirement.md",
+            "path": "{{output}}/requirement.md",
             "must_contain": "## 需求描述"
           }
         ]
@@ -55,15 +55,15 @@
         "goal": "现状分析产出，且含影响面、相关方与依赖、风险。",
         "artifacts": [
           {
-            "path": "docs/survey.md",
+            "path": "{{output}}/survey.md",
             "must_contain": "## 影响面"
           },
           {
-            "path": "docs/survey.md",
+            "path": "{{output}}/survey.md",
             "must_contain": "## 相关方与依赖"
           },
           {
-            "path": "docs/survey.md",
+            "path": "{{output}}/survey.md",
             "must_contain": "## 风险与未知项"
           }
         ],
@@ -76,14 +76,14 @@
       "name": "需求澄清",
       "description": "产出可验证的 DoD（目标与验收标准）",
       "subject": {
-        "goal": "基于 requirement + survey 产出两份文档。docs/goal.md：包含「## 目标」「## 验收标准（DoD）」，每条 DoD 标注验证层级（e2e/integration/unit/static）与可验证判据。验收数据必须可重新制造，不得把某条具体测试数据写死进 DoD。docs/spec.md：包含「## 规格」，写清对外行为、边界和已确认的决定，作为后续对照的规格。",
-        "instructions": "DoD 反模式自查：e2e 过多/全 P0/无法独立完成/一条验收捆多功能——发现则在文档中列出拆分或降级建议。本节点与调研共用同一段会话，不要重做全量现状调研。若发现与需求目标相关、但尚未写入「## 目标」的功能，在 docs/goal.md 里标成待澄清，停止把它写进验收标准。不要自行打开澄清对话。若这次选择改变了已经确认的决定，按决策定级契约提交，不要在本节点里改完。"
+        "goal": "基于 requirement + survey 产出两份文档。{{output}}/goal.md：包含「## 目标」「## 验收标准（DoD）」，每条 DoD 标注验证层级（e2e/integration/unit/static）与可验证判据。验收数据必须可重新制造，不得把某条具体测试数据写死进 DoD。{{output}}/spec.md：包含「## 规格」，写清对外行为、边界和已确认的决定，作为后续对照的规格。",
+        "instructions": "DoD 反模式自查：e2e 过多/全 P0/无法独立完成/一条验收捆多功能——发现则在文档中列出拆分或降级建议。本节点与调研共用同一段会话，不要重做全量现状调研。若发现与需求目标相关、但尚未写入「## 目标」的功能，在 {{output}}/goal.md 里标成待澄清，停止把它写进验收标准。不要自行打开澄清对话。若这次选择改变了已经确认的决定，按决策定级契约提交，不要在本节点里改完。"
       },
       "entry": {
         "goal": "调研报告已就绪。",
         "artifacts": [
           {
-            "path": "docs/survey.md",
+            "path": "{{output}}/survey.md",
             "must_contain": "## 影响面"
           }
         ]
@@ -92,11 +92,11 @@
         "goal": "DoD 产出且每条验收可验证。",
         "artifacts": [
           {
-            "path": "docs/goal.md",
+            "path": "{{output}}/goal.md",
             "must_contain": "## 验收标准"
           },
           {
-            "path": "docs/spec.md",
+            "path": "{{output}}/spec.md",
             "must_contain": "## 规格"
           }
         ],
@@ -113,14 +113,14 @@
       "name": "方案设计",
       "description": "产出实现计划与关键技术决定（ADR）",
       "subject": {
-        "goal": "基于 docs/goal.md 与 docs/spec.md 产出三份文档。docs/plan.md：包含「## 实现步骤」（分步、每步可验证）、「## ADR」（关键决定的选项、取舍与原因）和「## 附录：任务依赖」。docs/acceptance.feature：用 Gherkin（Feature / Scenario / Given / When / Then）写下验收用例。docs/decisions.md：包含「## 决策记录」，只追加。方案须与 survey 的现状证据一致，克制过度设计。",
-        "instructions": "开工前先按决策定级契约扫描。只要出现 L0 或 L1，先提交定级并停止设计，不要把决定写进 docs/decisions.md，也不要在本节点把修订做完。人确认之后的重跑里，决策记录只追加到 .gdd/revision-stage/docs/decisions.md。本节点与调研、澄清共用同一段会话，以 docs/survey.md 为基线，不另做全量调研。未在文档或代码中确认的结论不得作为设计前提。存量设计优先、最小改动优先；与 docs/goal.md 里写明的技术目标或选型限制冲突时，以目标为准。发现目标未写明的相关功能，或必须扩大改动范围才能满足目标时，在 docs/plan.md 里标成待确认并停止按该范围设计。不要自行打开澄清对话。实现步骤写完后，在 docs/plan.md 末尾写「## 附录：任务依赖」，按依赖把工作拆成任务，思路与拓扑排序相同。每行一个任务：- 任务ID | 依赖ID（多个用逗号，没有则写 -） | 任务。任务 ID 用字母开头。依赖只能指向本附录里的任务，不得成环。没有依赖关系的任务要拆开，这样开发节点才能并行；同一批能并行的任务之间不能有依赖，也不要要求它们改同一个文件。实现步骤里的工作都要落到某个任务上。"
+        "goal": "基于 {{output}}/goal.md 与 {{output}}/spec.md 产出三份文档。{{output}}/plan.md：包含「## 实现步骤」（分步、每步可验证）、「## ADR」（关键决定的选项、取舍与原因）和「## 附录：任务依赖」。{{output}}/acceptance.feature：用 Gherkin（Feature / Scenario / Given / When / Then）写下验收用例。Scenario 标题在文件内唯一，这个标题就是用例 id。{{output}}/decisions.md：包含「## 决策记录」，只追加。方案须与 survey 的现状证据一致，克制过度设计。",
+        "instructions": "开工前先按决策定级契约扫描。只要出现 L0 或 L1，先提交定级并停止设计，不要把决定写进 {{output}}/decisions.md，也不要在本节点把修订做完。人确认之后的重跑里，决策记录只追加到 .gdd/revision-stage/{{output}}/decisions.md。本节点与调研、澄清共用同一段会话，以 {{output}}/survey.md 为基线，不另做全量调研。未在文档或代码中确认的结论不得作为设计前提。存量设计优先、最小改动优先；与 {{output}}/goal.md 里写明的技术目标或选型限制冲突时，以目标为准。发现目标未写明的相关功能，或必须扩大改动范围才能满足目标时，在 {{output}}/plan.md 里标成待确认并停止按该范围设计。不要自行打开澄清对话。实现步骤写完后，在 {{output}}/plan.md 末尾写「## 附录：任务依赖」，按依赖把工作拆成任务，思路与拓扑排序相同。每行一个任务：- 任务ID | 依赖ID（多个用逗号，没有则写 -） | 任务。任务 ID 用字母开头。依赖只能指向本附录里的任务，不得成环。没有依赖关系的任务要拆开，这样开发节点才能并行；同一批能并行的任务之间不能有依赖，也不要要求它们改同一个文件。实现步骤里的工作都要落到某个任务上。"
       },
       "entry": {
         "goal": "DoD 已确认就绪。",
         "artifacts": [
           {
-            "path": "docs/goal.md",
+            "path": "{{output}}/goal.md",
             "must_contain": "## 验收标准"
           }
         ]
@@ -129,23 +129,23 @@
         "goal": "实现计划与 ADR 产出。",
         "artifacts": [
           {
-            "path": "docs/plan.md",
+            "path": "{{output}}/plan.md",
             "must_contain": "## 实现步骤"
           },
           {
-            "path": "docs/plan.md",
+            "path": "{{output}}/plan.md",
             "must_contain": "## ADR"
           },
           {
-            "path": "docs/plan.md",
+            "path": "{{output}}/plan.md",
             "must_contain": "## 附录：任务依赖"
           },
           {
-            "path": "docs/acceptance.feature",
+            "path": "{{output}}/acceptance.feature",
             "must_contain": "Feature:"
           },
           {
-            "path": "docs/decisions.md",
+            "path": "{{output}}/decisions.md",
             "must_contain": "## 决策记录"
           }
         ],
@@ -164,18 +164,18 @@
       "description": "按计划实现代码，逐项核销台账",
       "baseline_marker": true,
       "subject": {
-        "goal": "按 docs/plan.md 实现，并维护 docs/impl-ledger.md「## 核销台账」：每项包含「ID｜处理结果｜代码位置（文件+行号）｜证据（命令/输出）｜待办」。「已修改」不等于「已验证」，未验证项如实标注。",
-        "instructions": "本节点是独立会话。先读 docs/goal.md、docs/spec.md、docs/survey.md、docs/plan.md、docs/decisions.md 再改代码。附录「任务依赖」由 harness 调度：没有依赖、或依赖都已完成的任务会并行执行。会话里若标明了任务 ID，就只做那一项，不要抢其他任务。环境或依赖先自己处理，例如 mock。确需权限、资料或外部动作时，只说明一次：失败点、已经试过什么、排除了什么、推荐路径、最少需要什么帮助。若选择改变已经确认的决定，按决策定级契约提交，不要在本节点把 L0 或 L1 做完。上游文档对现状的描述与代码不一致时，以代码为准把差异记入台账，仍按已批准的 plan 实现目标。只实现已批准范围内的内容。发现计划外必须改动，或与目标相关但 goal 未写明的功能时，记入台账待办并停止扩大实现。不要自行打开澄清对话。打回意见先对照代码核实再改；核实后不成立的，在台账写明理由。写完后按计划与台账自己复核一遍，问题记入台账。提交由 exit 通过后的 harness 完成。"
+        "goal": "按 {{output}}/plan.md 实现，并维护 {{output}}/impl-ledger.md「## 核销台账」：每项包含「ID｜处理结果｜代码位置（文件+行号）｜证据（命令/输出）｜待办」。「已修改」不等于「已验证」，未验证项如实标注。",
+        "instructions": "本节点是独立会话。先读 {{output}}/goal.md、{{output}}/spec.md、{{output}}/survey.md、{{output}}/plan.md、{{output}}/decisions.md 再改代码。附录「任务依赖」由 harness 调度：没有依赖、或依赖都已完成的任务会并行执行。会话里若标明了任务 ID，就只做那一项，不要抢其他任务。环境或依赖先自己处理，例如 mock。确需权限、资料或外部动作时，只说明一次：失败点、已经试过什么、排除了什么、推荐路径、最少需要什么帮助。若选择改变已经确认的决定，按决策定级契约提交，不要在本节点把 L0 或 L1 做完。上游文档对现状的描述与代码不一致时，以代码为准把差异记入台账，仍按已批准的 plan 实现目标。只实现已批准范围内的内容。发现计划外必须改动，或与目标相关但 goal 未写明的功能时，记入台账待办并停止扩大实现。不要自行打开澄清对话。打回意见先对照代码核实再改；核实后不成立的，在台账写明理由。写完后按计划与台账自己复核一遍，问题记入台账。提交由 exit 通过后的 harness 完成。"
       },
       "entry": {
         "goal": "实现计划已就绪。",
         "artifacts": [
           {
-            "path": "docs/plan.md",
+            "path": "{{output}}/plan.md",
             "must_contain": "## 实现步骤"
           },
           {
-            "path": "docs/plan.md",
+            "path": "{{output}}/plan.md",
             "must_contain": "## 附录：任务依赖"
           }
         ]
@@ -184,7 +184,7 @@
         "goal": "实现完成且台账逐项核销。",
         "artifacts": [
           {
-            "path": "docs/impl-ledger.md",
+            "path": "{{output}}/impl-ledger.md",
             "must_contain": "## 核销台账"
           }
         ],
@@ -197,14 +197,14 @@
       "description": "按 DoD 执行分层验证（单测+集成/e2e），AI 门禁基于改动补充验证",
       "adversarial": true,
       "subject": {
-        "goal": "按 docs/goal.md 的 DoD 和 docs/acceptance.feature 逐条执行验证。输出 docs/test-report.md「## 验证结果」：每条 DoD 的验证层级（e2e/integration/unit/static）、执行方式、实际结果与证据。同时输出 docs/verify.md：每个用例都要能复查，至少包含「使用的数据」「过程日志」「落盘数据」。除单测外至少完成一条集成级以上验证：优先在本机直接启动服务/进程完成端到端验证（如启动服务后真实调用接口、启动脚本跑完整链路）；仅当本机确实无法启动（需外部中间件/对方服务/专用环境）时才降级为单测+静态验证，且必须在报告中逐条标注「未验证」及具体阻碍原因，不得以单测通过代替。",
-        "instructions": "本节点是独立会话。先读 docs/goal.md、docs/spec.md、docs/survey.md、docs/plan.md、docs/acceptance.feature，并自己查看本次代码变更。环境或依赖先自己处理，例如 mock，然后继续写 docs/verify.md。确需用户提供权限、缺失资料或外部动作时，才一次说明：失败点、已经试过什么、排除了什么、推荐路径、最少需要什么帮助。环境缺口不能记成通过。上游文档对现状的描述与代码不一致时，以代码为准写入报告；验收标准仍以 docs/goal.md 为准，代码没达到就记未通过。集成验证优先级：本机可启动的端到端 > 部署到测试环境机器验证 > 本机可模拟的组件级集成 > 单测。不要把「需要部署到测试环境机器」当作默认借口——先判断本机能否启动（读启动脚本/README/Makefile 确认）；能启动就在本机跑真实链路。不得为了通过而修改要验证的数据、断言或删除用例。每条用例执行完就更新 docs/test-report.md 和 docs/verify.md；阻塞的用例先跳过，最后汇总进报告。对照验收标准、plan 的实现步骤和本次变更，把未覆盖的场景写进「## 验证结果」。报告中每条未验证项必须写清：差什么环境、谁提供、建议的验证方式。测试节点的审批只能批准或驳回，不要自行打开澄清对话。"
+        "goal": "按 {{output}}/goal.md 的 DoD 和 {{output}}/acceptance.feature 逐条执行验证。输出 {{output}}/test-report.md「## 验证结果」：每条 DoD 的验证层级（e2e/integration/unit/static）、执行方式、实际结果与证据。同时输出 {{output}}/verify.md：每个用例一节，标题与 Scenario 标题相同，节内至少包含「使用的数据」「过程日志」「落盘数据」。除单测外至少完成一条集成级以上验证：优先在本机直接启动服务/进程完成端到端验证（如启动服务后真实调用接口、启动脚本跑完整链路）；仅当本机确实无法启动（需外部中间件/对方服务/专用环境）时才降级为单测+静态验证，且必须在报告中逐条标注「未验证」及具体阻碍原因，不得以单测通过代替。",
+        "instructions": "本节点是独立会话。先读 {{output}}/goal.md、{{output}}/spec.md、{{output}}/survey.md、{{output}}/plan.md、{{output}}/acceptance.feature，并自己查看本次代码变更。环境或依赖先自己处理，例如 mock，然后继续写 {{output}}/verify.md。确需用户提供权限、缺失资料或外部动作时，才一次说明：失败点、已经试过什么、排除了什么、推荐路径、最少需要什么帮助。环境缺口不能记成通过。上游文档对现状的描述与代码不一致时，以代码为准写入报告；验收标准仍以 {{output}}/goal.md 为准，代码没达到就记未通过。集成验证优先级：本机可启动的端到端 > 部署到测试环境机器验证 > 本机可模拟的组件级集成 > 单测。不要把「需要部署到测试环境机器」当作默认借口——先判断本机能否启动（读启动脚本/README/Makefile 确认）；能启动就在本机跑真实链路。不得为了通过而修改要验证的数据、断言或删除用例。每条用例执行完就更新 {{output}}/test-report.md 和 {{output}}/verify.md；阻塞的用例先跳过，最后汇总进报告。对照验收标准、plan 的实现步骤和本次变更，把未覆盖的场景写进「## 验证结果」。报告中每条未验证项必须写清：差什么环境、谁提供、建议的验证方式。测试节点的审批只能批准或驳回，不要自行打开澄清对话。"
       },
       "entry": {
         "goal": "实现台账已产出。",
         "artifacts": [
           {
-            "path": "docs/impl-ledger.md",
+            "path": "{{output}}/impl-ledger.md",
             "must_contain": "## 核销台账"
           }
         ]
@@ -213,11 +213,11 @@
         "goal": "验证报告产出，DoD 逐条有结果与证据；集成级以上验证至少一条或逐条说明阻碍。",
         "artifacts": [
           {
-            "path": "docs/test-report.md",
+            "path": "{{output}}/test-report.md",
             "must_contain": "## 验证结果"
           },
           {
-            "path": "docs/verify.md",
+            "path": "{{output}}/verify.md",
             "must_contain": "使用的数据"
           }
         ],
@@ -234,13 +234,13 @@
       "name": "收尾交付",
       "description": "DoD 总体达成比对与验收证据汇总",
       "subject": {
-        "goal": "汇总验收证据，输出 docs/delivery.md「## 验收证据」：DoD 逐条终态（通过/未通过/降级+原因）、关键证据引用（指向 test-report 或复验命令）。整体未达成时如实说明缺口。"
+        "goal": "汇总验收证据，输出 {{output}}/delivery.md「## 验收证据」：DoD 逐条终态（通过/未通过/降级+原因）、关键证据引用（指向 test-report 或复验命令）。整体未达成时如实说明缺口。"
       },
       "entry": {
         "goal": "测试验证报告已产出。",
         "artifacts": [
           {
-            "path": "docs/test-report.md",
+            "path": "{{output}}/test-report.md",
             "must_contain": "## 验证结果"
           }
         ]
@@ -249,7 +249,7 @@
         "goal": "交付证据汇总产出。",
         "artifacts": [
           {
-            "path": "docs/delivery.md",
+            "path": "{{output}}/delivery.md",
             "must_contain": "## 验收证据"
           }
         ],
@@ -261,13 +261,13 @@
       "name": "上线准备",
       "description": "产出四段式上线检查单",
       "subject": {
-        "goal": "输出 RELEASE-CHECKLIST.md，包含四段：「## 发布前确认」「## 本次变更」「## 上线步骤」（含回滚步骤）「## 异常处理」。依赖项排序，未确认项标注待确认与影响，不猜填。"
+        "goal": "输出 {{output}}/RELEASE-CHECKLIST.md，包含四段：「## 发布前确认」「## 本次变更」「## 上线步骤」（含回滚步骤）「## 异常处理」。依赖项排序，未确认项标注待确认与影响，不猜填。"
       },
       "entry": {
         "goal": "交付证据已汇总。",
         "artifacts": [
           {
-            "path": "docs/delivery.md",
+            "path": "{{output}}/delivery.md",
             "must_contain": "## 验收证据"
           }
         ]
@@ -276,11 +276,11 @@
         "goal": "四段式检查单产出。",
         "artifacts": [
           {
-            "path": "RELEASE-CHECKLIST.md",
+            "path": "{{output}}/RELEASE-CHECKLIST.md",
             "must_contain": "## 上线步骤"
           },
           {
-            "path": "RELEASE-CHECKLIST.md",
+            "path": "{{output}}/RELEASE-CHECKLIST.md",
             "must_contain": "## 异常处理"
           }
         ],
