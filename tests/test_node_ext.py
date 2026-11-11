@@ -118,9 +118,11 @@ def main():
     check(set(servers) == {"fs", "remote", "extra"}, f"三个 server（{sorted(servers)}）")
     check(servers["fs"]["args"] == ["-y", "server"], "stdio 参数保留")
     check(servers["remote"]["url"] == "https://example.com/mcp", "http url 保留")
-    check(len(ext.plugin_dirs) == 1, f"两个 skill 打进一个插件目录（{ext.plugin_dirs}）")
-    names = set(os.listdir(os.path.join(ext.plugin_dirs[0], "skills")))
-    check(names == {"review", "tester"}, f"插件内有两个 skill（{names}）")
+    check(len(ext.skill_dirs) == 2, f"两个 skill 各一个目录（{ext.skill_dirs}）")
+    names = {os.path.basename(p) for p in ext.skill_dirs}
+    check(names == {"review", "tester"}, f"暂存目录有两个 skill（{names}）")
+    check(all(os.path.isfile(os.path.join(p, "SKILL.md")) for p in ext.skill_dirs),
+          "每个 skill 目录都有 SKILL.md")
     os.makedirs(os.path.join(proj, "skills", "nope"), exist_ok=True)
     missing = PipelineSpec.from_dict({
         "id": "p", "name": "p",
@@ -189,7 +191,7 @@ def main():
                    "skills": [{"path": "skills/review", "name": "tester"}]}],
     }).nodes[0]
     named_ext = prepare(proj, named)
-    staged_md = os.path.join(named_ext.plugin_dirs[0], "skills", "tester", "SKILL.md")
+    staged_md = os.path.join(named_ext.skill_dirs[0], "SKILL.md")
     with open(staged_md, encoding="utf-8") as f:
         staged_text = f.read()
     check("name: tester" in staged_text.split("---", 2)[1], "指定的 skill 名字写进 SKILL.md")
@@ -233,25 +235,35 @@ def main():
     except ValueError as e:
         check("符号链接" in str(e), "skill 内指向目录外的符号链接要说明原因")
 
-    print("[N3] 只有 Claude 命令挂 MCP 和 skill")
-    os.environ["GDD_AGENT_BIN"] = "claude"
+    print("[N3] pi 命令挂 skill，MCP 写入隔离 agent 目录")
+    ext = prepare(proj, node)  # 前面的清理可能删掉了旧暂存目录，重新生成
+    settings = os.path.join(proj, "pi-settings.json")
+    with open(settings, "w", encoding="utf-8") as f:
+        json.dump({"version": 1, "baseUrl": "https://api.example.com/v1",
+                   "apiKey": "k", "model": "m"}, f)
+    os.environ["GDD_AGENT_BIN"] = sys.executable
+    os.environ["GDD_PI_SETTINGS"] = settings
+    os.environ["GDD_PI_AGENT_DIR"] = os.path.join(proj, "agent-dir")
+    os.environ["GDD_PI_SESSION_DIR"] = os.path.join(proj, "session-dir")
+    os.environ["GDD_STEER"] = "off"
     os.environ.pop("GDD_AGENT_PRE_ARGS", None)
     os.environ.pop("GDD_AGENT_EXTRA_ARGS", None)
     runner = AgentRunner(proj)
     runner.node_extensions = ext
     cmd = runner._build_cmd(["Read"], 5)
-    check(cmd.count("--mcp-config") == 1, "一个 --mcp-config")
-    check(cmd[cmd.index("--mcp-config") + 1] == ext.mcp_config, "指向生成的配置")
-    dirs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--plugin-dir"]
-    check(dirs == ext.plugin_dirs, "每个插件目录一个 --plugin-dir")
+    skills = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--skill"]
+    check(skills == ext.skill_dirs, "每个 skill 目录一个 --skill")
+    check("--mcp-config" not in cmd and "--plugin-dir" not in cmd,
+          "不再使用 Claude 专用 MCP/插件参数")
+    agent_dir = runner._prepare_agent_dir("https://api.example.com/v1", "k", "m")
+    with open(os.path.join(agent_dir, "mcp.json"), encoding="utf-8") as f:
+        check("fs" in json.load(f)["mcpServers"], "MCP 写入 agent 目录 mcp.json")
     runner.node_extensions = None
-    check("--mcp-config" not in runner._build_cmd(["Read"], 5), "无扩展时不挂")
-    os.environ["GDD_AGENT_BIN"] = "codex"
-    runner = AgentRunner(proj)
-    runner.node_extensions = ext
-    codex_cmd = runner._build_cmd(["Read"], 5)
-    check("--mcp-config" not in codex_cmd and "--plugin-dir" not in codex_cmd,
-          "codex 不注入 Claude 的 MCP/skill 参数")
+    cmd = runner._build_cmd(["Read"], 5)
+    check("--skill" not in cmd, "无扩展时不挂 skill")
+    runner._prepare_agent_dir("https://api.example.com/v1", "k", "m")
+    check(not os.path.exists(os.path.join(agent_dir, "mcp.json")),
+          "无扩展时清掉旧 mcp.json")
 
     print("[N4] 主体挂扩展，门禁不挂")
     seen = []
@@ -290,7 +302,7 @@ def main():
     gates = [ext for kind, ext in seen if kind == "gate"]
     check(subjects and all(ext is not None and ext.mcp_config for ext in subjects),
           "主体会话带 mcp 配置")
-    check(all(ext.plugin_dirs for ext in subjects), "主体会话带 skill 插件")
+    check(all(ext.skill_dirs for ext in subjects), "主体会话带 skill 目录")
     check(gates and all(ext is None for ext in gates), "门禁会话没有节点扩展")
 
     print("[N6] 加载失败不清掉已保存的主体会话")

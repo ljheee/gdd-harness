@@ -4,6 +4,10 @@
 /node_modules
 package-lock.json
 
+# gdd runtime state
+.gdd/
+iterations
+
 # python
 __pycache__/
 *.py[cod]

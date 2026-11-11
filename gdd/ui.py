@@ -34,6 +34,7 @@ from .cli import _load_pipeline_file
 from .iteration import prepare as prepare_iteration
 from .models import PipelineSpec
 from .orchestrator import Orchestrator
+from . import pi_settings
 
 # 任务创建串行化：ThreadingHTTPServer 并发处理双击/双 tab 的同名创建请求时，
 # 两个请求都过存在性检查后才建目录，败者的失败清理会删掉胜者初始化好的任务
@@ -667,6 +668,9 @@ pre{white-space:pre-wrap;font:12px/1.5 ui-monospace,Menlo,monospace;color:#c9d3e
   </div>
   <div class="sec"><div class="t">任务</div><div id="navTasks"></div></div>
   <div class="sec"><div class="t">模板</div><div id="navTpl"></div></div>
+  <div class="sec"><div class="t">执行端</div>
+    <button class="item" id="navSettings" onclick="showSettings()">⚙ 设置</button>
+  </div>
 </aside>
 <main id="main"><div class="empty">加载中…</div></main>
 <script>
@@ -933,6 +937,47 @@ async function clarifyDone(nodeId){
   }catch(e){alert('网络异常，请重试：'+e)}
 }
 
+async function showSettings(){
+  stopPoll();view={mode:'settings'};
+  const j=await api('api/settings');
+  if(!j.ok){$('#main').innerHTML=`<div class="alert err">${esc(j.error||'读取设置失败')}</div>`;return}
+  const keyHint=j.hasApiKey?`已保存（${esc(j.apiKeyMasked)}），留空表示不修改`:'未设置';
+  $('#main').innerHTML=`<h2>执行端设置 <span class="tag">pi / OpenAI 兼容端点</span></h2>
+    <div class="card">
+      <div class="hint" style="margin-bottom:12px">设置全局生效，对保存之后新建的 agent 会话起作用；运行中的会话不热更新。API key 只写入本机设置文件，不会明文回显。</div>
+      <div class="row"><label>端点（Base URL）</label><input id="setBase" value="${esc(j.baseUrl)}" placeholder="https://api.example.com/v1"></div>
+      <div class="row"><label>API key</label><input id="setKey" type="password" autocomplete="new-password" placeholder="${keyHint}"></div>
+      <div class="row"><label>模型</label><input id="setModel" value="${esc(j.model)}" placeholder="gpt-4o-mini"></div>
+      <div class="actions">
+        <button class="pri" onclick="saveSettings()">保存</button>
+        <button onclick="testSettings()">测试连通性</button>
+        <span class="hint" style="align-self:center">测试会向端点发一条最小 chat/completions 请求</span>
+      </div>
+      <div id="setMsg" style="margin-top:10px"></div>
+    </div>`;
+}
+function settingsBody(includeKey){
+  const body={baseUrl:($('#setBase')?.value||'').trim(),model:($('#setModel')?.value||'').trim()};
+  const key=($('#setKey')?.value||'');
+  if(includeKey&&key)body.apiKey=key;
+  return body;
+}
+async function saveSettings(){
+  const j=await api('api/settings',{method:'PUT',body:JSON.stringify(settingsBody(true))});
+  const box=$('#setMsg');
+  if(!j.ok){box.innerHTML=`<div class="alert err">${esc(j.error||'保存失败')}</div>`;return}
+  box.innerHTML='<div class="alert warn" style="border-color:#2b5c42;background:#12241a;color:#9fe0b8">已保存。对之后新建的会话生效。</div>';
+  const k=$('#setKey');if(k)k.value='';
+  setTimeout(showSettings,600);
+}
+async function testSettings(){
+  const box=$('#setMsg');
+  box.innerHTML='<div class="hint">测试中…</div>';
+  const j=await api('api/settings/test',{method:'POST',body:JSON.stringify(settingsBody(false))});
+  if(!j.ok){box.innerHTML=`<div class="alert err">${esc(j.error||'测试失败')}</div>`;return}
+  box.innerHTML=`<div class="alert warn" style="border-color:#2b5c42;background:#12241a;color:#9fe0b8">连通成功（模型 ${esc(j.model)}）${j.sample?`：${esc(String(j.sample).slice(0,120))}`:''}</div>`;
+}
+
 async function showTplA(b64){showTpl(dec(b64))}
 async function showTpl(name){
   stopPoll();view={mode:'tpl',name};
@@ -1093,6 +1138,11 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if p == "/api/settings":
+            try:
+                return self._json({"ok": True, **pi_settings.public_view()})
+            except pi_settings.SettingsError as e:
+                return self._json({"ok": False, "error": str(e)}, 500)
         if p == "/api/overview":
             self._json({"ok": True, "templates": _list_templates(self.root),
                         "tasks": _list_tasks(self.root)})
@@ -1140,6 +1190,30 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, OSError) as e:
             return self._json({"ok": False, "error": str(e)}, 400)
         try:
+            if p == "/api/settings/test":
+                try:
+                    saved = pi_settings.load()
+                except pi_settings.SettingsError as e:
+                    return self._json({"ok": False, "error": str(e)}, 400)
+                raw_base = body.get("baseUrl", saved.get("baseUrl"))
+                raw_model = body.get("model", saved.get("model"))
+                raw_key = body.get("apiKey")
+                if raw_base is not None and not isinstance(raw_base, str):
+                    return self._json({"ok": False, "error": "端点必须是字符串"}, 400)
+                if raw_model is not None and not isinstance(raw_model, str):
+                    return self._json({"ok": False, "error": "模型必须是字符串"}, 400)
+                if raw_key not in (None, "") and not isinstance(raw_key, str):
+                    return self._json({"ok": False, "error": "API key 必须是字符串"}, 400)
+                base = (raw_base or "").strip() or str(saved.get("baseUrl") or "")
+                model = (raw_model or "").strip() or str(saved.get("model") or "")
+                key = raw_key if raw_key not in (None, "") else saved.get("apiKey") or ""
+                try:
+                    result = pi_settings.test_endpoint(base, str(key), model)
+                except pi_settings.SettingsError as e:
+                    return self._json({"ok": False, "error": str(e)}, 400)
+                except pi_settings.SettingsTestError as e:
+                    return self._json({"ok": False, "error": str(e)}, 502)
+                return self._json({"ok": True, **result})
             if p == "/api/tasks":
                 name = str(body.get("name", "")).strip()
                 tpl = str(body.get("template", "")).strip()
@@ -1200,6 +1274,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def _do_put(self):
         p = urlparse(self.path).path
+        if p == "/api/settings":
+            body = self._body()
+            base = body.get("baseUrl")
+            model = body.get("model")
+            api_key = body.get("apiKey")
+            if not isinstance(base, str):
+                return self._json({"ok": False, "error": "端点必须是字符串"}, 400)
+            if not isinstance(model, str):
+                return self._json({"ok": False, "error": "模型必须是字符串"}, 400)
+            if api_key not in (None, "") and not isinstance(api_key, str):
+                return self._json({"ok": False, "error": "API key 必须是字符串"}, 400)
+            try:
+                data = pi_settings.save(base, model,
+                                        api_key=api_key if isinstance(api_key, str) else None)
+            except pi_settings.SettingsError as e:
+                return self._json({"ok": False, "error": str(e)}, 400)
+            return self._json({"ok": True, **pi_settings.public_view(data)})
         m = re.match(r"^/api/template/([^/]+)$", p)
         if not m:
             return self._json({"ok": False, "error": "not found"}, 404)

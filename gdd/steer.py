@@ -323,11 +323,25 @@ def hook_main(queue_file: str) -> int:
     return 0
 
 
+def take_main(root: str) -> int:
+    """pi 扩展入口：取出一条补充的格式化上下文；空队列无输出。"""
+    try:
+        body = drain(root)
+    except Exception:
+        return 0
+    if body:
+        sys.stdout.write(format_context(body))
+        sys.stdout.write("\n")
+    return 0
+
+
 def main(argv=None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if len(args) >= 2 and args[0] == "hook":
         return hook_main(args[1])
-    print("usage: steer.py hook <queue>", file=sys.stderr)
+    if len(args) >= 2 and args[0] == "take":
+        return take_main(args[1])
+    print("usage: steer.py hook <queue> | take <root>", file=sys.stderr)
     return 2
 
 

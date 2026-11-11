@@ -131,6 +131,26 @@ def _orch(plan, fail="", with_plan=False, clarify=False):
     return o, orig, root
 
 
+def test_downstream_closure():
+    print("[C] 下游传递闭包")
+    graph = parse("""## 附录：任务依赖
+- T1 | - | 甲
+- T2 | - | 乙
+- T3 | T1 | 依赖甲
+- T4 | T3 | 依赖丙
+- T5 | T2 | 依赖乙
+- T6 | T1, T5 | 菱形汇合
+""")
+    check(not graph.error, "图可解析")
+    check(graph.downstream({"T1"}) == {"T1", "T3", "T4", "T6"}, "链式 + 汇合的下游")
+    check(graph.downstream({"T2"}) == {"T2", "T5", "T6"}, "另一条链的下游")
+    check(graph.downstream({"T1", "T2"}) == {"T1", "T2", "T3", "T4", "T5", "T6"},
+          "多起点并集")
+    check(graph.downstream({"T4"}) == {"T4"}, "叶子任务只含自己")
+    check(graph.downstream({"NOPE"}) == {"NOPE"}, "未知 ID 不扩散")
+    print("[C] PASS\n")
+
+
 def test_parallel_waves():
     print("[W] 无依赖的任务并行，依赖完成后才开始")
     o, orig, root = _orch(PLAN)
@@ -418,6 +438,7 @@ def test_grade_in_steer_fallback_pauses():
 
 if __name__ == "__main__":
     test_parse()
+    test_downstream_closure()
     test_parallel_waves()
     test_failed_task_does_not_unblock_dependents()
     test_success_clears_gate_streak_and_resume_continues()

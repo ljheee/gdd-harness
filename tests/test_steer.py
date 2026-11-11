@@ -22,7 +22,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ.setdefault("PYTHONPATH", ROOT)
 
-STUB = os.path.join(ROOT, "tests", "stub_agent.py")
+STUB = os.path.join(ROOT, "tests", "pi_stub.py")
 PASS = 'GDD-VERDICT: {"verdict": "pass", "reason": "stub通过", "evidence": ["e1"], "feedback": ""}'
 
 
@@ -36,6 +36,14 @@ def main():
     home = tempfile.mkdtemp(prefix="gdd-steer-home-")
     os.environ["GDD_STEER_HOME"] = home
     os.environ.pop("GDD_STEER", None)
+    pi_home = tempfile.mkdtemp(prefix="gdd-steer-pi-")
+    settings = os.path.join(pi_home, "settings.json")
+    with open(settings, "w", encoding="utf-8") as f:
+        json.dump({"version": 1, "baseUrl": "https://api.example.com/v1",
+                   "apiKey": "k", "model": "m"}, f)
+    os.environ["GDD_PI_SETTINGS"] = settings
+    os.environ["GDD_PI_AGENT_DIR"] = os.path.join(pi_home, "agent")
+    os.environ["GDD_PI_SESSION_DIR"] = os.path.join(pi_home, "sessions")
 
     from gdd import steer
     from gdd.cli import main as cli_main
@@ -92,46 +100,38 @@ def main():
     check(rc == 0, "持锁时 gdd steer 仍成功")
     check("改成写本地文件" in steer.pending(proj), "补充已入队")
 
-    print("[S3] 只有 Claude 主体命令挂 settings")
-    os.environ["GDD_AGENT_BIN"] = "claude"
+    print("[S3] pi 主体命令加载 steer 扩展，门禁不加载")
+    os.environ["GDD_AGENT_BIN"] = sys.executable
     os.environ.pop("GDD_AGENT_PRE_ARGS", None)
     os.environ.pop("GDD_AGENT_EXTRA_ARGS", None)
     runner = AgentRunner(proj)
     cmd = runner._build_cmd(["Read"], 5, steer=True)
-    check("--settings" in cmd, "claude 命令含 --settings")
-    settings_path = cmd[cmd.index("--settings") + 1]
-    check(os.path.isfile(settings_path), "settings 文件已生成")
-    check(not os.path.commonpath([os.path.realpath(settings_path), os.path.realpath(proj)]).startswith(os.path.realpath(proj)),
-          "settings 不在项目目录内")
-    with open(settings_path, encoding="utf-8") as f:
-        settings = json.load(f)
-    hook_cmd = settings["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
-    check("steer.py" in hook_cmd and qpath in hook_cmd, "hook 命令指向队列")
+    exts = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--extension"]
+    check(any(p.endswith("steer_pi_extension.mjs") for p in exts),
+          "主体命令加载 steer 扩展")
+    check("--settings" not in cmd, "不再使用 Claude --settings")
     plain = AgentRunner(proj)._build_cmd(["Read"], 5, steer=False)
-    check("--settings" not in plain, "未要求 steer 时不挂 settings")
-    os.environ["GDD_AGENT_BIN"] = sys.executable
-    stub_cmd = AgentRunner(proj)._build_cmd(["Read"], 5, steer=True)
-    check("--settings" not in stub_cmd, "非 Claude bin 不注入 --settings")
-    os.environ["GDD_AGENT_BIN"] = "codex"
-    codex_cmd = AgentRunner(proj)._build_cmd(["Read"], 5, steer=True)
-    check("--settings" not in codex_cmd, "codex 不注入 Claude 的 --settings")
-    check(os.path.isfile(steer.codex_hooks_path(proj)), "仍写出 Codex hooks.json")
-    with open(steer.codex_hooks_path(proj), encoding="utf-8") as f:
-        codex_hooks = json.load(f)
-    check(codex_hooks["hooks"]["PostToolUse"][0]["hooks"][0]["command"] == hook_cmd,
-          "Codex 与 Claude 共用同一 hook 命令")
+    check(not any(p.endswith("steer_pi_extension.mjs")
+                  for p in [plain[i + 1] for i, a in enumerate(plain)
+                            if a == "--extension"]),
+          "未要求 steer 时不加载扩展")
+    env = runner._prepare_env(True)
+    check(env.get("GDD_STEER_QUEUE") == qpath, "扩展从环境拿到同一队列路径")
+    check(env.get("GDD_STEER_SCRIPT", "").endswith("steer.py"), "扩展用 Python 队列实现")
+    check("--settings" not in plain and "--mcp-config" not in plain
+          and "--plugin-dir" not in plain, "命令不含 Claude 专用参数")
 
     print("[S4] 未被工具消费时补送一次")
     work = tempfile.mkdtemp(prefix="gdd-steer-work-")
     script = os.path.join(work, "stub.json")
     with open(script, "w", encoding="utf-8") as f:
         json.dump([
-            {"patterns": ["用户在主体执行过程中补充"], "text": "已按补充改完", "is_error": False},
-            {"patterns": ["GDD-ROLE"], "text": "主体完成", "is_error": False},
+            {"patterns": ["用户在主体执行过程中补充"], "text": "已按补充改完"},
+            {"patterns": ["GDD-ROLE"], "text": "主体完成"},
         ], f, ensure_ascii=False)
     os.environ["GDD_AGENT_BIN"] = sys.executable
     os.environ["GDD_AGENT_PRE_ARGS"] = STUB
-    os.environ["GDD_STUB_SCRIPT"] = script
+    os.environ["GDD_PI_STUB_SCRIPT"] = script
     steer.append(work, "不要用 Redis")
     o = Orchestrator(work)
     o.init({
@@ -148,10 +148,10 @@ def main():
     subject_logs = [lg for lg in logs if lg["name"].endswith("-subject.json")]
     gate_logs = [lg for lg in logs if "-entry" in lg["name"] or "-exit" in lg["name"]]
     check(len(steer_logs) == 1, "恰好补送一轮")
-    check("--resume" in steer_logs[0]["cmd"], "补送带 --resume")
+    check("--session-id" in steer_logs[0]["cmd"], "补送带 --session-id")
     check("不要用 Redis" in steer_logs[0]["prompt"], "补送 prompt 含补充")
     check(all("不要用 Redis" not in lg["prompt"] for lg in subject_logs), "首轮主体 prompt 不含补充")
-    check(all("--settings" not in (lg.get("cmd") or []) for lg in gate_logs), "门禁命令不挂 settings")
+    check(all(not any(str(a).endswith("steer_pi_extension.mjs") for a in (lg.get("cmd") or [])) for lg in gate_logs), "门禁命令不挂 steer 扩展")
     events = [h.get("event") for h in o.state["history"]]
     check(events.count("steer_fallback") == 1, "记一次 steer_fallback")
 
@@ -160,10 +160,11 @@ def main():
     script2 = os.path.join(work2, "stub.json")
     with open(script2, "w", encoding="utf-8") as f:
         json.dump([
-            {"patterns": ["用户在主体执行过程中补充"], "text": "补送崩了", "is_error": True},
-            {"patterns": ["GDD-ROLE"], "text": "主体完成", "is_error": False},
+            {"patterns": ["用户在主体执行过程中补充"], "text": "补送崩了", "is_error": True,
+             "stop_reason": "error", "error": "fallback failed"},
+            {"patterns": ["GDD-ROLE"], "text": "主体完成"},
         ], f, ensure_ascii=False)
-    os.environ["GDD_STUB_SCRIPT"] = script2
+    os.environ["GDD_PI_STUB_SCRIPT"] = script2
     steer.append(work2, "保留这条")
     o2 = Orchestrator(work2)
     o2.init({
@@ -182,8 +183,8 @@ def main():
     work3 = tempfile.mkdtemp(prefix="gdd-steer-int-")
     script3 = os.path.join(work3, "stub.json")
     with open(script3, "w", encoding="utf-8") as f:
-        json.dump([{"patterns": ["GDD-ROLE"], "text": "主体完成", "is_error": False}], f)
-    os.environ["GDD_STUB_SCRIPT"] = script3
+        json.dump([{"patterns": ["GDD-ROLE"], "text": "主体完成"}], f)
+    os.environ["GDD_PI_STUB_SCRIPT"] = script3
     steer.append(work3, "中断也要留住")
     orig_run = AgentRunner.run
 
@@ -210,7 +211,7 @@ def main():
         AgentRunner.run = orig_run
     check("中断也要留住" in steer.pending(work3), "中断后补充回到队列")
     st3 = json.load(open(os.path.join(work3, ".gdd", "state.json"), encoding="utf-8"))
-    check(st3["node_states"]["work"]["sessions"].get("subject") == "stub-session",
+    check(st3["node_states"]["work"]["sessions"].get("subject") == "pi-stub-session",
           "已成功主体的 sid 已落盘")
     check(st3["node_states"]["work"]["phase"] == "working", "中断后相位仍是 working")
     check(not steer.subject_active(work3), "中断后主体标记已清")

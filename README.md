@@ -2,7 +2,7 @@
 
 节点编排 + entry/exit 双门禁 + 人工准入。
 可自定义节点流水线的GDD harness。
-MVP 执行端：**本地 Claude Code（headless）**。
+执行端：**本地 pi 进程 + 云端 OpenAI 兼容端点**（`@earendil-works/pi-coding-agent`，模型推理走设置页配置的端点，不需要本机 Claude 登录态或本地模型）。
 
 ## 核心设计
 
@@ -17,6 +17,8 @@ MVP 执行端：**本地 Claude Code（headless）**。
 ```bash
 cd /path/to/your/project
 export PYTHONPATH=/path/to/GDD        # 或 pip install -e /path/to/GDD
+(cd /path/to/GDD && npm ci)           # 在 GDD 仓库根安装 pi 执行端依赖（Node >= 22.19）
+# 启动控制台后在「设置」页配置端点 / API key / 模型；也可直接编辑 ~/.gdd/pi-settings.json
 
 # 用内置需求交付流水线初始化（七阶段+，8 节点，3 个人工确认点）
 gdd init --name my-change --requirement requirement.md
@@ -84,8 +86,8 @@ cargo tauri build --bundles app
 
 - `gddHome` 必须包含 `gdd/ui.py`；`python` 必须是 ≥3.10 的绝对路径；`workbenchRoot`
   默认 `~/gdd-workbench`（不存在时自动创建），其下每个子目录是一个任务。
-- `path`/`env` 可选，用于让 GUI 启动的控制台找到 `claude`/`codex` 等 Agent CLI
-  （如 `GDD_AGENT_BIN`）。配置中的 `env` 值不会写入日志。
+- `path`/`env` 可选，用于让 GUI 启动的控制台找到 pi 执行端
+  （如 `GDD_AGENT_BIN` / `GDD_PI_SETTINGS`）。配置中的 `env` 值不会写入日志。
 
 行为与边界：
 
@@ -148,7 +150,7 @@ cargo tauri build --bundles app
 - **blocked / retry**：blocked 时记录责任节点 `blocked_owner`（entry 打回型指向上游节点）。`gdd retry` 把执行点指回责任节点并清零其计数：普通型重跑节点主体；门禁故障型（exit_retry/pending 相位）仅重跑门禁不重跑主体。
 - **approval.required**：exit 通过后是否需人工准入才进入下一阶段（request_approval）；默认 false（exit 通过即进入下一阶段）。交互终端内联 y/n/a；非交互（CI）挂起，由 `gdd approve` 异步裁决。
 - **clarify**：是否开放「要点澄清」交互（默认 false）。两类交互严格区分：**request_approval**（强门禁卡点，裁决性的，改变状态机、消耗打回预算，仅 approval.required 节点）vs **clarification**（信息对齐性的，不动状态机、不耗预算，防线靠 exit 门禁重验）。两个窗口可用：节点启动前预对齐（pending 相位，独立澄清会话）、审批挂起时对产出追问（resume 主体会话）；`gdd chat` / 控制台 💬 卡片对话，对话落盘 `.gdd/dialogs/<node>.jsonl`；结束澄清（`/done` 或结束按钮）后主体补产 + 全新 exit 门禁强制重验。设计详见 `docs/design-clarify-resume.md`。
-- **主体会话复用**：打回重跑时复用上一轮主体会话（`claude -p --resume <sid>`，反馈以「继续修改」注入而非重发全量上下文）；门禁会话永不复用（独立判定防带偏）。打回 ≥2 次后改全新会话（防上下文膨胀）；**两个豁免**：turns 打满自动续跑正交于打回预算（`auto_continues > 0` 时仍续会话）、审批挂起澄清后的收尾轮强制续会话（review 澄清对话发生在主体会话上，新会话不可见）；主体成功后 `auto_continues` 清零（防一次已解决事件永久解除防污染门）。resume 失效自动降级全新重试。`GDD_SUBJECT_RESUME=off` 可关闭。跨节点复用可配置（`session_group`/`session_preset` 预设 independent/clarify-design/shared，内置 delivery 为 clarify-design：澄清设计链共享会话、实现测试独立——设计详见 `docs/design-session-group.md`）。
+- **主体会话复用**：打回重跑时复用上一轮主体会话（`pi --session-id <sid>`，反馈以「继续修改」注入而非重发全量上下文）；门禁会话永不复用（独立判定防带偏）。打回 ≥2 次后改全新会话（防上下文膨胀）；**两个豁免**：turns 打满自动续跑正交于打回预算（`auto_continues > 0` 时仍续会话）、审批挂起澄清后的收尾轮强制续会话（review 澄清对话发生在主体会话上，新会话不可见）；主体成功后 `auto_continues` 清零（防一次已解决事件永久解除防污染门）。resume 失效自动降级全新重试。`GDD_SUBJECT_RESUME=off` 可关闭。跨节点复用可配置（`session_group`/`session_preset` 预设 independent/clarify-design/shared，内置 delivery 为 clarify-design：澄清设计链共享会话、实现测试独立——设计详见 `docs/design-session-group.md`）。
 - **baseline_marker**：进入该节点主体工作时记录 git 基线 commit。
 - **exit.change_aware**：exit 门禁注入 `git diff --stat baseline`（含未提交工作区改动）与 `git status`，**AI 门禁据此补充验证项并实际执行**（内置 pipeline 的 test 节点开启）。
 - **补充验证项固化（模板/实例分离）**：全局模板只在 `gdd init` 时实例化为 `.gdd/pipeline.json`，绑定本次运行。change_aware 门禁基于本轮改动推导出的补充验证项通过 verdict 的 `supplements` 字段返回，harness **只增不减**地写回运行实例：可命令化项沉淀为机器检查 `commands`（下次重试不经 LLM）、产物检查追加/收紧 `artifacts.must_contain`、不可机器化的语义项追加到 `ai_check`；按内容去重防膨胀。全局模板不受影响。
@@ -172,17 +174,28 @@ cargo tauri build --bundles app
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `GDD_AGENT_BIN` | `claude` | 任一兼容 CLI（headless 读 stdin、输出 result JSON） |
-| `GDD_AGENT_PRE_ARGS` | - | 插在 bin 之后、`-p` 之前的参数（shlex 切分） |
-| `GDD_AGENT_MODEL` | - | 传给 `--model` |
+| `GDD_AGENT_BIN` | 自动 | pi 可执行文件覆盖；未设置时依次找 `<项目根>/node_modules/.bin/pi`、PATH 上的 `pi`。**不再支持 Claude headless** |
+| `GDD_AGENT_PRE_ARGS` | - | 插在 pi 路径之后、pi 参数之前的参数（shlex 切分） |
+| `GDD_AGENT_MODEL` | - | 设置页模型的高级覆盖（同一 custom provider 的模型 ID，优先于设置页） |
 | `GDD_AGENT_EXTRA_ARGS` | - | 附加参数（shlex） |
 | `GDD_AGENT_TIMEOUT` | 7200 | 单会话超时秒数（默认 2 小时；重主体节点如 plan/implement 实跑可能超 900s，勿设太短） |
-| `GDD_AGENT_MAX_TURNS_GATE` | 40 | 门禁会话 max-turns（实跑调优：15 不够复核大量 DoD 证据，40 一次通过；门禁复查型会话一般 30-50 足够） |
+| `GDD_AGENT_MAX_TURNS_GATE` | 40 | 门禁会话 turn 预算（harness 统计 pi `turn_end`，达到即终止；实跑调优：15 不够复核大量 DoD 证据，40 一次通过） |
 | `GDD_CHECK_TIMEOUT` | 600 | 机器检查命令超时秒数 |
-| `GDD_SUBJECT_RESUME` | on | 打回重跑是否复用主体会话（`--resume`）；`off` 强制全新会话 |
-| `GDD_SUBJECT_AUTO_CONTINUES_MAX` | 4 | 主体会话 turns 打满（error_max_turns）后自动 `--resume` 续跑的轮数上限（每轮继续配满 max_turns；超限转 gate_error → blocked 人工裁决） |
-| `GDD_STEER` | on | working 期间补充信息。`off` 不挂 PostToolUse、会话结束也不补送 |
-| `GDD_STEER_HOME` | `~/.gdd/steer` | 补充队列与 hook 配置目录（在项目仓库外） |
+| `GDD_SUBJECT_RESUME` | on | 打回重跑是否复用主体会话（`--session-id`）；`off` 强制全新会话 |
+| `GDD_SUBJECT_AUTO_CONTINUES_MAX` | 4 | 主体会话 turn 预算打满后自动 `--session-id` 续跑的轮数上限（超限转 gate_error → blocked 人工裁决） |
+| `GDD_PI_SETTINGS` | `~/.gdd/pi-settings.json` | 设置文件路径覆盖（测试/多环境用） |
+| `GDD_PI_AGENT_DIR` | `~/.gdd/pi-agent/<项目键>` | pi 隔离 agent 目录覆盖（models.json/auth.json/mcp.json） |
+| `GDD_PI_SESSION_DIR` | `~/.gdd/pi-sessions/<项目键>` | pi 会话存储目录覆盖 |
+| `GDD_STEER` | on | working 期间补充信息。`off` 不加载 pi steer 扩展、会话结束也不补送 |
+| `GDD_STEER_HOME` | `~/.gdd/steer` | 补充队列与扩展配置目录（在项目仓库外） |
+
+pi 执行端依赖与设置：
+
+- 仓库根 `package.json` 锁定 `@earendil-works/pi-coding-agent@1.4.0`、`pi-subagents@0.88.0`，Node `>=22.19.0`；提交 `package-lock.json`，缺失时执行 `npm ci`。
+- 主体会话加载 `pi-subagents` 扩展（具备 subagent 工具）；entry/exit 门禁、对抗会话不加载。GDD 自身的按任务并行仍由 harness 调度。
+- 端点、API key、模型在 Web UI「设置」页配置；API key 只写入 `~/.gdd/pi-settings.json`（0600）与隔离 agent 目录的 `auth.json`（0600），不进入 argv。优先级：`GDD_AGENT_MODEL` > 设置页模型；baseUrl/apiKey 只来自设置文件。
+- 节点声明的 MCP 写入隔离 agent 目录 `mcp.json`；`SKILL.md` 目录通过 `--skill` 加载。`.claude-plugin` 形式的插件目录已不支持，遇到会明确报配置错误。
+- 缺少 pi 依赖、缺少设置或端点 401/403 时会话失败并给出「`npm ci` / 设置页」处置提示，不静默回退 Claude。
 
 > 存量实例兼容：升级后 NodeSpec 新增字段（如 `clarify`）会改变流水线指纹，`run` 时自动识别 legacy 实例（剔除新增键后指纹匹配）并重写实例刷新指纹；其他任何指纹不一致仍 fail-closed blocked。
 
@@ -227,16 +240,19 @@ python3.12 scripts/verify_gui.py --check-8765-reuse     # 8765 有控制台时�
 > `verify_gui.py` 在本机缺少「屏幕录制」权限时无法截屏，会以 WKWebView 实际 URL 与
 > DOM 文本作为窗口内容证据。
 
-stub agent（`tests/stub_agent.py` + `GDD_STUB_SCRIPT`）可无模型跑全链路。
+pi stub（`tests/pi_stub.py` + `GDD_PI_STUB_SCRIPT`）可无模型跑全链路；`tests/test_pi_integration.py` 用本地 mock OpenAI 端点跑真实 pi 最小会话。
 
 ## 代码结构
 
 ```
 gdd/
   models.py        # Pipeline/Node/Gate/Approval/Subject 数据模型（零依赖 JSON）
-  runner.py        # 本地 Agent 适配器（claude -p headless，会话级隔离）
-  node_ext.py      # 节点 MCP/skill：生成仓库外配置，只挂主体会话
-  steer.py         # working 补充队列与 PostToolUse hook（仓库外，不占 .gdd/lock）
+  runner.py        # pi 执行端适配器（JSONL 事件、会话续跑、turn 预算、隔离 agent 目录）
+  pi_settings.py   # 设置页持久化（端点/API key/模型，脱敏与 0600）
+  acceptance.py    # acceptance.feature 的 Scenario 与 @task 关联解析/校验
+  taskgraph.py     # 任务依赖附录解析、就绪任务与下游闭包
+  node_ext.py      # 节点 MCP/skill：写入 pi mcp.json 与 --skill 暂存目录
+  steer.py         # working 补充队列（仓库外，不占 .gdd/lock）；steer_pi_extension.mjs 负责 pi 侧送达
   gates.py         # entry/exit 门禁：机器检查 + 独立 AI 验证 + verdict 解析（fail-closed）
   approval.py      # request_approval：交互确认 / 非交互挂起
   orchestrator.py  # 编排引擎：相位状态机、打回、审批、澄清、blocked/retry、状态持久化
@@ -257,7 +273,8 @@ assets/            # app 图标源文件（icons 由 cargo tauri icon 生成）
 
 ## 边界（MVP 已知限制）
 
-- 顺序流水线（无并行/分支 DAG）；打回只能回退到相邻节点。
+- 节点之间是顺序流水线（无分支 DAG），打回只能回退到相邻节点；implement 节点内部按方案附录「任务依赖」并行执行就绪任务，验收失败的 `code` 用例按 `@task:` 关联只失效相关任务及其下游。
+- 执行端只有 pi（本地子进程 + 云端 OpenAI 兼容端点），不再保留 Claude headless 兼容层；旧 `--output-format/--max-turns/--allowedTools/--settings/--mcp-config/--plugin-dir` 用法不再生效。
 - 主体会话上下文不跨节点共享，只通过产物文件传递（设计使然，非缺陷）。
 - AI 门禁仍依赖 LLM 输出 verdict——但机器检查层不依赖；关键判据应尽量放进 artifacts/commands。
 - **门禁 AI 会话带 Bash 工具**：prompt 约束「禁止修改文件」是软约束，理论上门禁可用 bash 写文件伪造产物再放行；机器检查层（must_contain 正则）可部分拦截，语义判据仍可能被自造证据欺骗。

@@ -19,9 +19,19 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ.setdefault("PYTHONPATH", ROOT)
 
+# pi 执行端设置与隔离目录：所有 e2e 会话都要求端点/模型就绪
+_PI_HOME = tempfile.mkdtemp(prefix="gdd-e2e-pi-")
+_PI_SETTINGS = os.path.join(_PI_HOME, "pi-settings.json")
+with open(_PI_SETTINGS, "w", encoding="utf-8") as _f:
+    json.dump({"version": 1, "baseUrl": "https://api.example.com/v1",
+               "apiKey": "k", "model": "m"}, _f)
+os.environ["GDD_PI_SETTINGS"] = _PI_SETTINGS
+os.environ["GDD_PI_AGENT_DIR"] = os.path.join(_PI_HOME, "agent")
+os.environ["GDD_PI_SESSION_DIR"] = os.path.join(_PI_HOME, "sessions")
+
 from gdd.orchestrator import Orchestrator  # noqa: E402
 
-STUB = os.path.join(ROOT, "tests", "stub_agent.py")
+STUB = os.path.join(ROOT, "tests", "pi_stub.py")
 PASS = 'GDD-VERDICT: {"verdict": "pass", "reason": "stub通过", "evidence": ["stub-evidence"], "feedback": ""}'
 FAIL = 'GDD-VERDICT: {"verdict": "fail", "reason": "stub不合格", "evidence": [], "feedback": "请补充X后重试"}'
 
@@ -93,7 +103,7 @@ def test_t0_builtin_template_file():
     check(builtins.DELIVERY_PIPELINE == raw, "builtins 导出与文件内容一致（权威源）")
     fp = hashlib.sha256(json.dumps(builtins.DELIVERY_PIPELINE, sort_keys=True,
                                     ensure_ascii=False).encode()).hexdigest()[:16]
-    check(fp == "b739b490990fecbd", "模板内容指纹稳定（防误改）")
+    check(fp == "c8af80545defae25", "模板内容指纹稳定（防误改）")
 
     # 同源：绑定同一迭代名后，内置名与文件路径 init 出的实例指纹一致
     d = fresh_project()
@@ -152,7 +162,7 @@ def test_a_happy_with_exit_bounce():
         "iterations/run1/goal.md": "# G\n## 目标\n## 验收标准（DoD）\n",
         "iterations/run1/spec.md": "# S\n## 规格\n",
         "iterations/run1/plan.md": "# P\n## 实现步骤\n## ADR\n## 附录：任务依赖\n- T1 | - | 实现\n",
-        "iterations/run1/acceptance.feature": "Feature: 验收\n  Scenario: 主路径\n    Given 就绪\n    When 执行\n    Then 通过\n",
+        "iterations/run1/acceptance.feature": "Feature: 验收\n  @task:T1\n  Scenario: 主路径\n    Given 就绪\n    When 执行\n    Then 通过\n",
         "iterations/run1/decisions.md": "# D\n## 决策记录\n",
         "iterations/run1/impl-ledger.md": "# L\n## 核销台账\n",
         "iterations/run1/test-report.md": "# T\n## 验证结果\n",
@@ -168,7 +178,7 @@ def test_a_happy_with_exit_bounce():
     env = dict(os.environ)
     env["GDD_AGENT_BIN"] = sys.executable
     env["GDD_AGENT_PRE_ARGS"] = STUB  # 同 run_gdd：PRE 接线防 -p 参数错位
-    env["GDD_STUB_SCRIPT"] = script
+    env["GDD_PI_STUB_SCRIPT"] = script
 
     # 但 subject 需要真实产出：替换为"什么都不做但成功"的 stub 规则已覆盖（bash: 前缀只是文本）
     # 因此：用 wrapper 让主体会话产文件
@@ -187,7 +197,7 @@ def test_a_happy_with_exit_bounce():
             "r='subject finished'\n"
             "print(json.dumps({'type':'result','subtype':'success','result':r,'is_error':False,'session_id':'stub-s','num_turns':2,'total_cost_usd':0.0}))\n"
         )
-    # 主体 wrapper 与门禁 stub 二选一：用 GDD_STUB_SCRIPT 无法区分主体/门禁（prompt 关键词已区分）
+    # 主体 wrapper 与门禁 stub 二选一：用 GDD_PI_STUB_SCRIPT 无法区分主体/门禁（prompt 关键词已区分）
     # 门禁 prompt 含 "门禁"，主体 prompt 含 "执行主体" —— 用 patterns 区分即可。
     # 简化：wrapper 处理主体，stub 只处理门禁。
     rules2 = [
@@ -213,6 +223,13 @@ def test_a_happy_with_exit_bounce():
 
         def run(self, prompt, *, allowed_tools, max_turns, log_path=None, resume_sid="", on_stream=None):
             from gdd.runner import SessionResult
+            if "[[GDD-TASK:" in prompt:
+                tid = prompt.split("[[GDD-TASK:", 1)[1].split("]", 1)[0]
+                note = os.path.join(self.root, ".gdd", "task-results", f"{tid}.md")
+                os.makedirs(os.path.dirname(note), exist_ok=True)
+                with open(note, "w") as f:
+                    f.write(f"{tid}｜完成｜x:1｜stub｜无\n")
+                return SessionResult(ok=True, text="task done", session_id=f"t-{tid}", turns=1)
             if "[[GDD-ROLE:subject" in prompt:
                 for nid, rel in self.NODE_FILES.items():
                     if nid in prompt:
@@ -1403,73 +1420,106 @@ def test_g2_go_session_mode():
 
 # ---------------------------------------------------------------- 实跑教训回归（环境类）
 
+def _pi_lines(*objects):
+    return "\n".join(json.dumps(o, ensure_ascii=False) for o in objects) + "\n"
+
+
+def _pi_assistant(text, stop="stop", error=None, cost=0.0):
+    message = {
+        "role": "assistant",
+        "content": [{"type": "text", "text": text}] if text else [],
+        "stopReason": stop,
+        "timestamp": 0,
+        "usage": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0,
+                  "totalTokens": 0,
+                  "cost": {"input": 0, "output": 0, "cacheRead": 0,
+                           "cacheWrite": 0, "total": cost}},
+    }
+    if error:
+        message["errorMessage"] = error
+    return [
+        {"type": "session", "version": 3, "id": "s1",
+         "timestamp": "2026-01-01T00:00:00.000Z", "cwd": "/tmp"},
+        {"type": "message_end", "message": message},
+        {"type": "agent_settled", "aborted": stop == "aborted"},
+    ]
+
+
 def test_l_auth_failure_explicit_error():
-    """L: 登录态失效识别——实跑中 claude 把 "Not logged in" 写进 stdout 正文
-    （可能无 result JSON 包装），引擎拿到的是空 stderr 片段式空错误。
-    期望：命中特征 → 显式「登录态/凭证失效」错误 + 处置指引（切换执行端/登录后 retry）。
-    """
-    print("[L] 登录态失效转显式错误")
+    """L: 凭证失效识别——错误文本/stdout 命中 401 等特征 → 指向设置页。"""
+    print("[L] 凭证失效转显式错误")
     from gdd.runner import AgentRunner
 
-    # 场景 1：不可解析输出 + 登录特征（无 JSON 包装）
-    res = AgentRunner._parse_output(
-        "Not logged in. Run /login to authenticate first.", "", 0)
-    check(not res.ok and "登录态/凭证失效" in res.error,
-          f"L1: 无 JSON 包装场景命中（{res.error[:80]}）")
-    check("切换可用执行端" in res.error,
-          "L1: 错误含处置指引（切换执行端）")
+    # 场景 1：pi 会话以 errorMessage 报告 401
+    out = _pi_lines(*_pi_assistant("", stop="error",
+                                   error="401 Unauthorized: invalid api key"))
+    res = AgentRunner._parse_output(out, "", 1)
+    check(not res.ok and "设置页" in res.error,
+          f"L1: 结构错误命中（{res.error[:80]}）")
 
-    # 场景 2：result JSON 包装但 is_error（写入 result 正文）
-    line = json.dumps({"type": "result", "subtype": "error",
-                       "result": "Error: Please log in to continue",
-                       "is_error": True, "session_id": "s1"})
-    res = AgentRunner._parse_output(line, "", 0)
-    check(not res.ok and "登录态/凭证失效" in res.error,
-          f"L2: JSON 包装场景命中（{res.error[:80]}）")
+    # 场景 2：无 JSON 事件，stderr 带凭证特征
+    res = AgentRunner._parse_output("noise\n", "401 Unauthorized", 1)
+    check(not res.ok and "设置页" in res.error,
+          f"L2: stderr 场景命中（{res.error[:80]}）")
 
-    # 场景 3：不可解析但无登录特征 → 保持原空 stderr 式错误（不误报）
+    # 场景 3：不可解析但无凭证特征 → 不误报
     res = AgentRunner._parse_output("some random noise", "", 1)
-    check(not res.ok and "登录态" not in res.error,
+    check(not res.ok and "设置页" not in res.error,
           f"L3: 无特征不误报（{res.error[:80]}）")
 
     # 场景 4：正常输出不受影响
-    ok_line = json.dumps({"type": "result", "subtype": "success",
-                          "result": "done", "is_error": False, "session_id": "s2"})
-    res = AgentRunner._parse_output(ok_line, "", 0)
-    check(res.ok and not res.turns_exhausted, "L4: 正常会话不受影响")
+    out = _pi_lines(*_pi_assistant("done"))
+    res = AgentRunner._parse_output(out, "", 0)
+    check(res.ok and not res.turns_exhausted and res.text == "done",
+          "L4: 正常会话不受影响")
 
-    # 场景 5：长 result 正文含 unauthorized 字样（任务输出）——不误判登录失效
+    # 场景 5：长错误正文含 401 字样（任务输出）——长度守卫防误判
     long_text = ("接口调用失败汇总：" + "请求返回 401 Unauthorized，已重试三次；" * 20)
-    line5 = json.dumps({"type": "result", "subtype": "error",
-                        "result": long_text, "is_error": True, "session_id": "s5"})
-    res5 = AgentRunner._parse_output(line5, "", 0)
-    check(not res5.ok and "登录态/凭证失效" not in res5.error,
-          f"L5: 长任务输出不误判（{res5.error[:60]}）")
-    # 场景 6：不可解析长输出含 unauthorized 字样（无 JSON 包装）——同样不误报
+    out5 = _pi_lines(*_pi_assistant("", stop="error", error=long_text))
+    res5 = AgentRunner._parse_output(out5, "", 1)
+    check(not res5.ok and "设置页" not in res5.error,
+          f"L5: 长错误正文不误判（{res5.error[:60]}）")
+    # 场景 6：不可解析长输出含 unauthorized 字样——同样不误报
     long_raw = "接口失败汇总：" + "请求返回 401 Unauthorized，重试中；" * 20
     res6 = AgentRunner._parse_output(long_raw, "", 1)
-    check(not res6.ok and "登录态/凭证失效" not in res6.error,
+    check(not res6.ok and "设置页" not in res6.error,
           f"L6: 不可解析长输出不误判（{res6.error[:60]}）")
     print("[L] PASS\n")
 
 
 def test_l2_turns_exhausted_flag():
-    """L2: error_max_turns 单独标记 turns_exhausted（区别于崩溃/凭证失效）。"""
+    """L2: 达到 turn 预算单独标记 turns_exhausted（区别于普通错误）。"""
     print("[L2] turns 打满标记")
     from gdd.runner import AgentRunner
 
-    line = json.dumps({"type": "result", "subtype": "error_max_turns",
-                       "result": "reached max turns", "is_error": True,
-                       "session_id": "s3", "num_turns": 80})
-    res = AgentRunner._parse_output(line, "", 0)
-    check(not res.ok and res.turns_exhausted and res.session_id == "s3",
-          f"L2: 打满标记（ok={res.ok}, exhausted={res.turns_exhausted}）")
+    d = tempfile.mkdtemp(prefix="gdd-e2e-l2-")
+    script = os.path.join(d, "stub.json")
+    with open(script, "w", encoding="utf-8") as f:
+        json.dump([{"patterns": ["x"], "text": "max", "turns": 5}], f)
+    old_bin, old_pre, old_script = (os.environ.get("GDD_AGENT_BIN"),
+                                    os.environ.get("GDD_AGENT_PRE_ARGS"),
+                                    os.environ.get("GDD_PI_STUB_SCRIPT"))
+    os.environ["GDD_AGENT_BIN"] = sys.executable
+    os.environ["GDD_AGENT_PRE_ARGS"] = STUB
+    os.environ["GDD_PI_STUB_SCRIPT"] = script
+    try:
+        res = AgentRunner(d).run("x", allowed_tools=[], max_turns=2)
+        check(not res.ok and res.turns_exhausted and res.session_id,
+              f"L2: 打满标记（ok={res.ok}, exhausted={res.turns_exhausted}）")
 
-    # 通用 error（subtype=error）：不是打满——自动续跑不应触发
-    line2 = json.dumps({"type": "result", "subtype": "error",
-                        "result": "boom", "is_error": True, "session_id": "s4"})
-    res2 = AgentRunner._parse_output(line2, "", 0)
-    check(not res2.ok and not res2.turns_exhausted, "L2: 通用错误不标打满")
+        with open(script, "w", encoding="utf-8") as f:
+            json.dump([{"patterns": ["x"], "text": "boom", "is_error": True,
+                        "stop_reason": "error", "error": "boom"}], f)
+        res2 = AgentRunner(d).run("x", allowed_tools=[], max_turns=10)
+        check(not res2.ok and not res2.turns_exhausted, "L2: 普通错误不标打满")
+    finally:
+        for k, v in (("GDD_AGENT_BIN", old_bin), ("GDD_AGENT_PRE_ARGS", old_pre),
+                     ("GDD_PI_STUB_SCRIPT", old_script)):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(d)
     print("[L2] PASS\n")
 
 
@@ -2818,13 +2868,13 @@ def test_r7_bugbot_pins():
         gdd_ui._chat_err.pop("r7ui", None)
         gdd_ui._run_err.pop("r7ui", None)
 
-    # ---- P2: runner SIGINT 路径会 killpg（契约：buffered/streaming 两路径）----
+    # ---- P2: runner SIGINT 路径会 killpg ----
     import inspect
     from gdd import runner as rn
-    src = (inspect.getsource(rn.AgentRunner._run_buffered)
-           + inspect.getsource(rn.AgentRunner._run_streaming))
-    check(src.count("KeyboardInterrupt") >= 2 and "killpg" in src,
-          "R7-P2: buffered/streaming 对 KeyboardInterrupt 有 killpg")
+    src = inspect.getsource(rn.AgentRunner._run_process)
+    kill_src = inspect.getsource(rn.AgentRunner._kill)
+    check("KeyboardInterrupt" in src and "self._kill" in src and "killpg" in kill_src,
+          "R7-P2: pi 会话对 KeyboardInterrupt 有 killpg")
 
     # ---- P1: gate 命令进程组清理（契约）----
     src_g = inspect.getsource(g.run_machine_checks)
@@ -3000,8 +3050,160 @@ def test_r8_bugbot_pins():
     print("[R8] PASS\n")
 
 
+def test_s2_pi_stub_full_delivery():
+    """S2 (D13): 命名迭代 init→completed 全走 pi stub；一次 code 失败按任务打回。"""
+    print("[S2] pi stub 全链路 + 按任务打回")
+    from gdd.builtins import DELIVERY_PIPELINE
+    from gdd.iteration import prepare as prepare_iteration
+    from gdd.orchestrator import Orchestrator
+
+    d = tempfile.mkdtemp(prefix="gdd-e2e-s2-")
+    subprocess.run(["git", "init", "-q"], cwd=d, capture_output=True)
+    out = "iterations/s2"
+    plan_md = (
+        "# 方案\n## 实现步骤\n1. T1\n2. T2\n"
+        "## ADR\n- 采用最小实现\n"
+        "## 附录：任务依赖\n- T1 | - | 实现主路径\n- T2 | T1 | 下游适配\n"
+    )
+    accept = (
+        "Feature: 验收\n"
+        "  @task:T1\n  Scenario: 失败场景\n    Given 就绪\n    Then 通过\n"
+        "  @task:T2\n  Scenario: 下游场景\n    Given 就绪\n    Then 通过\n"
+    )
+    files = {
+        f"{out}/requirement.md": "# R\n## 需求描述\n健康检查\n",
+        f"{out}/survey.md": "# S\n## 现状分析\n## 影响面\n## 相关方与依赖\n## 风险与未知项\n",
+        f"{out}/goal.md": "# G\n## 目标\n## 验收标准（DoD）\n",
+        f"{out}/spec.md": "# S\n## 规格\n",
+        f"{out}/plan.md": plan_md,
+        f"{out}/acceptance.feature": accept,
+        f"{out}/decisions.md": "# D\n## 决策记录\n",
+        f"{out}/test-report.md": "# T\n## 验证结果\n",
+        f"{out}/verify.md": "# V\n## 失败场景\n使用的数据\n过程日志\n落盘数据\n",
+        f"{out}/delivery.md": "# D\n## 验收证据\n",
+        f"{out}/RELEASE-CHECKLIST.md": "# C\n## 发布前确认\n## 本次变更\n## 上线步骤\n## 异常处理\n",
+    }
+    def wf(*rels):
+        return {rel: files[rel] for rel in rels}
+    rules = [
+        {"patterns": ["[[GDD-ROLE:adversarial"], "max_hits": 1,
+         "text": ('GDD-ADVERSARIAL: {"cases":['
+                  '{"id":"失败场景","result":"fail","cause":"code","reason":"首次实现缺失"},'
+                  '{"id":"下游场景","result":"pass","cause":"code","reason":"ok"}]}')},
+        {"patterns": ["[[GDD-ROLE:adversarial"],
+         "text": ('GDD-ADVERSARIAL: {"cases":['
+                  '{"id":"失败场景","result":"pass","cause":"code","reason":"修复后通过"},'
+                  '{"id":"下游场景","result":"pass","cause":"code","reason":"ok"}]}')},
+        {"patterns": ["[[GDD-TASK:T1]]", "T1：实现主路径"],
+         "write_files": {".gdd/task-results/T1.md": "T1｜完成｜src/t1.py:1｜stub｜无\n",
+                         f"{out}/src-t1.txt": "T1\n"}},
+        {"patterns": ["[[GDD-TASK:T2]]", "T2：下游适配"],
+         "write_files": {".gdd/task-results/T2.md": "T2｜完成｜src/t2.py:1｜stub｜无\n",
+                         f"{out}/src-t2.txt": "T2\n"}},
+        {"patterns": ["[[GDD-ROLE:subject node:plan]]"],
+         "write_files": wf(f"{out}/plan.md", f"{out}/acceptance.feature", f"{out}/decisions.md")},
+        {"patterns": ["[[GDD-ROLE:subject node:clarify]]"],
+         "write_files": wf(f"{out}/goal.md", f"{out}/spec.md")},
+        {"patterns": ["[[GDD-ROLE:subject node:project_init]]"],
+         "write_files": wf(f"{out}/requirement.md")},
+        {"patterns": ["[[GDD-ROLE:subject node:survey]]"],
+         "write_files": wf(f"{out}/survey.md")},
+        {"patterns": ["[[GDD-ROLE:subject node:test]]"],
+         "write_files": wf(f"{out}/test-report.md", f"{out}/verify.md")},
+        {"patterns": ["[[GDD-ROLE:subject node:delivery]]"],
+         "write_files": wf(f"{out}/delivery.md")},
+        {"patterns": ["[[GDD-ROLE:subject node:release_checklist]]"],
+         "write_files": wf(f"{out}/RELEASE-CHECKLIST.md")},
+        {"patterns": ["[[GDD-ROLE:gate"], "text": PASS},
+    ]
+    script = os.path.join(d, "pi-script.json")
+    with open(script, "w", encoding="utf-8") as f:
+        json.dump(rules, f, ensure_ascii=False)
+    keys = ("GDD_AGENT_BIN", "GDD_AGENT_PRE_ARGS", "GDD_PI_STUB_SCRIPT",
+            "GDD_PI_STUB_COUNTER_DIR", "GDD_STEER")
+    saved = {k: os.environ.get(k) for k in keys}
+    os.environ["GDD_AGENT_BIN"] = sys.executable
+    os.environ["GDD_AGENT_PRE_ARGS"] = STUB
+    os.environ["GDD_PI_STUB_SCRIPT"] = script
+    os.environ["GDD_PI_STUB_COUNTER_DIR"] = os.path.join(d, ".gdd", "stub-counters")
+    os.environ["GDD_STEER"] = "off"
+    try:
+        pd = prepare_iteration(json.loads(json.dumps(DELIVERY_PIPELINE)), d, name="s2")
+        pd["git_delivery"] = {"enabled": False}
+        o = Orchestrator(d)
+        o.init(pd, "加一个健康检查")
+        status = o.run()
+        guard = 0
+        while status == "awaiting_approval" and guard < 10:
+            o.resolve_approval(True)
+            status = o.run()
+            guard += 1
+        check(status == "completed", f"S2: 全链路完成（{status}）")
+        st = state_of(d)
+        events = [e.get("event") for e in st["history"]]
+        check("adversarial_code" in events, "S2: 发生一次 code 失败打回")
+        routes = [e for e in st["history"] if e.get("event") == "task_route"]
+        check(routes and set(routes[-1].get("tasks") or []) == {"T1", "T2"},
+              f"S2: 按关联任务与下游闭包打回（{routes[-1] if routes else None}）")
+        check(events.count("task_done") >= 4,
+              f"S2: 任务重跑后全部完成（task_done={events.count('task_done')}）")
+        check(st["node_states"]["test"].get("adversarial_done"), "S2: 重跑后对抗通过")
+        ns = st["node_states"]["implement"]
+        check(set(ns.get("tasks_done") or []) == {"T1", "T2"}, "S2: 任务核销齐全")
+        ledger = os.path.join(d, out, "impl-ledger.md")
+        check(os.path.isfile(ledger), "S2: 核销台账落盘")
+        with open(ledger, encoding="utf-8") as f:
+            body = f.read()
+        check("## 核销台账" in body and "T1" in body and "T2" in body, "S2: 台账内容")
+        for rel in ("test-report.md", "verify.md", "delivery.md", "RELEASE-CHECKLIST.md"):
+            check(os.path.isfile(os.path.join(d, out, rel)), f"S2: {rel} 产出")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(d)
+    print("[S2] PASS\n")
+
+
+def test_git_add_with_ignored_gdd():
+    """R9：.gdd 被 .gitignore 忽略时，交付用 add 不能因显式 exclude 整体失败。"""
+    print("[R9] .gdd 已忽略时的交付暂存")
+    d = tempfile.mkdtemp(prefix="gdd-e2e-r9-")
+    try:
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=d, check=True)
+        with open(os.path.join(d, ".gitignore"), "w", encoding="utf-8") as f:
+            f.write(".gdd/\n")
+        os.makedirs(os.path.join(d, "docs"))
+        open(os.path.join(d, "docs", "a.md"), "w").write("ok\n")
+        os.makedirs(os.path.join(d, ".gdd"))
+        open(os.path.join(d, ".gdd", "state.json"), "w").write("{}\n")
+        o = Orchestrator(d)
+        r = o._git_add_all()
+        check(r is not None and r.returncode == 0,
+              f"R9: .gdd 已忽略时 add 仍成功（{(r.stderr if r else 'None')}）")
+        staged = subprocess.check_output(
+            ["git", "diff", "--cached", "--name-only"], cwd=d, text=True)
+        names = {ln.strip() for ln in staged.splitlines() if ln.strip()}
+        check(names == {".gitignore", "docs/a.md"},
+              f"R9: .gdd 不进索引（got {names}）")
+        os.makedirs(os.path.join(d, "nested", ".gdd"))
+        open(os.path.join(d, "nested", ".gdd", "x.json"), "w").write("{}\n")
+        r = o._git_add_all()
+        check(r is not None and r.returncode == 0,
+              "R9: 嵌套 .gdd 已忽略时 add 仍成功")
+        staged = subprocess.check_output(
+            ["git", "diff", "--cached", "--name-only"], cwd=d, text=True)
+        names = {ln.strip() for ln in staged.splitlines() if ln.strip()}
+        check("nested/.gdd/x.json" not in names, "R9: 嵌套 .gdd 不进索引")
+    finally:
+        shutil.rmtree(d)
+    print("[R9] PASS\n")
+
+
 def test_stream_p0_p1():
-    """P0/P1 流式：stream-json 回调收到 text_delta + tool；SessionResult.streamed。"""
+    """P0/P1 流式：pi JSONL 回调收到 text_delta + tool；SessionResult.streamed。"""
     print("[STREAM] P0/P1 流式回显")
     import tempfile as _tf
     import time
@@ -3015,17 +3217,17 @@ def test_stream_p0_p1():
             json.dump([{
                 "patterns": ["[[GDD-ROLE"],
                 "text": "HelloStreamWorld",
-                "stream_tools": [
-                    {"name": "Write", "path": "docs/out.md"},
-                    {"name": "Bash", "input": {"command": "echo hi"}},
+                "tools": [
+                    {"name": "write", "args": {"path": "docs/out.md"}},
+                    {"name": "bash", "args": {"command": "echo hi"}},
                 ],
             }], f)
         env_bin = os.environ.get("GDD_AGENT_BIN")
         env_pre = os.environ.get("GDD_AGENT_PRE_ARGS")
-        env_script = os.environ.get("GDD_STUB_SCRIPT")
+        env_script = os.environ.get("GDD_PI_STUB_SCRIPT")
         os.environ["GDD_AGENT_BIN"] = sys.executable
         os.environ["GDD_AGENT_PRE_ARGS"] = STUB
-        os.environ["GDD_STUB_SCRIPT"] = script
+        os.environ["GDD_PI_STUB_SCRIPT"] = script
         try:
             events = []
             runner = AgentRunner(d)
@@ -3036,43 +3238,38 @@ def test_stream_p0_p1():
                 on_stream=lambda ev: events.append(dict(ev)),
             )
             check(res.ok and res.streamed, f"STREAM: ok+streamed（{res.ok},{res.streamed},{res.error}）")
-            check(res.text == "HelloStreamWorld", f"STREAM: result 文本完整（{res.text!r}）")
+            check(res.text == "HelloStreamWorld", f"STREAM: assistant 文本完整（{res.text!r}）")
             texts = "".join(e["text"] for e in events if e.get("kind") == "text")
             check(texts == "HelloStreamWorld", f"STREAM: text_delta 拼接完整（{texts!r}）")
             tools = [e for e in events if e.get("kind") == "tool"]
-            check(any(t.get("name") == "Write" and "docs/out.md" in (t.get("summary") or "")
-                      for t in tools), f"STREAM: Write 工具摘要（{tools}）")
-            check(any(t.get("name") == "Bash" and "echo hi" in (t.get("summary") or "")
-                      for t in tools), f"STREAM: Bash 工具摘要（{tools}）")
+            check(any(t.get("name") == "write" and "docs/out.md" in (t.get("summary") or "")
+                      for t in tools), f"STREAM: write 工具摘要（{tools}）")
+            check(any(t.get("name") == "bash" and "echo hi" in (t.get("summary") or "")
+                      for t in tools), f"STREAM: bash 工具摘要（{tools}）")
 
-            # 无 on_stream → 仍走 json，streamed=False
+            # 无 on_stream → 不标记流式
             res2 = runner.run("[[GDD-ROLE:gate]]", allowed_tools=[], max_turns=2)
-            check(res2.ok and not res2.streamed, "STREAM: 无回调保持 json 非流式")
+            check(res2.ok and not res2.streamed, "STREAM: 无回调不标记 streamed")
 
             # 打印机不崩
             make_clarify_printer()({"kind": "text", "text": "x"})
             make_subject_printer(text_cap=5)({"kind": "text", "text": "abcdef"})
-            make_subject_printer()({"kind": "tool", "name": "Write", "summary": "a.md"})
+            make_subject_printer()({"kind": "tool", "name": "write", "summary": "a.md"})
             check(True, "STREAM: 打印机可调用")
 
             # subject 打印机彼此独立（resume→fresh 各建一份，截断额度不串）
             from gdd.stream_ui import factory_for_tty
             fac = factory_for_tty()
             p1, p2 = fac("subject"), fac("subject")
-            # p1 吃满 cap
             p1({"kind": "text", "text": "x" * 900})
-            seen2 = []
-            # 劫持 p2 的输出：直接喂短文本，若误共享 omitted 则不再回调可见——
-            # 用独立 printer 的 text_n：p2 仍应接受新文本（内部 state 独立）
-            # 通过闭包侧写：重建后 cap 从 0 起
             from gdd import stream_ui as sui
             n = {"c": 0}
             real_print = sui._safe_print
 
-            def counting(s, *, end="\n", flush=True):
-                if s and s not in ("⋯ ",):
-                    n["c"] += len(s.replace("⋯ ", "").replace("…", ""))
-                return real_print(s, end=end, flush=flush)
+            def counting(txt, *, end="\n", flush=True):
+                if txt and txt not in ("⋯ ",):
+                    n["c"] += len(txt.replace("⋯ ", "").replace("…", ""))
+                return real_print(txt, end=end, flush=flush)
 
             sui._safe_print = counting
             try:
@@ -3081,21 +3278,10 @@ def test_stream_p0_p1():
                 sui._safe_print = real_print
             check(n["c"] >= 5, f"STREAM: 新建 subject 打印机额度独立（got {n['c']}）")
 
-            # 流式路径：agent 挂死不吐换行时墙钟超时仍生效（非 readline 永久阻塞）
+            # 挂死且不吐换行时墙钟超时仍生效
             hang = os.path.join(d, "hang_agent.py")
             with open(hang, "w") as f:
-                f.write(
-                    "import sys, time\n"
-                    "sys.stdin.read()\n"
-                    "args = sys.argv[1:]\n"
-                    "stream = any(a == 'stream-json' or a.endswith('=stream-json') for a in args)\n"
-                    "if stream:\n"
-                    "    time.sleep(9999)\n"  # 永不换行
-                    "else:\n"
-                    "    import json\n"
-                    "    print(json.dumps({'type':'result','result':'ok','is_error':False,"
-                    "'session_id':'h','num_turns':1,'total_cost_usd':0,'subtype':'success'}))\n"
-                )
+                f.write("import sys, time\nsys.stdin.read()\ntime.sleep(9999)\n")
             os.environ["GDD_AGENT_BIN"] = sys.executable
             os.environ["GDD_AGENT_PRE_ARGS"] = hang
             os.environ["GDD_AGENT_TIMEOUT"] = "1"
@@ -3121,20 +3307,16 @@ def test_stream_p0_p1():
             else:
                 os.environ["GDD_AGENT_PRE_ARGS"] = env_pre
             if env_script is None:
-                os.environ.pop("GDD_STUB_SCRIPT", None)
+                os.environ.pop("GDD_PI_STUB_SCRIPT", None)
             else:
-                os.environ["GDD_STUB_SCRIPT"] = env_script
+                os.environ["GDD_PI_STUB_SCRIPT"] = env_script
     finally:
         shutil.rmtree(d)
     print("[STREAM] PASS\n")
 
 
 def test_timeout_keeps_unread_pipe():
-    """超时点上还留在管道里的 result 要并回来；挂死且没有成功结果仍报超时。
-
-    缓冲路径：第二次 communicate 的返回值含已读前缀和未读残片，旧代码把返回值丢掉。
-    流式路径：主线程不能再读 stdout，残行只从读线程的队列取。
-    """
+    """超时边界：祖父进程占着 stdout 时不丢已写出的结果；真超时仍报超时。"""
     print("[E2g] 超时残片")
     import threading
     import time
@@ -3146,128 +3328,29 @@ def test_timeout_keeps_unread_pipe():
     check(_merge_captured("HEAD", "") == "HEAD", "重读为空保留快照")
     check(_merge_captured("", "TAIL") == "TAIL", "快照为空用残片")
 
-    result = json.dumps({
-        "type": "result", "subtype": "success", "result": "done",
-        "is_error": False, "session_id": "s",
-    })
-
-    class Buf:
-        def __init__(self):
-            self.pid = 2 ** 22
-            self.returncode = 0
-            self.n = 0
-
-        def poll(self):
-            return self.returncode
-
-        def communicate(self, input=None, timeout=None):
-            self.n += 1
-            if self.n == 1:
-                raise subprocess.TimeoutExpired(["x"], timeout or 1, output="NOISE\n", stderr="")
-            return ("NOISE\n" + result + "\n", "")
-
-    class Hang:
-        def __init__(self):
-            self.pid = 2 ** 22
-            self.returncode = -9
-            self.n = 0
-
-        def poll(self):
-            return self.returncode
-
-        def communicate(self, input=None, timeout=None):
-            self.n += 1
-            if self.n == 1:
-                raise subprocess.TimeoutExpired(["x"], timeout or 1, output="NOISE\n", stderr="")
-            return ("NOISE\n", "")
-
-    d = tempfile.mkdtemp()
-    try:
-        runner = AgentRunner(d)
-        runner.timeout = 1
-        res = runner._run_buffered(Buf(), "p", ["x"], None, time.time())
-        check(res.ok and res.text == "done", f"缓冲超时并回管道残片（{res.error}）")
-        res = runner._run_buffered(Hang(), "p", ["x"], None, time.time())
-        check(not res.ok and "超时" in (res.error or ""), f"无结果的超时仍报超时（{res.error}）")
-    finally:
-        shutil.rmtree(d)
-
-    released = threading.Event()
-    read_calls = {"n": 0}
-    real_killpg = os.killpg
-
-    def fake_killpg(pid, sig):
-        released.set()
-        raise ProcessLookupError()
-
-    class Stdin:
-        def write(self, data):
-            return len(data or "")
-
-        def close(self):
-            pass
-
-    class Stdout:
-        def __init__(self):
-            self.phase = 0
-
-        def readline(self):
-            if self.phase == 0:
-                self.phase = 1
-                released.wait(timeout=3)
-                return result + "\n"
-            return ""
-
-        def read(self):
-            read_calls["n"] += 1
-            raise AssertionError("main thread read stdout")
-
-    class Stderr:
-        def __iter__(self):
-            return iter(())
-
-    class StreamProc:
-        def __init__(self):
-            self.pid = 2 ** 22
-            self.returncode = 0
-            self.stdin = Stdin()
-            self.stdout = Stdout()
-            self.stderr = Stderr()
-
-        def poll(self):
-            # 杀掉之前必须看起来还活着，否则主循环会当成正常结束，进不了超时分支。
-            if released.is_set():
-                return self.returncode
-            return None
-
-        def wait(self, timeout=None):
-            return self.returncode
-
-    d2 = tempfile.mkdtemp()
-    os.killpg = fake_killpg
-    try:
-        runner = AgentRunner(d2)
-        runner.timeout = 0.4
-        res = runner._run_streaming(
-            StreamProc(), "p", ["x"], None, time.time(), lambda e: None)
-        check(res.ok and res.text == "done" and res.streamed,
-              f"流式超时并回读线程残行（{res.error}）")
-        check(read_calls["n"] == 0, "流式超时主线程不读 stdout")
-    finally:
-        os.killpg = real_killpg
-        shutil.rmtree(d2)
-
-    # 真进程：result 已写出，孙进程占着 stdout 把 communicate 拖到超时。
-    # 以及睡过超时、没有 result 的会话仍报超时。
-    keys = ("GDD_AGENT_BIN", "GDD_AGENT_PRE_ARGS", "GDD_AGENT_TIMEOUT")
+    keys = ("GDD_AGENT_BIN", "GDD_AGENT_PRE_ARGS", "GDD_AGENT_TIMEOUT",
+            "GDD_PI_STUB_SCRIPT")
     saved = {k: os.environ.get(k) for k in keys}
     d3 = tempfile.mkdtemp()
     try:
         held = os.path.join(d3, "held.py")
+        events = [
+            {"type": "session", "version": 3, "id": "h",
+             "timestamp": "2026-01-01T00:00:00.000Z", "cwd": d3},
+            {"type": "message_end", "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "done"}],
+                "stopReason": "stop", "timestamp": 0,
+                "usage": {"cost": {"total": 0}}}},
+            {"type": "agent_end", "messages": [], "willRetry": False},
+            {"type": "agent_settled", "aborted": False},
+        ]
         with open(held, "w", encoding="utf-8") as f:
             f.write(
-                "import os, sys, time\n"
-                "sys.stdout.write(" + repr(result + "\n") + ")\n"
+                "import json, os, sys, time\n"
+                "sys.stdin.read()\n"
+                "for m in " + repr(events) + ":\n"
+                "    sys.stdout.write(json.dumps(m) + '\\n')\n"
                 "sys.stdout.flush()\n"
                 "if os.fork() == 0:\n"
                 "    time.sleep(30)\n"
@@ -3276,14 +3359,16 @@ def test_timeout_keeps_unread_pipe():
             )
         slow = os.path.join(d3, "slow.py")
         with open(slow, "w", encoding="utf-8") as f:
-            f.write("import time\ntime.sleep(5)\n")
+            f.write("import sys, time\nsys.stdin.read()\ntime.sleep(5)\n")
         os.environ["GDD_AGENT_BIN"] = sys.executable
         os.environ["GDD_AGENT_TIMEOUT"] = "1"
+        os.environ.pop("GDD_PI_STUB_SCRIPT", None)
         os.environ["GDD_AGENT_PRE_ARGS"] = held
-        res = AgentRunner(d3).run("p", allowed_tools=[], max_turns=1)
-        check(res.ok and res.text == "done", f"孙进程占管道时不丢已写出的结果（{res.error}）")
+        res = AgentRunner(d3).run("p", allowed_tools=[], max_turns=10)
+        check(res.ok and res.text == "done",
+              f"孙进程占管道时不丢已写出的结果（{res.error}）")
         os.environ["GDD_AGENT_PRE_ARGS"] = slow
-        res = AgentRunner(d3).run("p", allowed_tools=[], max_turns=1)
+        res = AgentRunner(d3).run("p", allowed_tools=[], max_turns=10)
         check(not res.ok and "超时" in (res.error or ""), f"真超时仍报超时（{res.error}）")
     finally:
         for k, v in saved.items():
@@ -3333,6 +3418,8 @@ if __name__ == "__main__":
     test_p2_pins_r6()
     test_r7_bugbot_pins()
     test_r8_bugbot_pins()
+    test_s2_pi_stub_full_delivery()
+    test_git_add_with_ignored_gdd()
     test_stream_p0_p1()
     test_timeout_keeps_unread_pipe()
     print("全部通过 ✅")

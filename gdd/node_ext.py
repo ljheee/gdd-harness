@@ -1,7 +1,11 @@
-"""把节点声明的 MCP / skill 变成一次主体会话的 Claude 参数。
+"""把节点声明的 MCP / skill 变成一次 pi 主体会话的配置。
 
 配置写在仓库外。门禁会话不调用 prepare，因此不会继承。
 空声明返回 None，命令行不追加任何参数。
+
+- MCP：生成 `{"mcpServers": {...}}` 文件，由 runner 复制进隔离 agent 目录的 mcp.json；
+- skills：把含 SKILL.md 的目录暂存到隔离目录，交给 pi `--skill` 加载；
+- `.claude-plugin` 形式的插件目录不再支持，遇到时明确报配置错误。
 """
 from __future__ import annotations
 
@@ -18,7 +22,7 @@ from .models import McpSpec, NodeSpec, SkillSpec, _MCP_NAME_RE, _no_inject, _str
 @dataclass
 class NodeExtensions:
     mcp_config: str = ""
-    plugin_dirs: List[str] = field(default_factory=list)
+    skill_dirs: List[str] = field(default_factory=list)
 
 
 def ext_home() -> str:
@@ -211,15 +215,15 @@ def _inline_server(spec: McpSpec) -> dict:
 
 
 def prepare(root: str, node: NodeSpec) -> Optional[NodeExtensions]:
-    """生成该节点主体会话要用的 mcp 配置和 skill 插件目录。没有声明则返回 None。"""
+    """生成该节点主体会话要用的 mcp 配置与 skill 目录。没有声明则返回 None。"""
     dest = os.path.join(ext_home(), _project_key(root), node.id)
     cfg = os.path.join(dest, "mcp.json")
-    bundle = os.path.join(dest, "skills-plugin")
+    skill_root = os.path.join(dest, "skills")
     if not node.mcp and not node.skills:
         _remove_file(cfg)
         _remove_file(cfg + ".tmp")
-        if os.path.isdir(bundle):
-            shutil.rmtree(bundle)
+        if os.path.isdir(skill_root):
+            shutil.rmtree(skill_root)
         return None
     home = ext_home()
     _mkdir_private(home)
@@ -247,21 +251,19 @@ def prepare(root: str, node: NodeSpec) -> Optional[NodeExtensions]:
     else:
         _remove_file(cfg)
         _remove_file(cfg + ".tmp")
+    if os.path.isdir(skill_root):
+        shutil.rmtree(skill_root)
     if node.skills:
-        bundle = os.path.join(dest, "skills-plugin")
-        skill_root = os.path.join(bundle, "skills")
-        if os.path.isdir(bundle):
-            shutil.rmtree(bundle)
         os.makedirs(skill_root, exist_ok=True)
         used = set()
-        staged = False
         for spec in node.skills:
             path = _resolve(root, spec.path)
             if not os.path.isdir(path):
                 raise ValueError(f"skill 目录不存在: {spec.path}")
             if _is_plugin(path):
-                ext.plugin_dirs.append(path)
-                continue
+                raise ValueError(
+                    f"不支持的插件目录（.claude-plugin 形式的插件已移除）：{spec.path}；"
+                    "请改为含 SKILL.md 的 skill 目录")
             if not os.path.isfile(os.path.join(path, "SKILL.md")):
                 raise ValueError(f"skill 目录缺少 SKILL.md: {spec.path}")
             _assert_skill_links(path)
@@ -276,23 +278,7 @@ def prepare(root: str, node: NodeSpec) -> Optional[NodeExtensions]:
                 if rewritten != text:
                     with open(md, "w", encoding="utf-8") as f:
                         f.write(rewritten)
-            staged = True
-        if staged:
-            plugin = {
-                "name": f"gdd-{node.id}"[:64],
-                "version": "0.0.1",
-                "description": f"GDD node {node.id} skills",
-                "skills": "./skills",
-            }
-            manifest = os.path.join(bundle, ".claude-plugin")
-            os.makedirs(manifest, exist_ok=True)
-            with open(os.path.join(manifest, "plugin.json"), "w", encoding="utf-8") as f:
-                json.dump(plugin, f, ensure_ascii=False, indent=2)
-            ext.plugin_dirs.insert(0, bundle)
-        elif os.path.isdir(bundle):
-            shutil.rmtree(bundle, ignore_errors=True)
-    elif os.path.isdir(bundle):
-        shutil.rmtree(bundle)
-    if not ext.mcp_config and not ext.plugin_dirs:
+            ext.skill_dirs.append(target)
+    if not ext.mcp_config and not ext.skill_dirs:
         return None
     return ext

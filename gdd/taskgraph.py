@@ -40,6 +40,27 @@ class TaskGraph:
                 out.append(task)
         return out
 
+    def by_id(self) -> dict:
+        return {task.id: task for task in self.tasks}
+
+    def downstream(self, task_ids: Set[str]) -> Set[str]:
+        """给定任务集合的传递下游闭包（含起点本身）。
+
+        按依赖反向传播：只要某任务的任一依赖在闭包里，该任务也在闭包里。
+        未知 ID 忽略（调用方负责先用附录任务集合校验）。
+        """
+        closure = set(task_ids or ())
+        changed = True
+        while changed:
+            changed = False
+            for task in self.tasks:
+                if task.id in closure:
+                    continue
+                if any(dep in closure for dep in task.deps):
+                    closure.add(task.id)
+                    changed = True
+        return closure
+
 
 def load_graph(path: str) -> Optional[TaskGraph]:
     """没有附录时返回 None，调用方按原来的单会话开发。附录不合法时带回 error。"""

@@ -19,9 +19,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
+from . import acceptance as acceptance_mod
 from . import approval as approval_mod
 from . import gates
 from . import revision as revision_mod
+from . import taskgraph
 from .models import ArtifactCheck, NodeSpec, PipelineSpec, _parse_bool
 from .runner import AgentRunner
 
@@ -793,7 +795,7 @@ class Orchestrator:
         # 初始基线提交：把 init 前已存在（或分支切换携入）的未提交内容固化为基线，
         # 避免首个节点 exit 提交扫入历史遗留改动（含已在交付分支的重 init 场景）。
         # 空仓库必须创建提交（否则交付分支是 unborn 引用，后续 rev-list/checkout 失效）
-        add0 = self._git_proc("add", "-A", "--", *_GIT_ADD_PATHSPEC)
+        add0 = self._git_add_all()
         if add0 is None or add0.returncode != 0:
             # add 失败必须显式（index.lock 竞争/权限）：静默空索引会让遗留文件
             # 事后被卷入首个节点交付，且基线记“成功”与事实不符
@@ -903,7 +905,7 @@ class Orchestrator:
             # cur==branch 使 rev-list 散落检测不运行——对比 init 时分支快照补检
             stray_ref = self._stray_from_branch_snapshot(cfg.branch)
         # P2-5 / P1-3：排除根级与任意深度嵌套 .gdd 及其下文件（见 _GIT_ADD_PATHSPEC）
-        add = self._git_proc("add", "-A", "--", *_GIT_ADD_PATHSPEC)
+        add = self._git_add_all()
         if add is None or add.returncode != 0:
             # add 失败（index.lock/权限）→ 静默空索引会把交付记成“无改动”丢失
             _fail(node.id, (((add.stderr if add else "") or "git add 失败（index.lock/权限？）").strip())[:200])
@@ -1405,6 +1407,7 @@ class Orchestrator:
         node = self._current_node()
         ns = st["node_states"][node.id]
         runner = AgentRunner(self.root)
+        runner.on_event = self._record
 
         if ns["phase"] == "pending":
             return self._phase_entry(node, ns, runner)
@@ -1451,6 +1454,46 @@ class Orchestrator:
             if n.baseline_marker or n.id == "implement":
                 return n
         return None
+
+    def _output_dir(self) -> str:
+        """本次迭代的产物目录：绑定命名迭代时取值，否则回退 docs/。"""
+        it = self.state.get("iteration") or {}
+        out = str(it.get("output") or "").strip()
+        return out or "docs"
+
+    def _plan_path(self) -> str:
+        return os.path.join(self.root, self._output_dir(), "plan.md")
+
+    def _ledger_path(self) -> str:
+        return os.path.join(self.root, self._output_dir(), "impl-ledger.md")
+
+    def _acceptance_path(self) -> str:
+        rel = str(self.state.get("acceptance_file") or "").strip()
+        if rel:
+            return os.path.join(self.root, rel)
+        return os.path.join(self.root, self._output_dir(), "acceptance.feature")
+
+    def _is_plan_node(self, node: NodeSpec) -> bool:
+        for art in node.exit.artifacts:
+            if str(art.path).replace("\\", "/").rstrip("/").endswith("plan.md"):
+                return True
+        return False
+
+    def _plan_acceptance_errors(self, node: NodeSpec) -> List[str]:
+        """plan 出口的 harness 侧关联校验；无任务附录时按规格跳过。"""
+        if not self._is_plan_node(node):
+            return []
+        plan_path = self._plan_path()
+        graph = taskgraph.load_graph(plan_path)
+        if graph is None or graph.error:
+            # 没有附录：保留原有单会话行为；附录写坏由 exit 的 AI 判据处理。
+            return []
+        acceptance_path = self._acceptance_path()
+        if not os.path.isfile(acceptance_path):
+            # 产物缺失交给机器检查报具体路径，不在此重复。
+            return []
+        return acceptance_mod.load_and_validate(
+            acceptance_path, [task.id for task in graph.tasks])
 
     def _after_subject(self, node: NodeSpec, ns: Dict, runner: AgentRunner, session) -> Optional[bool]:
         """主体成功之后：定级确认、重跑落盘、对抗裁决。返回 None 表示继续出口门禁。"""
@@ -1717,6 +1760,7 @@ class Orchestrator:
     def _return_to_implement(self, test_node: NodeSpec, cases: List[dict]) -> bool:
         impl = self._implement_node()
         fails = revision_mod.failed_cases(cases)
+        code_fails = revision_mod.failed_cases(cases, {"code"})
         text = "对抗测试判定有 code 问题。请按这些失败用例修改实现：\n" + revision_mod.format_failed(fails)
         if impl is None:
             return self._bounce_current(test_node, gates.Verdict(
@@ -1725,6 +1769,23 @@ class Orchestrator:
         ns["bounces"] = ns.get("bounces", 0) + 1
         self.state["feedbacks"][impl.id] = text
         self.state.setdefault("feedback_kinds", {})[impl.id] = "adversarial"
+        # 按用例→任务关联选择性失效；任何一条 code 失败找不到关联就整轮回退。
+        graph = taskgraph.load_graph(self._plan_path())
+        case_map = acceptance_mod.case_tasks_from_file(self._acceptance_path())
+        routed, route_reason = self._route_case_tasks(code_fails, graph, case_map)
+        if routed:
+            self._invalidate_tasks(ns, graph, routed)
+            ns["task_feedback"] = {
+                tid: self._task_route_feedback(tid, code_fails, case_map)
+                for tid in sorted(routed)
+            }
+            self._record("task_route", node=impl.id, tasks=sorted(routed),
+                         cases=[str(c.get("id") or "") for c in code_fails])
+        else:
+            ns.pop("task_feedback", None)
+            self._record("task_route_fallback", node=impl.id,
+                         reason=(route_reason or "无法按任务关联")[:300],
+                         cases=[str(c.get("id") or "") for c in code_fails])
         if ns["bounces"] >= impl.max_bounces:
             self.state["status"] = "blocked"
             self.state["blocked_reason"] = f"实现环节因对抗测试打回已达上限：{text[:300]}"
@@ -1747,6 +1808,60 @@ class Orchestrator:
         self._record("adversarial_code", node=impl.id)
         self._save()
         return True
+
+    def _route_case_tasks(self, code_fails: List[dict], graph, case_map) -> tuple:
+        """返回 (待失效任务集合, 失败原因)。集合为空表示整轮回退。"""
+        if not code_fails:
+            return set(), "本轮没有 cause=code 的失败用例"
+        if graph is None:
+            return set(), "未找到可用的任务依赖附录"
+        if graph.error:
+            return set(), f"任务依赖附录不可用：{graph.error}"
+        if case_map is None:
+            return set(), "验收用例文件缺失或没有可解析的 Scenario"
+        known = graph.by_id()
+        seeds = set()
+        missing = []
+        for case in code_fails:
+            case_id = str(case.get("id") or "")
+            tasks = case_map.get(case_id)
+            if not tasks:
+                missing.append(case_id)
+                continue
+            unknown = [tid for tid in tasks if tid not in known]
+            if unknown:
+                missing.append(f"{case_id}→{','.join(unknown)}")
+                continue
+            seeds.update(tasks)
+        if missing:
+            return set(), "code 失败用例找不到有效任务关联：" + "；".join(missing)
+        if not seeds:
+            return set(), "code 失败用例没有关联到任何任务"
+        return graph.downstream(seeds), ""
+
+    def _invalidate_tasks(self, ns: Dict, graph, task_ids: set) -> None:
+        """清除指定任务及其会话/核销行，使其按依赖拓扑重新执行。"""
+        done = set(ns.get("tasks_done") or [])
+        sig = dict(ns.get("task_sig") or {})
+        sessions = ns.setdefault("sessions", {})
+        for tid in task_ids:
+            done.discard(tid)
+            sig.pop(tid, None)
+            sessions.pop(f"task:{tid}", None)
+            self._discard_task_note(tid)
+        ns["tasks_done"] = [task.id for task in graph.tasks if task.id in done]
+        ns["task_sig"] = {tid: sig[tid] for tid in ns["tasks_done"] if tid in sig}
+
+    def _task_route_feedback(self, task_id: str, code_fails: List[dict],
+                             case_map: Optional[dict]) -> str:
+        direct = [c for c in code_fails
+                  if task_id in ((case_map or {}).get(str(c.get("id"))) or [])]
+        if direct:
+            return (f"对抗测试判定以下关联用例为 code 失败，请修复任务 {task_id} 的实现：\n"
+                    + revision_mod.format_failed(direct))
+        return ("上游任务已按对抗测试的 code 失败重跑，本任务可能依赖其产物；"
+                "请对照以下失败用例检查并同步修正：\n"
+                + revision_mod.format_failed(code_fails))
 
     def _rerun_test(self, node: NodeSpec, ns: Dict, cases: List[dict]) -> bool:
         fails = revision_mod.failed_cases(cases)
@@ -1974,11 +2089,10 @@ class Orchestrator:
     def _run_impl_tasks(self, node: NodeSpec, ns: Dict, runner: AgentRunner,
                         feedback: str, upstream: List[str], raw_req: str) -> Optional[bool]:
         """按附录把已就绪的任务并行做完。返回 None 表示改走单会话。"""
-        from . import taskgraph
         from .node_ext import prepare
         from .runner import SessionResult
 
-        graph = taskgraph.load_graph(os.path.join(self.root, "docs", "plan.md"))
+        graph = taskgraph.load_graph(self._plan_path())
         if graph is None:
             return None
         if graph.error:
@@ -2021,11 +2135,13 @@ class Orchestrator:
 
         def _one(task):
             task_runner = type(runner)(self.root)
+            task_runner.on_event = self._record
             task_runner.steer_subject = True
             task_runner.node_extensions = ext
             sid = sessions.get(f"task:{task.id}", "") if os.environ.get(
                 "GDD_SUBJECT_RESUME", "on") != "off" else ""
-            prompt = self._task_prompt(node, task, feedback, upstream, raw_req, bool(sid))
+            task_feedback = (ns.get("task_feedback") or {}).get(task.id, feedback)
+            prompt = self._task_prompt(node, task, task_feedback, upstream, raw_req, bool(sid))
             cb = None
             if base_cb is not None:
                 def cb(ev, tid=task.id):
@@ -2201,6 +2317,7 @@ class Orchestrator:
         ns.pop("task_sig", None)
         ns.pop("task_continues", None)
         ns.pop("task_note_misses", None)
+        ns.pop("task_feedback", None)
         sessions = ns.get("sessions") or {}
         for key in list(sessions):
             if str(key).startswith("task:"):
@@ -2231,8 +2348,9 @@ class Orchestrator:
                 line = (f"{task.id}｜未核销｜缺少核销行｜｜"
                         f"需要补写 .gdd/task-results/{task.id}.md")
             rows.append(line)
-        os.makedirs(os.path.join(self.root, "docs"), exist_ok=True)
-        with open(os.path.join(self.root, "docs", "impl-ledger.md"), "w", encoding="utf-8") as f:
+        path = self._ledger_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
             f.write("# 核销台账\n\n## 核销台账\n\n" + "\n".join(rows) + "\n")
 
     def _run_exit_gate(self, node: NodeSpec, ns: Dict, runner: AgentRunner) -> bool:
@@ -2240,6 +2358,21 @@ class Orchestrator:
         # 门禁自身故障（exit_retry）或进程崩溃时反馈保留在 state，重试/重启后不丢失核验项
         pending_fb = self.state["feedbacks"].get(node.id, "")
         pending_kind = self.state.get("feedback_kinds", {}).get(node.id, "")
+
+        # 方案与验收用例同批产出后，harness 侧核对每个 Scenario 的 @task 关联。
+        # 有任务附录才启用；失败直接打回 plan 主体，不启动 AI 门禁。
+        assoc_errors = self._plan_acceptance_errors(node)
+        if assoc_errors:
+            feedback = ("验收用例与任务的关联校验未通过，逐项修复：\n- "
+                        + "\n- ".join(assoc_errors))
+            self._record("acceptance_link_fail", node=node.id,
+                         errors=assoc_errors[:10])
+            self.state["last_exit_evidence"] = [
+                f"关联校验失败：{e}" for e in assoc_errors[:20]]
+            return self._bounce_current(node, gates.Verdict(
+                passed=False, reason="验收用例与任务关联校验未通过",
+                evidence=[f"关联校验失败：{e}" for e in assoc_errors[:20]],
+                feedback=feedback))
 
         change_summary = self._change_summary(node.id) if node.exit.change_aware else ""
         # 上轮打回项：交由 exit 门禁逐项核验（首轮跑 exit 时无打回，天然为空）
@@ -2770,6 +2903,7 @@ class Orchestrator:
                 return {"ok": False, "error": f"节点 {node_id} 当前不可澄清（需 clarify: true 且处于启动前/审批挂起窗口）"}
             node, mode = ctx["node"], ctx["mode"]
             runner = AgentRunner(self.root)
+            runner.on_event = self._record
             sessions = self.state["node_states"][node.id].setdefault("sessions", {})
             # GDD_SUBJECT_RESUME=off 全局逃生舱：chat 同样遵守（--resume 坏掉的环境里
             # 每条 review 消息都注定失败并触发降级路径）
@@ -3080,3 +3214,22 @@ class Orchestrator:
             return True
         finally:
             self._release_lock()
+
+    def _git_add_all(self):
+        """全量暂存并排除 .gdd；兼容 .gdd 已被 .gitignore 忽略的仓库。
+
+        显式 exclude `.gdd` 只有在路径未被忽略时才合法；一旦仓库把 `.gdd/`
+        写进 .gitignore（本迭代交付要求），git 会因「点名被忽略路径」直接
+        拒绝整次 add（rc=1）。此时回退为全量 add，再把根级与嵌套 `.gdd`
+        从索引移除，保持「会话状态不进交付」的既有约束。
+        """
+        add = self._git_proc("add", "-A", "--", *_GIT_ADD_PATHSPEC)
+        if add is not None and add.returncode == 0:
+            return add
+        err = ((add.stderr if add is not None else "") or "")
+        if "ignored by one of your .gitignore" not in err:
+            return add
+        add = self._git_proc("add", "-A", "--", ".")
+        if add is not None and add.returncode == 0:
+            self._git_proc("reset", "-q", "--", ".gdd", ":(glob)**/.gdd/**")
+        return add
