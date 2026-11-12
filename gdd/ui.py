@@ -658,8 +658,24 @@ pre{white-space:pre-wrap;font:12px/1.5 ui-monospace,Menlo,monospace;color:#c9d3e
 .live-tool{color:var(--amber)}
 .live-text{color:#d5dced;white-space:pre-wrap}
 .live-note{color:var(--green);margin-top:6px;white-space:pre-wrap}
-.tabs{display:flex;gap:8px;margin-bottom:16px}
+.tabs{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap;align-items:center}
 .tabs button.on{border-color:var(--blue);color:#cfe0ff}
+.node.sel{border-color:var(--blue);box-shadow:0 0 0 1px var(--blue)}
+.tpl-summary{border-bottom:1px solid var(--line);padding-bottom:10px;margin-bottom:12px}
+.tpl-detail-h{margin-bottom:6px}
+.tpl-kv{display:flex;gap:10px;margin:6px 0;align-items:flex-start}
+.tpl-k{width:150px;flex-shrink:0;color:var(--dim);font-size:12px}
+.tpl-v{flex:1;min-width:0}
+.tpl-v pre{margin:0}
+.tpl-list{margin:0 0 0 18px;color:var(--fg);font-size:12px}
+.tpl-form .row{margin-bottom:10px}
+.tpl-form textarea{min-height:72px}
+.row label.tpl-check{display:flex;align-items:center;gap:8px;color:var(--fg);font-size:13px;margin-bottom:0}
+.tpl-check input{width:auto;margin:0}
+.tpl-list-row{display:flex;gap:8px;margin-bottom:6px;align-items:flex-start}
+.tpl-list-row input{flex:1;min-width:0}
+.tpl-list-row button{flex-shrink:0;padding:6px 10px}
+.tpl-sub{color:var(--dim);font-size:12px;letter-spacing:.08em;margin:14px 0 6px;border-top:1px dashed var(--line);padding-top:10px}
 </style></head><body>
 <aside>
   <h1>GDD 控制台</h1><div class="sub">Goal Driven Development</div>
@@ -667,7 +683,9 @@ pre{white-space:pre-wrap;font:12px/1.5 ui-monospace,Menlo,monospace;color:#c9d3e
     <button class="pri item" style="text-align:center" onclick="showNew()">＋ 从模板启动任务</button>
   </div>
   <div class="sec"><div class="t">任务</div><div id="navTasks"></div></div>
-  <div class="sec"><div class="t">模板</div><div id="navTpl"></div></div>
+  <div class="sec"><div class="t">模板</div><div id="navTpl"></div>
+    <button class="item" data-action="new-template" onclick="showNewTpl()">＋ 新建模板</button>
+  </div>
   <div class="sec"><div class="t">执行端</div>
     <button class="item" id="navSettings" onclick="showSettings()">⚙ 设置</button>
   </div>
@@ -982,33 +1000,506 @@ async function testSettings(){
 }
 
 async function showTplA(b64){showTpl(dec(b64))}
+
+// ---------- 模板可视化（T1）：JSON 客户端解析 + 节点流/详情 + 源码视图 ----------
+const TPL_MARKS=[['clarify','澄清'],['review','评审'],['adversarial','对抗'],['baseline_marker','git 基线']];
+const TPL_NODE_KEYS=['id','name','description','entry','exit','approval','subject','max_bounces',
+  'baseline_marker','clarify','adversarial','review','session_group','mcp','skills'];
+
+// ---------- 结构化表单（T2）：字段清单、控件生成与收集 ----------
+// 严格对应 spec.md 5.2；节点 id 只读展示，mcp/skills 不在清单内（只读摘要 + 源码模式）。
+const TPL_FIELDS={
+  pipeline:['name','description','session_preset','git_delivery.enabled','git_delivery.branch','git_delivery.remote'],
+  node:['name','description','subject.goal','subject.instructions','subject.max_turns',
+    'approval.required','approval.prompt','clarify','max_bounces','baseline_marker',
+    'adversarial','review','session_group',
+    'entry.goal','entry.ai_check','entry.change_aware','entry.artifacts','entry.commands',
+    'exit.goal','exit.ai_check','exit.change_aware','exit.artifacts','exit.commands']
+};
+const TPL_PRESETS=['independent','clarify-design','shared'];
+const TPL_INT_FIELDS=['subject.max_turns','max_bounces'];
+
+function tplDeep(v){return v==null?v:JSON.parse(JSON.stringify(v))}
+function tplGet(o,path){
+  let cur=o;
+  for(const k of String(path).split('.')){
+    if(cur==null||typeof cur!=='object'||Array.isArray(cur))return undefined;
+    cur=cur[k];
+  }
+  return cur;
+}
+function tplSet(o,path,v){
+  const ks=String(path).split('.');let cur=o;
+  for(let i=0;i<ks.length-1;i++){
+    if(cur[ks[i]]==null||typeof cur[ks[i]]!=='object'||Array.isArray(cur[ks[i]]))cur[ks[i]]={};
+    cur=cur[ks[i]];
+  }
+  cur[ks[ks.length-1]]=v;
+}
+function tplDel(o,path){
+  const ks=String(path).split('.');let cur=o;
+  for(let i=0;i<ks.length-1;i++){
+    if(cur==null||typeof cur!=='object'||Array.isArray(cur))return;
+    cur=cur[ks[i]];
+  }
+  if(cur!=null&&typeof cur==='object'&&!Array.isArray(cur))delete cur[ks[ks.length-1]];
+}
+function tplTextControl(field,val,multiline,placeholder){
+  const v=val==null?'':String(val),ph=placeholder==null?'':String(placeholder);
+  return multiline
+    ?`<textarea data-field="${esc(field)}" placeholder="${esc(ph)}">${esc(v)}</textarea>`
+    :`<input data-field="${esc(field)}" value="${esc(v)}" placeholder="${esc(ph)}">`;
+}
+function tplCheckControl(field,on,label){
+  return `<label class="tpl-check"><input type="checkbox" data-field="${esc(field)}"${tplBool(on)?' checked':''}> ${esc(label)}</label>`;
+}
+function tplFieldRow(field,label,control){
+  return `<div class="row"><label>${esc(label)}</label>${control}</div>`;
+}
+
+// ---- 流水线级表单（控件均由 TPL_FIELDS.pipeline 生成）----
+function tplPipelineField(p,data){
+  const f='pipeline.'+p,gd=tplObj(data.git_delivery);
+  if(p==='session_preset'){
+    const cur=tplStr(data.session_preset,'independent');
+    const opts=TPL_PRESETS.map(v=>`<option value="${v}"${cur===v?' selected':''}>${v}</option>`).join('')
+      +(TPL_PRESETS.includes(cur)?'':`<option value="${esc(cur)}" selected>${esc(cur)}</option>`);
+    return tplFieldRow(p,p,`<select data-field="${esc(f)}">${opts}</select>`);
+  }
+  if(p==='git_delivery.enabled'){
+    const on=gd.enabled===undefined?true:tplBool(gd.enabled);
+    return `<div class="row">${tplCheckControl(f,on,'启用 git 交付')}</div>`;
+  }
+  if(p==='description')return tplFieldRow(p,p,tplTextControl(f,tplStr(data.description,''),true));
+  if(p==='git_delivery.branch')return tplFieldRow(p,p,tplTextControl(f,tplStr(gd.branch,'gdd/delivery')));
+  if(p==='git_delivery.remote')return tplFieldRow(p,p,tplTextControl(f,tplStr(gd.remote,''),false,'空 = 自动探测首个 remote'));
+  return tplFieldRow(p,p,tplTextControl(f,tplStr(data[p],'')));
+}
+function tplPipelineForm(data){
+  const fields={};
+  TPL_FIELDS.pipeline.forEach(p=>{fields[p]=tplPipelineField(p,data)});
+  return `<div class="card tpl-form" data-form="pipeline">
+    <div class="tpl-detail-h"><b>流水线</b> <span class="tag" data-readonly="pipeline-id">${esc(tplStr(data.id,'(缺少 id)'))}</span><span class="hint">id 只读（源码模式可改）</span></div>
+    <div class="two"><div>${fields['name']||''}${fields['session_preset']||''}</div>
+      <div>${fields['git_delivery.enabled']||''}${fields['git_delivery.branch']||''}${fields['git_delivery.remote']||''}</div></div>
+    ${fields['description']||''}
+  </div>`;
+}
+
+// ---- 节点级表单 ----
+function tplArtifactsEditor(i,p,raw){
+  const f='node.'+i+'.'+p,list=tplArr(raw);
+  const rows=list.map((a,j)=>{
+    a=tplObj(a);
+    return `<div class="tpl-list-row" data-art-row data-art-index="${j}">
+      <input data-field="${esc(f+'.'+j+'.path')}" data-art="path" value="${esc(tplStr(a.path,''))}" placeholder="path（支持 glob）">
+      <input data-field="${esc(f+'.'+j+'.must_contain')}" data-art="must_contain" value="${esc(tplStr(a.must_contain,''))}" placeholder="must_contain 正则（可选）">
+      <button type="button" onclick="tplDelRow(${i},'${p}',${j})">删除</button>
+    </div>`;
+  }).join('');
+  return `<div class="row" data-field="${esc(f)}" data-list="artifacts"><label>${esc(p)}</label>
+    <div data-art-rows>${rows||'<div class="hint">（空）</div>'}</div>
+    <button type="button" onclick="tplAddArtifact(${i},'${p}')">＋ 添加产物</button></div>`;
+}
+function tplCommandsEditor(i,p,raw){
+  const f='node.'+i+'.'+p,list=tplArr(raw);
+  const rows=list.map((c,j)=>`<div class="tpl-list-row" data-cmd-row data-cmd-index="${j}">
+    <input data-field="${esc(f+'.'+j)}" data-cmd="1" value="${esc(String(c))}" placeholder="shell 命令">
+    <button type="button" onclick="tplDelRow(${i},'${p}',${j})">删除</button></div>`).join('');
+  return `<div class="row" data-field="${esc(f)}" data-list="commands"><label>${esc(p)}</label>
+    <div data-cmd-rows>${rows||'<div class="hint">（空）</div>'}</div>
+    <button type="button" onclick="tplAddCommand(${i},'${p}')">＋ 添加命令</button></div>`;
+}
+function tplNodeField(i,p,n){
+  const f='node.'+i+'.'+p,v=tplGet(n,p);
+  if(p.endsWith('.artifacts'))return tplArtifactsEditor(i,p,v);
+  if(p.endsWith('.commands'))return tplCommandsEditor(i,p,v);
+  if(p==='name'){
+    // 与 NodeSpec.from_dict 的 name=d.get("name", d["id"]) 对齐：缺失时预填 id，
+    // 避免“打开即保存”把「缺失→运行时回退 id」写成显式空名字。
+    const nm=(v===undefined||v===null)?tplStr(n.id,''):String(v);
+    return tplFieldRow(p,p,tplTextControl(f,nm));
+  }
+  if(TPL_INT_FIELDS.includes(p)){
+    const def=p==='subject.max_turns'?80:3;
+    return tplFieldRow(p,p,`<input type="number" step="1" data-field="${esc(f)}" value="${esc(String(v===undefined||v===null?def:v))}">`);
+  }
+  if(p==='approval.required'||p==='clarify'||p==='baseline_marker'||p==='adversarial'||p==='review'||p.endsWith('.change_aware')){
+    return `<div class="row">${tplCheckControl(f,v,p)}</div>`;
+  }
+  if(p==='description'||p==='approval.prompt'||p==='subject.goal'||p==='subject.instructions'||p.endsWith('.goal')||p.endsWith('.ai_check')){
+    return tplFieldRow(p,p,tplTextControl(f,tplStr(v,''),true));
+  }
+  return tplFieldRow(p,p,tplTextControl(f,tplStr(v,'')));
+}
+function tplFormDetail(el,n,i){
+  const id=tplStr(n.id,'(缺少 id)'),nm=tplStr(n.name,id);
+  const mcp=tplArr(n.mcp),skills=tplArr(n.skills);
+  const unknown=Object.keys(n).filter(k=>!TPL_NODE_KEYS.includes(k));
+  const marks=[];
+  if(tplBool(tplObj(n.approval).required))marks.push('需人工审批');
+  TPL_MARKS.forEach(([k,t])=>{if(tplBool(n[k]))marks.push(t)});
+  const field=p=>tplNodeField(i,p,n);
+  const top=TPL_FIELDS.node.filter(p=>!p.startsWith('entry.')&&!p.startsWith('exit.')).map(field).join('');
+  const entry=TPL_FIELDS.node.filter(p=>p.startsWith('entry.')).map(field).join('');
+  const exit=TPL_FIELDS.node.filter(p=>p.startsWith('exit.')).map(field).join('');
+  const other=unknown.length
+    ?`<div class="tpl-kv" style="margin-top:10px"><div class="tpl-k">其他字段（只读）</div><div class="tpl-v"><pre>${esc(JSON.stringify(Object.fromEntries(unknown.map(k=>[k,n[k]])),null,2))}</pre><div class="hint">未知/未展示字段保存时原样保留，可在源码模式查看。</div></div></div>`
+    :'';
+  el.innerHTML=`<div class="card tpl-detail tpl-form" data-node-detail="${esc(id)}" data-node-index="${i}">
+    <div class="tpl-detail-h"><b>${esc(nm)}</b> <span class="tag" data-readonly="node-id">${esc(id)}</span>${marks.map(m=>`<span class="tag">${esc(m)}</span>`).join('')}</div>
+    <div class="hint" style="margin-bottom:8px">节点 id 只读（源码模式可改）；mcp / skills 仅源码可改；未展示字段保存时原样保留。</div>
+    ${top}
+    <div class="tpl-sub">entry 门禁</div>${entry}
+    <div class="tpl-sub">exit 门禁</div>${exit}
+    ${tplRow('mcp',mcp.length?`<pre>${esc(JSON.stringify(mcp,null,2))}</pre><div class="hint">只读摘要；源码模式可修改</div>`:'<span class="hint">（空）</span>')}
+    ${tplRow('skills',skills.length?`<pre>${esc(JSON.stringify(skills,null,2))}</pre><div class="hint">只读摘要；源码模式可修改</div>`:'<span class="hint">（空）</span>')}
+    ${other}
+  </div>`;
+}
+
+// ---- 表单收集：只覆盖表单字段；mcp/skills/未知键保持原对象引用，不重建 ----
+function tplFieldEl(field){return document.querySelector('[data-field="'+field+'"]')}
+function tplNodeData(i){
+  const nodes=tplArr(window._tplData&&window._tplData.nodes),n=nodes[i];
+  return (n&&typeof n==='object'&&!Array.isArray(n))?n:null;
+}
+function collectTplArtifacts(n,p,box){
+  if(!box)return;
+  const old=tplArr(tplGet(n,p));
+  const rows=Array.from(box.querySelectorAll('[data-art-row]'));
+  const out=rows.map((row,domIdx)=>{
+    let idx=Number(row.dataset.artIndex);
+    if(!Number.isInteger(idx)||idx<0||idx>=old.length)idx=domIdx;
+    // 以原对象为基底浅克隆：只改 path/must_contain，未知子字段原样保留
+    const base=(old[idx]&&typeof old[idx]==='object'&&!Array.isArray(old[idx]))?old[idx]:{};
+    const obj=Object.assign({},base);
+    const pe=row.querySelector('[data-art="path"]'),me=row.querySelector('[data-art="must_contain"]');
+    obj.path=pe?String(pe.value):'';
+    const mc=me?String(me.value):'';
+    if(mc)obj.must_contain=mc;else delete obj.must_contain;
+    return obj;
+  });
+  tplSet(n,p,out);
+}
+function collectTplCommands(n,p,box){
+  if(!box)return;
+  const rows=Array.from(box.querySelectorAll('[data-cmd-row]'));
+  tplSet(n,p,rows.map(r=>{const el=r.querySelector('[data-cmd]');return el?String(el.value):''}));
+}
+function collectTplForm(){
+  const errs=[],data=window._tplData;
+  if(!data||typeof data!=='object'||Array.isArray(data))return errs;
+  TPL_FIELDS.pipeline.forEach(p=>{
+    const el=tplFieldEl('pipeline.'+p);
+    if(!el)return;
+    if(p==='git_delivery.enabled')tplSet(data,p,!!el.checked);
+    else tplSet(data,p,String(el.value));
+  });
+  const nodes=tplArr(data.nodes);
+  nodes.forEach((n,i)=>{
+    if(!n||typeof n!=='object'||Array.isArray(n))return;
+    TPL_FIELDS.node.forEach(p=>{
+      const field='node.'+i+'.'+p;
+      if(p.endsWith('.artifacts')){collectTplArtifacts(n,p,tplFieldEl(field));return}
+      if(p.endsWith('.commands')){collectTplCommands(n,p,tplFieldEl(field));return}
+      const el=tplFieldEl(field);
+      if(!el)return;
+      if(el.type==='checkbox'){tplSet(n,p,!!el.checked);return}
+      if(TPL_INT_FIELDS.includes(p)){
+        const s=String(el.value).trim();
+        if(s===''){tplDel(n,p);return}
+        if(!/^-?\d+$/.test(s)){errs.push('节点 '+(n.id||i)+' 的 '+p+' 必须是整数');return}
+        tplSet(n,p,parseInt(s,10));return;
+      }
+      tplSet(n,p,String(el.value));
+    });
+  });
+  return errs;
+}
+function tplAddArtifact(i,p){
+  collectTplForm();
+  const n=tplNodeData(i);if(!n)return;
+  const ks=p.split('.');
+  if(!n[ks[0]]||typeof n[ks[0]]!=='object'||Array.isArray(n[ks[0]]))n[ks[0]]={};
+  const arr=tplArr(n[ks[0]][ks[1]]);
+  n[ks[0]][ks[1]]=arr;
+  arr.push({path:'',must_contain:''});
+  renderTplVisual();
+}
+function tplAddCommand(i,p){
+  collectTplForm();
+  const n=tplNodeData(i);if(!n)return;
+  const ks=p.split('.');
+  if(!n[ks[0]]||typeof n[ks[0]]!=='object'||Array.isArray(n[ks[0]]))n[ks[0]]={};
+  const arr=tplArr(n[ks[0]][ks[1]]);
+  n[ks[0]][ks[1]]=arr;
+  arr.push('');
+  renderTplVisual();
+}
+function tplDelRow(i,p,j){
+  collectTplForm();
+  const n=tplNodeData(i);if(!n)return;
+  const arr=tplArr(tplGet(n,p));
+  if(j<0||j>=arr.length)return;
+  arr.splice(j,1);
+  renderTplVisual();
+}
+
+// 与服务端 _parse_pipeline_content 一致的格式识别：按内容而非扩展名；
+// 去前导空白后以 { 开头按 JSON 解析，失败归 invalid，其余归 yaml（仅源码视图）。
+function parseTplContent(content){
+  const s=String(content==null?'':content);
+  const t=s.replace(/^\s+/,'');
+  if(t.startsWith('{')){
+    try{return {kind:'json',data:JSON.parse(s)}}
+    catch(e){return {kind:'invalid',error:String((e&&e.message)||e)}}
+  }
+  return {kind:'yaml'};
+}
+function tplObj(v){return v&&typeof v==='object'&&!Array.isArray(v)?v:{}}
+function tplArr(v){return Array.isArray(v)?v:[]}
+function tplBool(v){
+  if(v===true)return true;
+  if(v===false||v==null)return false;
+  if(typeof v==='string')return ['true','yes','on','1'].includes(v.trim().toLowerCase());
+  return !!v;
+}
+function tplStr(v,fallback){
+  if(v===undefined||v===null||v==='')return String(fallback==null?'':fallback);
+  return String(v);
+}
+function tplTextBlock(v,empty){
+  const s=(v===undefined||v===null)?'':String(v);
+  return s?`<pre>${esc(s)}</pre>`:`<span class="hint">${esc(empty||'（空）')}</span>`;
+}
+function tplOnOff(v){return tplBool(v)?'<span class="tag" style="margin-left:0">启用</span>':'<span class="hint">未启用</span>'}
+function tplRow(k,v){return `<div class="tpl-kv"><div class="tpl-k">${esc(k)}</div><div class="tpl-v">${v}</div></div>`}
+// 空 session_group 的实际语义取决于流水线 session_preset 的展开（gdd/models.py
+// _expand_session_preset）：shared 全部归 gdd_all；clarify-design 下 clarify 节点
+// 归相邻设计组；independent 才是真正独立。只读详情按此展示，避免误导。
+function tplSessionGroupText(n){
+  const preset=tplStr((window._tplData||{}).session_preset,'independent');
+  if(preset==='shared')return '<span class="hint">（空 → 由 session_preset=shared 展开为共享组 gdd_all）</span>';
+  if(preset==='clarify-design'&&tplBool(n.clarify))return '<span class="hint">（空 → 由 session_preset=clarify-design 与相邻 clarify 节点共享设计组）</span>';
+  return '<span class="hint">（空 = 独立会话）</span>';
+}
+
+function tplGate(g){
+  g=tplObj(g);
+  const arts=tplArr(g.artifacts).map(a=>{
+    a=tplObj(a);
+    const mc=(a.must_contain===undefined||a.must_contain===null||a.must_contain==='')?'':String(a.must_contain);
+    return `<li><code>${esc(tplStr(a.path,'(缺少 path)'))}</code>${mc?` — 必须匹配 <code>${esc(mc)}</code>`:''}</li>`;
+  }).join('');
+  const cmds=tplArr(g.commands).map(c=>`<li><code>${esc(String(c))}</code></li>`).join('');
+  return tplRow('goal',tplTextBlock(g.goal))
+    +tplRow('ai_check',tplTextBlock(g.ai_check))
+    +tplRow('change_aware',tplOnOff(g.change_aware))
+    +tplRow('artifacts',arts?`<ul class="tpl-list">${arts}</ul>`:'<span class="hint">（空）</span>')
+    +tplRow('commands',cmds?`<ul class="tpl-list">${cmds}</ul>`:'<span class="hint">（空）</span>');
+}
+
+function tplPipelineSummary(data){
+  const gd=tplObj(data.git_delivery);
+  // 与 GitDeliverySpec.from_dict（enabled 缺失默认 True）及 tplPipelineField 保持一致
+  const gdEnabled=gd.enabled===undefined?true:tplBool(gd.enabled);
+  const preset=tplStr(data.session_preset,'independent');
+  return `<div class="tpl-summary">
+    <div class="tpl-detail-h"><b>${esc(tplStr(data.name,'(未命名模板)'))}</b><span class="tag">${esc(tplStr(data.id,'(缺少 id)'))}</span><span class="tag">${esc(preset)}</span></div>
+    <div class="hint">${esc(tplStr(data.description,'（无描述）'))}</div>
+    <div class="hint" style="margin-top:4px">git 交付：${gdEnabled?'启用':'停用'} · 分支 <code>${esc(tplStr(gd.branch,'gdd/delivery'))}</code>${gd.remote?` · remote <code>${esc(String(gd.remote))}</code>`:''}</div>
+  </div>`;
+}
+
+function renderTplDetail(){
+  const el=document.getElementById('tplDetail');if(!el)return;
+  const nodes=tplArr(window._tplData&&window._tplData.nodes);
+  if(!nodes.length){el.innerHTML='<div class="hint">模板没有可展示的节点。</div>';return}
+  let i=Number(window._tplSel);if(!Number.isInteger(i)||i<0||i>=nodes.length)i=0;
+  window._tplSel=i;
+  const n=tplObj(nodes[i]);
+  if(window._tplBuiltin)renderTplDetailReadonly(el,i);
+  else tplFormDetail(el,n,i);
+}
+function renderTplDetailReadonly(el,i){
+  const nodes=tplArr(window._tplData&&window._tplData.nodes);
+  const n=tplObj(nodes[i]),sub=tplObj(n.subject),ap=tplObj(n.approval);
+  const id=tplStr(n.id,'(缺少 id)'),nm=tplStr(n.name,id);
+  const mcp=tplArr(n.mcp),skills=tplArr(n.skills);
+  const unknown=Object.keys(n).filter(k=>!TPL_NODE_KEYS.includes(k));
+  const ro=window._tplBuiltin
+    ?'<div class="hint" style="margin-bottom:8px">内置模板 · 只读；如需修改请先「复制为新模板」。</div>'
+    :'<div class="hint" style="margin-bottom:8px">当前为只读预览；修改模板请切换到「源码」模式。</div>';
+  const marks=[];
+  if(tplBool(ap.required))marks.push('需人工审批');
+  TPL_MARKS.forEach(([k,t])=>{if(tplBool(n[k]))marks.push(t)});
+  const other=unknown.length
+    ?`<div class="tpl-kv" style="margin-top:10px"><div class="tpl-k">其他字段（只读）</div><div class="tpl-v"><pre>${esc(JSON.stringify(Object.fromEntries(unknown.map(k=>[k,n[k]])),null,2))}</pre><div class="hint">未知/未展示字段保存时原样保留，可在源码模式查看。</div></div></div>`
+    :'';
+  el.innerHTML=`<div class="card tpl-detail" data-node-detail="${esc(id)}" data-node-index="${i}">
+    <div class="tpl-detail-h"><b>${esc(nm)}</b> <span class="tag">${esc(id)}</span>${marks.map(m=>`<span class="tag">${esc(m)}</span>`).join('')}</div>
+    ${ro}
+    ${tplRow('description',tplTextBlock(n.description))}
+    ${tplRow('subject.goal',tplTextBlock(sub.goal))}
+    ${tplRow('subject.instructions',tplTextBlock(sub.instructions))}
+    ${tplRow('subject.max_turns',`<code>${esc(String(sub.max_turns===undefined?80:sub.max_turns))}</code>`)}
+    ${tplRow('approval.required',tplOnOff(ap.required))}
+    ${tplRow('approval.prompt',tplTextBlock(ap.prompt))}
+    ${tplRow('session_group',n.session_group?`<code>${esc(String(n.session_group))}</code>`:tplSessionGroupText(n))}
+    ${tplRow('max_bounces',`<code>${esc(String(n.max_bounces===undefined?3:n.max_bounces))}</code>`)}
+    ${tplRow('baseline_marker',tplOnOff(n.baseline_marker))}
+    ${tplRow('clarify',tplOnOff(n.clarify))}
+    ${tplRow('adversarial',tplOnOff(n.adversarial))}
+    ${tplRow('review',tplOnOff(n.review))}
+    ${tplRow('entry',tplGate(n.entry))}
+    ${tplRow('exit',tplGate(n.exit))}
+    ${tplRow('mcp',mcp.length?`<pre>${esc(JSON.stringify(mcp,null,2))}</pre><div class="hint">只读摘要；源码模式可修改</div>`:'<span class="hint">（空）</span>')}
+    ${tplRow('skills',skills.length?`<pre>${esc(JSON.stringify(skills,null,2))}</pre><div class="hint">只读摘要；源码模式可修改</div>`:'<span class="hint">（空）</span>')}
+    ${other}
+  </div>`;
+}
+
+function renderTplVisual(){
+  const box=$('#tplBody');if(!box)return;
+  const kind=window._tplKind,parseErr=window._tplParseError||'';
+  if(kind!=='json'){
+    box.innerHTML=`<div data-view="template-visual">
+      <div class="alert warn">${kind==='yaml'?'该模板为 YAML/非 JSON，当前仅支持源码查看/编辑。':`模板内容无法解析为 JSON：${esc(parseErr||'未知错误')}。请使用源码查看/编辑。`}</div>
+      <div class="hint">点击上方「源码」查看模板原文。</div></div>`;
+    return;
+  }
+  const data=window._tplData;
+  if(!data||typeof data!=='object'||Array.isArray(data)){
+    box.innerHTML='<div data-view="template-visual"><div class="alert err">模板 JSON 顶层必须是对象，无法可视化；请使用源码查看/编辑。</div></div>';
+    return;
+  }
+  const nodes=tplArr(data.nodes);
+  const cards=nodes.map((raw,i)=>{
+    const n=tplObj(raw);
+    const id=tplStr(n.id,'(缺少 id)'),nm=tplStr(n.name,id);
+    const marks=[];
+    if(tplBool(tplObj(n.approval).required))marks.push('需人工审批');
+    TPL_MARKS.forEach(([k,t])=>{if(tplBool(n[k]))marks.push(t)});
+    const desc=tplStr(n.description,'');
+    return `<div class="node tpl-node${window._tplSel===i?' sel':''}" data-node-id="${esc(id)}" data-node-index="${i}" style="cursor:pointer" onclick="tplSelect(${i})">
+      <div class="nm">${esc(nm)}</div>
+      <div class="ph">${esc(id)}</div>
+      ${marks.length?`<div class="bd" style="margin-top:3px">${marks.map(m=>`<span class="tag" style="margin-left:0;margin-right:4px">${esc(m)}</span>`).join('')}</div>`:''}
+      ${desc?`<div class="bd" style="margin-top:3px">${esc(desc.length>60?desc.slice(0,60)+'…':desc)}</div>`:''}
+    </div>${i<nodes.length-1?'<div class="arrow">→</div>':''}`;
+  }).join('');
+  box.innerHTML=`<div data-view="template-visual">
+    ${window._tplBuiltin?tplPipelineSummary(data):tplPipelineForm(data)}
+    <div class="hint">节点流程（${nodes.length} 个节点，按模板 nodes 顺序）</div>
+    <div class="flow" style="margin-top:8px">${cards||'<div class="empty" style="padding:16px">模板未定义 nodes 数组或节点为空。</div>'}</div>
+    <div id="tplDetail" style="margin-top:16px"></div>
+  </div>`;
+  renderTplDetail();
+}
+function tplSelect(i){
+  // 切换节点前先收集，保留未保存的本地编辑（同一页面会话内）
+  if(!window._tplBuiltin)collectTplForm();
+  window._tplSel=Number(i)||0;
+  document.querySelectorAll('#tplBody .tpl-node[data-node-index]').forEach(el=>{
+    el.classList.toggle('sel',Number(el.dataset.nodeIndex)===window._tplSel);
+  });
+  renderTplDetail();
+}
+
+function renderTplSource(){
+  const builtin=!!window._tplBuiltin;
+  const editing=window._tplSrcMode==='edit'&&!builtin;
+  const cur=window._tplDraft!=null?window._tplDraft:(window._tpl||'');
+  $('#tplBody').innerHTML=editing
+    ?`<textarea id="tplEdit" style="min-height:420px">${esc(cur)}</textarea>`
+    :`<pre data-view="template-source">${esc(cur)}</pre>`;
+  const sb=$('#tplSaveBtn');if(sb)sb.style.display=editing?'':'none';
+}
+function tplShow(v){
+  if(!$('#tplBody'))return;
+  if(window._tplView==='visual'&&!window._tplBuiltin)collectTplForm();
+  if(window._tplView==='source'){
+    const ta=document.getElementById('tplEdit');if(ta)window._tplDraft=ta.value;
+  }
+  window._tplView=v;
+  const vis=document.getElementById('tplTabVisual'),src=document.getElementById('tplTabSource');
+  if(vis)vis.classList.toggle('on',v==='visual');
+  if(src)src.classList.toggle('on',v==='source');
+  const eb=document.getElementById('tplEditBtn');
+  if(eb){
+    const editOn=v==='source'&&window._tplSrcMode==='edit';
+    eb.textContent=editOn?'查看源码':'编辑源码';
+    eb.onclick=()=>tplMode(editOn?'view':'edit');
+  }
+  const sb=document.getElementById('tplSaveBtn');
+  if(sb){
+    const canSave=!window._tplBuiltin&&(v==='visual'?window._tplKind==='json':window._tplSrcMode==='edit');
+    sb.style.display=canSave?'':'none';
+  }
+  if(v==='visual'){renderTplVisual()}else{renderTplSource()}
+}
+function tplMode(m){
+  const ta=document.getElementById('tplEdit');if(ta)window._tplDraft=ta.value;
+  window._tplSrcMode=m;
+  tplShow('source');
+}
+
 async function showTpl(name){
   stopPoll();view={mode:'tpl',name};
   const j=await api('api/template/'+encodeURIComponent(name));
   if(!j.ok){$('#main').innerHTML=`<div class="alert err">${esc(j.error)}</div>`;return}
   const editable=!j.builtin;
   const cur=j.content;
+  const parsed=parseTplContent(cur);
+  const notice=window._tplNotice||''; window._tplNotice='';
+  window._tpl=cur; window._tplName=name; window._tplBuiltin=!!j.builtin;
+  window._tplKind=parsed.kind; window._tplData=parsed.kind==='json'?tplDeep(parsed.data):null;
+  window._tplParseError=parsed.error||''; window._tplSel=0; window._tplDraft=null;
+  window._tplSrcMode='view'; window._tplView='';
+  const kindWarn=parsed.kind==='json'?'':`<div class="alert warn">${parsed.kind==='yaml'?'该模板为 YAML/非 JSON，当前仅支持源码查看/编辑。':`模板内容无法解析为 JSON：${esc(parsed.error||'未知错误')}；请使用源码查看/编辑。`}</div>`;
   $('#main').innerHTML=`<h2>模板：${esc(name)}${j.builtin?'<span class="tag">内置 · 只读</span>':''}</h2>
   <div class="card">
-    <div class="tabs">${j.builtin?'':'<button onclick="tplMode(\'view\')">查看</button><button onclick="tplMode(\'edit\')">编辑</button>'}</div>
+    <div class="tabs">
+      <button id="tplTabVisual" onclick="tplShow('visual')">可视化</button>
+      <button id="tplTabSource" onclick="tplShow('source')">源码</button>
+      <span style="flex:1"></span>
+      ${editable?'<button id="tplEditBtn"></button>':''}
+    </div>
+    ${kindWarn}
     <div id="tplBody"></div>
     <div class="actions" style="margin-top:12px">
-      ${editable?'<button class="pri" onclick="saveTpl(\''+esc(name)+'\')">保存</button><button class="danger" onclick="delTpl(\''+esc(name)+'\')">删除</button>':''}
+      ${editable?'<button class="pri" id="tplSaveBtn" style="display:none" onclick="saveTpl(\''+esc(name)+'\')">保存</button><button class="danger" onclick="delTpl(\''+esc(name)+'\')">删除</button>':''}
       ${j.builtin?'<button onclick="forkTpl(\''+esc(name)+'\')">复制为新模板</button>':''}
       <button onclick="showNew()">用此模板新建任务 →</button>
-    </div><div id="tplErr"></div></div>`;
-  window._tpl=cur; window._tplName=name; tplMode(j.builtin?'view':'view');
-}
-function tplMode(m){
-  const cur=window._tpl||'';
-  $('#tplBody').innerHTML=m==='edit'?`<textarea id="tplEdit" style="min-height:420px">${esc(cur)}</textarea>`:`<pre>${esc(cur)}</pre>`;
-  window._tplMode=m;
+    </div><div id="tplErr">${notice}</div></div>`;
+  tplShow(parsed.kind==='json'?'visual':'source');
 }
 async function saveTpl(name){
-  const content=$('#tplEdit').value;
+  let content='';
+  if(window._tplView==='visual'){
+    // 可视化模式：先收集表单（只覆盖表单字段），再把解析后的对象序列化回 JSON 文本，
+    // 走现有 PUT content 路径；未展示字段（mcp/skills/未知键）随原对象保留。
+    if(window._tplBuiltin){$('#tplErr').innerHTML='<div class="alert err">内置模板只读，请先「复制为新模板」</div>';return}
+    if(window._tplKind!=='json'||!window._tplData||typeof window._tplData!=='object'||Array.isArray(window._tplData)){
+      $('#tplErr').innerHTML='<div class="alert err">当前模板不是 JSON 对象，请使用源码模式保存</div>';return;
+    }
+    const errs=collectTplForm();
+    if(errs.length){$('#tplErr').innerHTML=`<div class="alert err">${esc(errs.join('；'))}</div>`;return}
+    content=JSON.stringify(window._tplData,null,2);
+  }else{
+    const ta=document.getElementById('tplEdit');
+    if(!ta){$('#tplErr').innerHTML='<div class="alert err">请先切换到源码编辑模式</div>';return}
+    content=ta.value;
+  }
   const j=await api('api/template/'+encodeURIComponent(name),{method:'PUT',body:JSON.stringify({content})});
-  if(!j.ok){$('#tplErr').innerHTML=`<div class="alert err">${esc(j.error)}</div>`;return}
-  window._tpl=content; showTpl(name);
+  if(!j.ok){
+    // 保存失败：显示服务端错误，保留本地编辑，不用本地值覆盖磁盘内容
+    $('#tplErr').innerHTML=`<div class="alert err">${esc(j.error)}</div>`;return;
+  }
+  window._tpl=content; window._tplDraft=null;
+  window._tplNotice='<div class="alert warn" style="border-color:#2b5c42;background:#12241a;color:#9fe0b8">已保存。对之后新建的任务生效。</div>';
+  refreshNav(); showTpl(name);
 }
 async function delTpl(name){
   if(!confirm('删除模板 '+name+'？'))return;
@@ -1022,6 +1513,50 @@ async function forkTpl(name){
   const j=await api('api/template/'+encodeURIComponent(name),{method:'PUT',body:JSON.stringify({content:window._tpl,fork:nn})});
   if(!j.ok){$('#tplErr').innerHTML=`<div class="alert err">${esc(j.error)}</div>`;return}
   showTpl(nn);refreshNav();
+}
+
+// ---------- 新建模板（T3）：名称预检查 + 最小合法模板 ----------
+// 与服务端 _NAME_RE 语义一致：中英文/数字/_/-，1–64 字，首字符不能是 -。
+const TPL_NAME_RE=/^[A-Za-z0-9_\u4e00-\u9fff][A-Za-z0-9_\-\u4e00-\u9fff]{0,63}$/;
+function tplNewMinimal(name,display){
+  // 最小合法模板（spec 第 6 节）：一个默认节点，其余字段用模型默认值。
+  return {id:name,name:display||name,description:'',session_preset:'independent',
+    git_delivery:{enabled:true,branch:'gdd/delivery'},
+    nodes:[{id:'node1',name:'节点1',description:''}]};
+}
+function showNewTpl(){
+  stopPoll();view={mode:'tplnew'};refreshNav();
+  $('#main').innerHTML=`<h2>新建模板</h2><div class="card" data-view="template-new">
+    <div class="row"><label>模板名（必填）</label>
+      <input id="newTplName" data-field="new-template.name" placeholder="my-template" onkeydown="if(event.key==='Enter')createTpl()">
+      <span class="hint">仅支持中英文、数字、_、-，1–64 字且不能以 - 开头；不能与已有模板重名，delivery 为内置保留名。</span></div>
+    <div class="row"><label>展示名（可选，默认同模板名）</label>
+      <input id="newTplDisplay" data-field="new-template.display-name" placeholder="我的模板" onkeydown="if(event.key==='Enter')createTpl()"></div>
+    <div class="actions">
+      <button class="pri" id="newTplCreate" data-action="create-template" onclick="createTpl()">创建模板</button>
+      <button data-action="cancel-template" onclick="refreshNav();showNew()">取消</button>
+      <span class="hint" style="align-self:center">创建后默认含一个节点；节点增删/重排请用源码模式。</span></div>
+    <div id="newTplErr"></div></div>`;
+}
+async function createTpl(){
+  const name=($('#newTplName')?.value||'').trim();
+  const display=($('#newTplDisplay')?.value||'').trim();
+  const fail=msg=>{$('#newTplErr').innerHTML=`<div class="alert err">${esc(msg)}</div>`};
+  if(!name){fail('请输入模板名');return}
+  if(!TPL_NAME_RE.test(name)){fail('模板名不合法：仅支持中英文、数字、_、-，1–64 字且不能以 - 开头');return}
+  if(name==='delivery'){fail('delivery 是内置模板保留名，请换个名字');return}
+  // 已存在模板（任意扩展名）先给快速提示；真正的 create-only 由服务端 fork 分支兜底
+  // （普通 PUT 是保存覆盖语义，大小写变体/并发同名不能只靠这里的精确匹配）。
+  const ov=await api('api/overview');
+  if(!ov.ok){fail(ov.error||'无法读取模板列表');return}
+  if((ov.templates||[]).some(t=>t.name===name)){fail(`模板 ${name} 已存在，换个名字`);return}
+  const btn=$('#newTplCreate');if(btn)btn.disabled=true;
+  const content=JSON.stringify(tplNewMinimal(name,display),null,2);
+  // 走服务端既有 fork 参数（create-only）：普通 PUT 是保存覆盖语义，
+  // 大小写变体/并发同名会覆盖已有模板；fork 分支拒绝已存在名并原子创建。
+  const j=await api('api/template/'+encodeURIComponent(name),{method:'PUT',body:JSON.stringify({content,fork:name})});
+  if(!j.ok){if(btn)btn.disabled=false;fail(j.error||'创建失败');return}
+  refreshNav();showTpl(name);
 }
 
 refreshNav();showNew();setInterval(refreshNav,5000);
@@ -1318,7 +1853,8 @@ class Handler(BaseHTTPRequestHandler):
             # 内置、PUT/DELETE 被内置只读规则拒、列表出现重名：永不可编辑删除
             if fork in BUILTINS:
                 return self._json({"ok": False, "error": f"{fork} 是内置模板保留名，请换个名字"}, 400)
-            if os.path.exists(_template_path(self.root, fork)):
+            target = _template_path(self.root, fork)
+            if os.path.exists(target):
                 return self._json({"ok": False, "error": f"模板 {fork} 已存在，换个名字"}, 400)
             content = str(body.get("content", ""))
             try:
@@ -1326,7 +1862,14 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._json({"ok": False, "error": f"模板不合法: {e}"}, 400)
             os.makedirs(_templates_dir(self.root), exist_ok=True)
-            with open(_template_path(self.root, fork), "w", encoding="utf-8") as f:
+            # 新建是 create-only：exists 检查与写入之间存在 TOCTOU 窗口（两个 tab
+            # 并发同名、大小写不敏感文件系统的大小写变体）。O_EXCL 原子创建，
+            # 保证恰一个请求成功、其余返回“已存在”且不覆盖既有文件。
+            try:
+                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            except FileExistsError:
+                return self._json({"ok": False, "error": f"模板 {fork} 已存在，换个名字"}, 400)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(content)
             return self._json({"ok": True, "name": fork})
         if name == "delivery":

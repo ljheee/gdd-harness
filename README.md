@@ -44,8 +44,13 @@ mkdir -p ~/gdd-workbench && cd ~/gdd-workbench
 PYTHONPATH=/path/to/GDD python3 -m gdd.ui --root .   # 打开 http://127.0.0.1:8765
 ```
 
-本地 Web 控制台：模板管理（内置 delivery + 自定义 YAML/JSON，fork 可编辑）、从模板启动任务、
+本地 Web 控制台：模板管理（内置 delivery + 自定义 YAML/JSON）、从模板启动任务、
 任务列表、节点流程图（当前节点/待审批高亮/门禁重试/完成态）、审批与重试一键操作、blocked 原因置顶。
+模板页默认「可视化」视图：按模板 `nodes` 顺序展示节点流程与详情；自定义 JSON 模板可直接用结构化表单
+编辑流水线级 `name`/`description`/`session_preset`/`git_delivery` 与节点多数字段（含 `subject`、`approval`、
+`entry`/`exit` 门禁），节点 `id` 只读，`mcp`/`skills` 与节点增删/重排走「源码」视图。源码视图保留原文
+查看/编辑；YAML 模板仅源码模式。内置模板（delivery）保持内置只读、不可删除，可 fork 为新模板后编辑；
+模板管理区提供「＋ 新建模板」（默认含一个节点，创建后即可用于新建任务）。
 仅监听 127.0.0.1；详见 USER_GUIDE.md 第 10 章。
 
 ### Mac app（Tauri 2 壳，`src-tauri/`）
@@ -228,6 +233,11 @@ python3 tests/test_clarify.py # 主体会话 resume / 要点澄清通道 / legac
 python3 tests/test_steer.py   # working 补充：hook 消费 / 不占锁 / 结束补送一次
 python3 tests/test_node_ext.py # 节点多个 MCP/skill：只挂主体，门禁不继承
 
+# 模板可视化/结构化编辑/新建模板（本迭代新增）
+python3.12 tests/test_template_ui_api.py    # 保存逐字段相等与非法拒绝、编辑后建任务、内置只读/fork、YAML 源码兼容、实例隔离
+python3.12 tests/test_template_ui_static.py # 表单字段覆盖与零前端依赖/文档关键词静态检查
+python3.12 tests/test_template_ui_e2e.py    # 浏览器 e2e：可视化视图、表单编辑、新建模板、未展示字段保留
+
 # Mac app（Tauri 2 壳）
 cd src-tauri && cargo test          # 配置校验 / 探测 / 进程监管单元与集成测试
 bash scripts/verify_app.sh          # D1/D14 静态检查（Tauri 配置、资源、ATS、文档）
@@ -237,6 +247,11 @@ python3.12 scripts/verify_gui.py       # D4 真实窗口（URL + WKWebView DOM +
 python3.12 scripts/verify_gui.py --check-error-dialogs  # D9/D11 错误对话框可见性（截图）
 python3.12 scripts/verify_gui.py --check-8765-reuse     # 8765 有控制台时做只读复用验证
 ```
+
+> `tests/test_template_ui_e2e.py` 需要可 `import playwright` 的 Python 解释器，并使用系统 Chrome
+> （`chromium.launch(channel="chrome", headless=True)`）。**Playwright 仅用于测试阶段的 e2e 自动化，
+> 不是产品运行时依赖**：`gdd/ui.py`、Tauri 壳与用户浏览器均不需要安装，控制台仍为零依赖内嵌单页。
+> 其余模板测试用 `python3.12`（YAML 用例需本机可用 PyYAML）。
 
 > 8765 被用户正在使用的控制台占用时，应用级脚本用测试钩子 `GDD_CONSOLE_TEST_PORT`
 > 选择空闲端口做隔离验证；生产端口固定 8765 由 `supervisor::DEFAULT_PORT` 单元测试守护。
