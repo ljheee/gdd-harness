@@ -63,13 +63,35 @@ def cmd_init(args) -> int:
             return 1
         builtin = False
 
+    records = []
     try:
-        pipeline = prepare_iteration(
-            pipeline, args.root,
-            name=getattr(args, "name", "") or "",
-            branch=getattr(args, "branch", "") or "",
-            base=getattr(args, "base", "") or "")
+        repo_urls = list(getattr(args, "repo", None) or [])
+        if repo_urls:
+            from .repos import prepare_repos
+            bases = list(getattr(args, "repo_base", None) or [])
+            specs = [{"url": url, "base": bases[i] if i < len(bases) else ""}
+                     for i, url in enumerate(repo_urls)]
+            repos_dir = (getattr(args, "repos_dir", "") or os.environ.get("GDD_REPOS")
+                         or os.path.dirname(os.path.abspath(args.root)))
+            records = prepare_repos(repos_dir, args.root, getattr(args, "name", "") or "",
+                                    specs, branch=getattr(args, "branch", "") or "")
+            pipeline = prepare_iteration(
+                pipeline, args.root,
+                name=getattr(args, "name", "") or "",
+                branch=getattr(args, "branch", "") or "",
+                base=getattr(args, "base", "") or "",
+                task_home=True)
+        else:
+            records = []
+            pipeline = prepare_iteration(
+                pipeline, args.root,
+                name=getattr(args, "name", "") or "",
+                branch=getattr(args, "branch", "") or "",
+                base=getattr(args, "base", "") or "")
     except ValueError as e:
+        if records:
+            from .repos import release_repos
+            release_repos(records)
         print(f"初始化失败: {e}")
         return 1
 
@@ -81,13 +103,19 @@ def cmd_init(args) -> int:
                 requirement = f.read()
         except OSError as e:
             print(f"读取需求文件失败: {e}")
+            if records:
+                from .repos import release_repos
+                release_repos(records)
             return 1
     else:
         requirement = ""
 
     try:
-        o.init(pipeline, requirement)
+        o.init(pipeline, requirement, repos=records)
     except (ValueError, TypeError, AttributeError, RuntimeError, KeyError) as e:
+        if records:
+            from .repos import release_repos
+            release_repos(records)
         print(f"初始化失败: {e}")
         return 1
     print(f"流水线已初始化：{pipeline.get('name', pipeline.get('id'))}"
@@ -955,11 +983,14 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("init", help="初始化流水线")
     p.add_argument("--pipeline", default="delivery", help="内置名（delivery）或 pipeline JSON 文件路径")
-    p.add_argument("--name", default="", help="迭代名。内置 delivery 必填，不能与项目目录同名，产物写入 iterations/<名字>/")
+    p.add_argument("--name", default="", help="任务名。内置 delivery 必填")
     p.add_argument("--branch", default="", help="交付分支，默认 gdd/<名字>")
     p.add_argument("--base", default="", help="从这条已有分支拉出交付分支，默认当前分支")
+    p.add_argument("--repo", action="append", default=[], help="仓库地址，可重复")
+    p.add_argument("--repo-base", action="append", default=[], help="与 --repo 顺序对应的基线分支")
+    p.add_argument("--repos-dir", default="", help="代码仓库目录。配合 --repo 使用，默认同 --root 的上一级")
     p.add_argument("--requirement", default=None, help="需求文本文件路径，- 表示 stdin")
-    p.add_argument("--root", default=".", help="项目根目录（默认当前目录）")
+    p.add_argument("--root", default=".", help="任务目录（多仓库）或项目根目录")
     p.set_defaults(func=cmd_init)
 
     p = sub.add_parser("run", help="推进流水线")

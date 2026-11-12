@@ -76,8 +76,30 @@ def prior_contracts(root: str, name: str) -> List[str]:
     return found
 
 
+def prior_task_docs(workbench: str, name: str) -> List[str]:
+    """工作台里其他任务已经写下的规格和决策。返回绝对路径，不放进仓库。"""
+    found: List[str] = []
+    if not workbench or not os.path.isdir(workbench):
+        return found
+    for entry in sorted(os.listdir(workbench)):
+        if entry == name or entry.startswith("."):
+            continue
+        for leaf in ("spec.md", "decisions.md"):
+            path = os.path.join(workbench, entry, leaf)
+            if os.path.isfile(path):
+                found.append(path)
+    return found
+
+
+def task_files_occupied(task_dir: str) -> bool:
+    for leaf in ("goal.md", "spec.md", "plan.md"):
+        if os.path.isfile(os.path.join(task_dir, leaf)):
+            return True
+    return False
+
+
 def prepare(pipeline: Dict, root: str, name: str = "", branch: str = "",
-            base: str = "") -> Dict:
+            base: str = "", task_home: bool = False) -> Dict:
     """绑定占位符。无占位符的自定义流水线保持原路径。"""
     data = json.loads(json.dumps(pipeline))
     name = (name or "").strip()
@@ -90,6 +112,25 @@ def prepare(pipeline: Dict, root: str, name: str = "", branch: str = "",
     if base:
         base = validate_branch(base)
     if not needs_iteration(data):
+        if task_home:
+            if not name:
+                raise ValueError("初始化必须提供 --name")
+            resolved = branch or default_branch(name)
+            validate_branch(resolved)
+            gd = data.get("git_delivery")
+            if not isinstance(gd, dict):
+                data["git_delivery"] = {"enabled": True, "branch": resolved}
+            elif gd.get("enabled", True) is not False:
+                gd["branch"] = resolved
+            data["iteration"] = {
+                "name": name,
+                "output": "",
+                "branch": resolved,
+                "base": base,
+                "prior": [],
+                "task_home": True,
+            }
+            return data
         if branch and isinstance(data.get("git_delivery"), dict):
             data["git_delivery"]["branch"] = branch
         if name or branch or base:
@@ -104,6 +145,34 @@ def prepare(pipeline: Dict, root: str, name: str = "", branch: str = "",
     if not name:
         raise ValueError("这条流水线按迭代落产物，初始化必须提供 --name")
     bind_output = "{{output}}" in json.dumps(data, ensure_ascii=False)
+    if task_home:
+        if bind_output and task_files_occupied(root):
+            raise ValueError(
+                f"任务目录已有文档，这个名字属于已有任务。"
+                f"换一个任务名，已有目录保持不动")
+        out = ""
+        resolved = branch or default_branch(name)
+        validate_branch(resolved)
+        text = json.dumps(data, ensure_ascii=False)
+        text = text.replace("{{output}}/", "").replace("{{output}}", ".")
+        text = text.replace("{{name}}", name)
+        data = json.loads(text)
+        gd = data.get("git_delivery")
+        if not isinstance(gd, dict):
+            data["git_delivery"] = {"enabled": True, "branch": resolved}
+        else:
+            data["git_delivery"]["branch"] = resolved
+        data["iteration"] = {
+            "name": name,
+            "output": out,
+            "branch": resolved,
+            "base": base,
+            "prior": [],
+            "prior_outside": prior_task_docs(os.path.dirname(os.path.abspath(root)), name)
+            if bind_output else [],
+            "task_home": True,
+        }
+        return data
     if bind_output and name == project_dirname(root):
         raise ValueError(
             f"迭代名不能与项目目录同名（{name}）。"

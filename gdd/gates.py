@@ -571,19 +571,20 @@ def build_review_prompt(
     fb_part = ""
     if feedback:
         fb_part = f"\n上一轮评审未通过或被门禁打回，反馈（逐项核实是否已处理）：\n{feedback}\n"
+    shown = (output_dir or "").strip() or "."
     return f"""{marker}
 你是 GDD 流水线「{node.name}」节点的执行主体，负责本次实现的代码评审。
 本节点使用独立、只读的评审会话：不复用开发实现节点的会话或结论。
 
 节点ID: {node.id}
 工作目录：当前项目根目录。
-本次产物目录：{output_dir}
+本次产物目录：{shown}
 
 评审依据（必须自己读文件核实，不采信开发节点的自评、impl-ledger 的结论或开发会话的历史）：
-- {output_dir}/goal.md：已确认的目标与验收标准
-- {output_dir}/spec.md：已确认的规格、边界与决定
-- {output_dir}/plan.md：已确认的实现方案与任务拆分
-- {output_dir}/impl-ledger.md：开发核销台账（只作线索，不作为结论）
+- {shown}/goal.md：已确认的目标与验收标准
+- {shown}/spec.md：已确认的规格、边界与决定
+- {shown}/plan.md：已确认的实现方案与任务拆分
+- {shown}/impl-ledger.md：开发核销台账（只作线索，不作为结论）
 - 本次 implement 基线以来的改动（见下方 git diff/status 摘要）
 
 只读纪律：

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -224,35 +225,40 @@ def main():
           f"非法 YAML 创建任务返回 JSON（{r.get('error')}）")
     r = c.post("/api/tasks", {"name": "t1", "template": "mine", "requirement": "做个小工具"})
     check(r["ok"], "任务创建成功")
-    r = c.post("/api/tasks", {"name": "proj-a", "template": "delivery",
-                              "requirement": "x", "iteration": "proj-a"})
-    check(not r["ok"] and "项目目录" in r.get("error", ""),
-          f"迭代名与任务名相同被拒绝（{r.get('error')}）")
     r = c.post("/api/tasks", {"name": "proj-a", "template": "delivery", "requirement": "x"})
-    check(not r["ok"] and "迭代名" in r.get("error", ""),
-          f"delivery 缺迭代名被拒绝（{r.get('error')}）")
-    r = c.post("/api/tasks", {"name": "proj-a", "template": "delivery",
-                              "requirement": "做评审", "iteration": "round-1"})
-    check(r["ok"], f"迭代名与任务名不同可以创建（{r.get('error')}）")
-    with open(os.path.join(workdir, "proj-a", ".gdd", "pipeline.json"), encoding="utf-8") as f:
+    check(not r["ok"] and "仓库" in r.get("error", ""),
+          f"delivery 缺仓库被拒绝（{r.get('error')}）")
+    src = os.path.join(workdir, "src-repo")
+    os.makedirs(src)
+    subprocess.run(["git", "init", "-q", "-b", "master"], cwd=src, check=True)
+    subprocess.run(["git", "-c", "user.name=gdd", "-c", "user.email=gdd@harness.local",
+                    "commit", "--allow-empty", "-m", "base"], cwd=src, check=True)
+    gdd_ui.Handler.repos = os.path.join(workdir, "code")
+    r = c.post("/api/tasks", {"name": "round-1", "template": "delivery",
+                              "requirement": "做评审",
+                              "repos": [{"url": src, "base": "master"}]})
+    check(r["ok"], f"填写仓库后可以创建（{r.get('error')}）")
+    with open(os.path.join(workdir, "round-1", ".gdd", "pipeline.json"), encoding="utf-8") as f:
         pipe_text = f.read()
-    check("iterations/round-1/" in pipe_text and "iterations/proj-a/" not in pipe_text,
-          "产物目录用迭代名，不用项目名")
-    kept = os.path.join(workdir, "proj-a", "iterations", "round-1", "goal.md")
-    os.makedirs(os.path.dirname(kept), exist_ok=True)
+    check("goal.md" in pipe_text and "iterations/" not in pipe_text,
+          "产物直接在任务目录，不再写 iterations/")
+    check(os.path.isdir(os.path.join(workdir, "round-1", "worktrees")), "任务目录里有 worktrees")
+    kept = os.path.join(workdir, "round-1", "goal.md")
     with open(kept, "w", encoding="utf-8") as f:
         f.write("上一轮\n")
-    r = c.post("/api/task/proj-a/action", {"op": "reset"})
+    r = c.post("/api/task/round-1/action", {"op": "reset"})
     check(r["ok"], "重置后可以再初始化")
-    r = c.post("/api/tasks", {"name": "proj-a", "template": "delivery",
-                              "requirement": "下一轮", "iteration": "round-1"})
-    check(not r["ok"] and "已有文件" in r.get("error", ""),
-          f"同名迭代目录拒绝覆盖（{r.get('error')}）")
-    check(open(kept, encoding="utf-8").read() == "上一轮\n", "已有迭代文件保持不动")
-    r = c.post("/api/tasks", {"name": "proj-a", "template": "delivery",
-                              "requirement": "下一轮", "iteration": "round-2"})
-    check(r["ok"], f"同一项目换迭代名可以再初始化（{r.get('error')}）")
-    check(open(kept, encoding="utf-8").read() == "上一轮\n", "新迭代不改上一轮目录")
+    r = c.post("/api/tasks", {"name": "round-1", "template": "delivery",
+                              "requirement": "下一轮",
+                              "repos": [{"url": src, "base": "master"}]})
+    check(not r["ok"] and "已有" in r.get("error", ""),
+          f"同名任务目录拒绝覆盖（{r.get('error')}）")
+    check(open(kept, encoding="utf-8").read() == "上一轮\n", "已有任务文件保持不动")
+    r = c.post("/api/tasks", {"name": "round-2", "template": "delivery",
+                              "requirement": "下一轮",
+                              "repos": [{"url": src, "base": "master"}]})
+    check(r["ok"], f"换任务名可以再初始化（{r.get('error')}）")
+    check(open(kept, encoding="utf-8").read() == "上一轮\n", "新任务不改上一轮目录")
     check(os.path.exists(os.path.join(workdir, "t1", ".gdd", "state.json")), "state.json 已生成")
     d = c.get("/api/task/t1")
     check(d["ok"] and d["status"] == "running" and d["nodes"][0]["phase"] == "pending",

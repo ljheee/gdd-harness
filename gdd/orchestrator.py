@@ -131,7 +131,10 @@ class Orchestrator:
 
     # ------------------------------------------------------------ init / load
 
-    def init(self, pipeline_dict: Dict[str, Any], requirement: str = "") -> None:
+    def init(self, pipeline_dict: Dict[str, Any], requirement: str = "",
+             repos: list = None) -> None:
+        self._init_repos = repos or []
+        self._reject_nested_git_root(pipeline_dict)
         if os.path.exists(self.state_path):
             raise RuntimeError(f"已初始化：{self.state_path}（如需重来请先删除 .gdd 或 gdd reset）")
         self._reject_unbound_iteration(pipeline_dict)
@@ -157,8 +160,25 @@ class Orchestrator:
             self._input_text.encode("utf-8", "replace")).hexdigest()
         self.state["pipeline_fingerprint"] = self._pipeline_fingerprint()
         self._remember_iteration(pipeline_dict)
+        if self._init_repos:
+            self.state["repos"] = self._init_repos
         self._git_delivery_setup()
         self._save()
+
+    def _reject_nested_git_root(self, pipeline_dict: Dict[str, Any]) -> None:
+        """任务根必须自己就是 git 顶层。落在仓库里面时直接拒绝，不切外层分支，也不另开 worktree。"""
+        if not self._effective_delivery_branch(pipeline_dict):
+            return
+        inside = self._git_proc("rev-parse", "--is-inside-work-tree")
+        if inside is None or inside.returncode != 0:
+            return
+        top = self._git_proc("rev-parse", "--show-toplevel")
+        toplevel = top.stdout.strip() if (top and top.returncode == 0) else ""
+        if not toplevel or os.path.realpath(toplevel) == os.path.realpath(self.root):
+            return
+        raise RuntimeError(
+            f"任务根 {self.root} 位于 git 仓库 {toplevel} 里面，不能在这里初始化。"
+            f"工作台要放在仓库外面。命令行的 --root 指到工作台下的任务目录，不要指到仓库里面。")
 
     def _reject_unbound_iteration(self, pipeline_dict: Dict[str, Any]) -> None:
         """占位符必须在初始化前换成这次的目录和分支。"""
@@ -266,9 +286,19 @@ class Orchestrator:
         }
         if it.get("base"):
             self.state["iteration_base"] = str(it["base"])
-        prior = it.get("prior") or []
+        if it.get("task_home"):
+            self.state["iteration"]["task_home"] = True
+        outside = it.get("prior_outside") or []
+        prior = outside if isinstance(outside, list) and outside else (it.get("prior") or [])
         if isinstance(prior, list):
             self.state["prior_contracts"] = [str(p) for p in prior if isinstance(p, str) and p]
+        if it.get("task_home"):
+            self.state["contract_files"] = [
+                "goal.md", "spec.md", "plan.md", "decisions.md",
+            ]
+            self.state["acceptance_file"] = "acceptance.feature"
+            self.state["verify_file"] = "verify.md"
+            return
         if not out:
             return
         self.state["contract_files"] = [
@@ -686,22 +716,49 @@ class Orchestrator:
         """返回原始 CompletedProcess（None = git 不可用/超时）。"""
         try:
             return subprocess.run(
-                ["git", *args], cwd=self.root, capture_output=True, text=True,
+                ["git", *args], cwd=getattr(self, "_git_cwd", None) or self.root,
+                capture_output=True, text=True,
                 encoding="utf-8", errors="replace", timeout=timeout)
         except (OSError, subprocess.TimeoutExpired):
             return None
 
     def _change_summary(self, node_id: str = "") -> str:
-        # change_aware 基线按节点记（baseline_commit:<node_id>）；空 node_id 时
-        # 回退「管线序最新」基线或 legacy 全局单槽（存量实例兼容）。
-        # P2-8：曾按 state 键名字母序取「最新」（sorted() 对
-        # baseline_commit:n1/n2/n10 排出 n1<n10<n2 的字典序≠管线序），
-        # 多 marker 自定义模板的 change_aware 门禁对着错误 diff 验证、
-        # 把前序节点已交付内容归因当前节点。正确序 = baseline 事件在
-        # history 中的记录序 = 管线推进序（事件只在 entry 通过时按序写入）
-        baseline = (self.state.get(f"baseline_commit:{node_id}")
-                    if node_id else None)
-        if not baseline:
+        repos = [r for r in (self.state.get("repos") or [])
+                 if isinstance(r, dict) and r.get("worktree")]
+        if repos and not getattr(self, "_git_cwd", None):
+            chunks = []
+            for repo in repos:
+                self._git_cwd = repo["worktree"]
+                try:
+                    text = self._change_summary(node_id)
+                finally:
+                    self._git_cwd = None
+                chunks.append(f"[{repo.get('name')}]\n{text}")
+            return "\n\n".join(chunks)
+        # 多仓库时每个检出只用自己的基线。另一份仓库的 SHA 在这里是坏对象，
+        # diff 会空掉，门禁就看不到这份仓库的改动。
+        repo = self._active_repo()
+        if repo:
+            baseline = self._repo_baseline(repo["name"], node_id) if node_id else ""
+            if not baseline:
+                order = self.pipeline.node_order()
+                keyed = sorted(
+                    ((k, v) for k, v in self.state.items()
+                     if isinstance(k, str) and k.startswith("baseline_commits:")
+                     and isinstance(v, dict) and v.get(repo["name"])),
+                    key=lambda kv: order.get(kv[0].rsplit(":", 1)[1], -1))
+                baseline = keyed[-1][1].get(repo["name"]) if keyed else None
+        else:
+            # change_aware 基线按节点记（baseline_commit:<node_id>）；空 node_id 时
+            # 回退「管线序最新」基线或 legacy 全局单槽（存量实例兼容）。
+            # P2-8：曾按 state 键名字母序取「最新」（sorted() 对
+            # baseline_commit:n1/n2/n10 排出 n1<n10<n2 的字典序≠管线序），
+            # 多 marker 自定义模板的 change_aware 门禁对着错误 diff 验证、
+            # 把前序节点已交付内容归因当前节点。正确序 = baseline 事件在
+            # history 中的记录序 = 管线推进序（事件只在 entry 通过时按序写入）
+            baseline = (self.state.get(f"baseline_commit:{node_id}")
+                        if node_id else None)
+        if not baseline and not repo:
             order = self.pipeline.node_order()  # 节点 id -> 管线序
             keyed = sorted(
                 ((k, v) for k, v in self.state.items()
@@ -731,6 +788,23 @@ class Orchestrator:
         if cfg is None or not cfg.enabled:
             self._record("git_delivery_skip", reason="git_delivery 未启用")
             return
+        if self.state.get("repos"):
+            snaps = {}
+            for repo in self._repo_records():
+                self._git_cwd = repo["worktree"]
+                try:
+                    fer = self._git_proc("for-each-ref", "refs/heads/",
+                                         "--format=%(refname:short) %(objectname)")
+                finally:
+                    self._git_cwd = None
+                if fer is not None and fer.returncode == 0:
+                    snaps[repo["name"]] = dict(
+                        ln.strip().split() for ln in fer.stdout.splitlines()
+                        if len(ln.strip().split()) == 2)
+            self.state["git_branch_snapshots"] = snaps
+            self._record("git_delivery_ready", branch=cfg.branch,
+                         repos=len(self.state["repos"]))
+            return
         inside = self._git_proc("rev-parse", "--is-inside-work-tree")
         if inside is None or inside.returncode != 0:
             init = self._git_proc("init")
@@ -747,13 +821,14 @@ class Orchestrator:
             top = self._git_proc("rev-parse", "--show-toplevel")
             toplevel = top.stdout.strip() if (top and top.returncode == 0) else ""
             if toplevel and os.path.realpath(toplevel) != os.path.realpath(self.root):
-                # 持久化停用（仅记事件不落盘时，_deliver_git 仍会在 exit 时切分支劫持外层仓）
+                # init 已先拒绝这条路径。这里是漏检时的保护：状态已经写下，不能再抛回去，
+                # 也不能去切外层仓的分支。
                 self.state["git_delivery_disabled"] = True
                 self.state["git_delivery_disabled_reason"] = (
                     f"任务根位于外层 git 仓的子目录（toplevel {toplevel}）")
                 self._record("git_delivery_skip", reason=(
                     f"检测到外层 git 仓（toplevel {toplevel} ≠ 任务根 {self.root}）："
-                    f"已永久停用 git 交付；如需启用请在任务根单独 git init 后 gdd reset 重开"))
+                    f"已停用 git 交付，避免切换外层仓库的分支"))
                 return
         base = str(self.state.get("iteration_base") or "").strip()
         if base:
@@ -845,7 +920,27 @@ class Orchestrator:
           切回交付分支后工作区无改动但提交滞留他分支——比对
           log <delivery_branch>..HEAD 检出，记失败并提示，绝不静默丢交付；
         - 推送失败仅记录事件，不阻塞、不打回。
+        多仓库时每个 worktree 各提交一次，任务文档留在任务目录。
         """
+        repos = [r for r in (self.state.get("repos") or [])
+                 if isinstance(r, dict) and r.get("worktree")]
+        if repos and not getattr(self, "_git_cwd", None):
+            for repo in repos:
+                self._git_cwd = repo["worktree"]
+                try:
+                    self._deliver_git(node)
+                finally:
+                    self._git_cwd = None
+            stray = self._stray_task_files()
+            if stray:
+                shown = "、".join(stray[:8])
+                self.state["commit_failed"] = {
+                    "node": node.id,
+                    "reason": f"代码写在任务目录而不是 worktrees：{shown}",
+                }
+                self._record("git_commit_fail", node=node.id,
+                             reason=self.state["commit_failed"]["reason"])
+            return
         cfg = self.pipeline.git_delivery
         if not cfg.enabled or self.state.get("git_delivery_disabled"):
             return
@@ -869,7 +964,19 @@ class Orchestrator:
                     "node": node_id, "ref": stray,
                     "reason": "提交滞留 %s，交付不完整" % stray}
             else:
-                self.state["commit_failed"] = {"node": node_id, "reason": reason}
+                repo = self._active_repo()
+                if repo:
+                    pending = self.state.get("commit_failed_repos")
+                    if not isinstance(pending, dict):
+                        pending = {}
+                    pending[repo["name"]] = {"node": node_id, "reason": reason}
+                    self.state["commit_failed_repos"] = pending
+                    self.state["commit_failed"] = {
+                        "node": node_id,
+                        "reason": f"{repo['name']}: {reason}",
+                    }
+                else:
+                    self.state["commit_failed"] = {"node": node_id, "reason": reason}
         cur = self._git_proc("symbolic-ref", "--short", "HEAD")
         cur_branch = cur.stdout.strip() if (cur and cur.returncode == 0) else ""
         stray_ref = ""  # 滞留位置标识：分支名或 detached 短 SHA（检测不依赖分支名非空）
@@ -908,6 +1015,9 @@ class Orchestrator:
         # 声明产物展开到具体文件（glob 是一等语义，与门禁/快照同一匹配语义）：
         # 展开后逐文件核对 ignore，防 glob 声明的产物被 .gitignore 挡住时静默不交付
         # （stray_ref 已警示：产物可能随分支切换被回收，missing 时归因滞留而非误报“被删”）
+        # 多仓库时任务根上的文档留在任务目录，不拿去 worktree 里 git add。
+        repo_now = self._active_repo()
+        anchor = os.path.realpath(repo_now["worktree"]) if repo_now else ""
         declared: List[str] = []
         missing: List[str] = []
         outside: List[str] = []
@@ -923,8 +1033,22 @@ class Orchestrator:
                 continue
             hits = [m for m in gates._artifact_matches(self.root, p)
                     if os.path.isfile(m)]
-            if hits:
-                declared.extend(os.path.relpath(m, self.root) for m in hits)
+            if repo_now and not hits:
+                hits = [m for m in gates._artifact_matches(repo_now["worktree"], p)
+                        if os.path.isfile(m)]
+            kept: List[str] = []
+            for m in hits:
+                real = os.path.realpath(m)
+                if repo_now:
+                    if real != anchor and not real.startswith(anchor + os.sep):
+                        continue
+                    kept.append(os.path.relpath(real, anchor))
+                else:
+                    kept.append(os.path.relpath(m, self.root))
+            if kept:
+                declared.extend(kept)
+            elif repo_now and hits:
+                continue
             else:
                 missing.append(str(a.path))
         # P2-5 / P1-3：排除根级与任意深度嵌套 .gdd 及其下文件（见 _GIT_ADD_PATHSPEC）
@@ -1017,10 +1141,33 @@ class Orchestrator:
             # 本轮 commit 真实成功且零失败分支置位旗标：上轮警示解除
             # （P1-4：曾以 before/after 槽状态推断「本轮成败」，ignored-skip
             # fall-through 无 return 前置位使推断翻车——重复犯例被误清）
-            self.state.pop("commit_failed", None)
-            if commit_failed_before:
-                self._record("commit_failed_cleared", node=node.id,
-                             reason="本轮交付成功，上轮警示解除")
+            # 多仓库的失败按仓库记。后一个仓库提交成功只清自己的槽。
+            repo = self._active_repo()
+            if repo:
+                pending = self.state.get("commit_failed_repos")
+                if not isinstance(pending, dict):
+                    pending = {}
+                had = repo["name"] in pending
+                pending.pop(repo["name"], None)
+                if pending:
+                    self.state["commit_failed_repos"] = pending
+                    name, slot = next(iter(pending.items()))
+                    slot = slot if isinstance(slot, dict) else {}
+                    self.state["commit_failed"] = {
+                        "node": slot.get("node") or node.id,
+                        "reason": f"{name}: {slot.get('reason') or ''}",
+                    }
+                else:
+                    self.state.pop("commit_failed_repos", None)
+                    self.state.pop("commit_failed", None)
+                    if commit_failed_before or had:
+                        self._record("commit_failed_cleared", node=node.id,
+                                     reason="本轮交付成功，上轮警示解除")
+            else:
+                self.state.pop("commit_failed", None)
+                if commit_failed_before:
+                    self._record("commit_failed_cleared", node=node.id,
+                                 reason="本轮交付成功，上轮警示解除")
         self._record("git_commit", node=node.id, branch=cfg.branch,
                      sha=(sha.stdout.strip() if (sha and sha.returncode == 0) else None))
         remote = cfg.remote
@@ -1033,14 +1180,36 @@ class Orchestrator:
             return
         p = self._git_proc("push", "-u", remote, cfg.branch, timeout=120)
         if p is not None and p.returncode == 0:
-            self.state.pop("push_failed", None)  # 仅清推送失败槽；stray 警示独立保留
-            # push 成功也同步刷新分支快照（交付分支 tip 已前移，防误报滞留）
+            repo = self._active_repo()
+            if repo:
+                pending = self.state.get("push_failed_repos") or {}
+                if isinstance(pending, dict):
+                    pending.pop(repo["name"], None)
+                    if pending:
+                        self.state["push_failed_repos"] = pending
+                    else:
+                        self.state.pop("push_failed_repos", None)
+            else:
+                self.state.pop("push_failed", None)  # 仅清推送失败槽；stray 警示独立保留
             self._refresh_branch_snapshot()
-            self._record("git_push", node=node.id, remote=remote, branch=cfg.branch)
+            self._record("git_push", node=node.id, remote=remote, branch=cfg.branch,
+                         repo=repo["name"] if repo else None)
         else:
             reason = ((p.stderr if p else "") or "").strip()[:200] or "push 失败"
-            self.state["push_failed"] = {"node": node.id, "remote": remote, "reason": reason}
-            self._record("git_push_fail", node=node.id, remote=remote, reason=reason)
+            repo = self._active_repo()
+            if repo:
+                pending = self.state.get("push_failed_repos")
+                if not isinstance(pending, dict):
+                    pending = {}
+                pending[repo["name"]] = {
+                    "node": node.id, "remote": remote, "reason": reason,
+                    "branch": cfg.branch,
+                }
+                self.state["push_failed_repos"] = pending
+            else:
+                self.state["push_failed"] = {"node": node.id, "remote": remote, "reason": reason}
+            self._record("git_push_fail", node=node.id, remote=remote, reason=reason,
+                         repo=repo["name"] if repo else None)
 
     def _refresh_branch_snapshot(self) -> None:
         """刷新分支快照——**只更新交付分支自己的 tip**（P1-5）。
@@ -1051,7 +1220,17 @@ class Orchestrator:
         真实滞留的 stray_delivery 并记假「已并入」。其他分支的 tip 是
         「待并入的滞留」本身，绝不是基线的一部分。
         """
-        snap = self.state.get("git_branch_snapshot")
+        repo = self._active_repo()
+        if repo:
+            snaps = self.state.get("git_branch_snapshots")
+            if not isinstance(snaps, dict):
+                snaps = {}
+            snap = snaps.get(repo["name"])
+            if not isinstance(snap, dict):
+                snap = {}
+        else:
+            snaps = None
+            snap = self.state.get("git_branch_snapshot")
         branch = self.pipeline.git_delivery.branch
         rp = self._git_proc("rev-parse", branch)
         if rp is not None and rp.returncode == 0:
@@ -1060,7 +1239,11 @@ class Orchestrator:
                 if snap is None:
                     snap = {}
                 snap[branch] = tip
-                self.state["git_branch_snapshot"] = snap
+                if repo:
+                    snaps[repo["name"]] = snap
+                    self.state["git_branch_snapshots"] = snaps
+                else:
+                    self.state["git_branch_snapshot"] = snap
 
     def _stray_from_branch_snapshot(self, delivery_branch: str) -> str:
         """分支快照对比：返回未并入交付分支的滞留分支名（无则空串）。
@@ -1075,7 +1258,12 @@ class Orchestrator:
         一律不指控；有快照时只指控「相对快照新滞留」的分支。用户基线变更
         的最终裁决者是 change_aware 门禁与人工审批，不是散落检测。
         """
-        snap = self.state.get("git_branch_snapshot")
+        repo = self._active_repo()
+        if repo:
+            snaps = self.state.get("git_branch_snapshots")
+            snap = snaps.get(repo["name"]) if isinstance(snaps, dict) else None
+        else:
+            snap = self.state.get("git_branch_snapshot")
         if not snap:
             # P2-10：init 基线失败提前 return 未写快照 → 此处若照常对比会把
             # 用户 init 后的正常提交全部指控为散落（检测静默变误伤机器）。
@@ -1116,6 +1304,40 @@ class Orchestrator:
 
         stray_delivery（提交滞留警示）不走此路径：滞留提交不在交付分支，补推无意义。
         """
+        pending = self.state.get("push_failed_repos")
+        if isinstance(pending, dict) and pending:
+            for name in list(pending):
+                repo = next((r for r in self._repo_records() if r["name"] == name), None)
+                if not repo:
+                    continue
+                pf = pending.get(name) or {}
+                self._git_cwd = repo["worktree"]
+                try:
+                    remote = pf.get("remote") or ""
+                    branch = pf.get("branch") or self.pipeline.git_delivery.branch
+                    if not remote:
+                        rl = self._git_proc("remote")
+                        remotes = rl.stdout.split() if (rl and rl.returncode == 0) else []
+                        remote = remotes[0] if remotes else ""
+                    if not remote:
+                        continue
+                    pushed = self._git_proc("push", "-u", remote, branch, timeout=120)
+                    if pushed is not None and pushed.returncode == 0:
+                        pending.pop(name, None)
+                        self._record("git_push", node=pf.get("node"), remote=remote,
+                                     branch=branch, repo=name, note="recovered")
+                    else:
+                        self._record("git_push_retry_fail", node=pf.get("node"), repo=name,
+                                     reason=(((pushed.stderr if pushed else "") or "").strip()[:200])
+                                     or "push 失败")
+                finally:
+                    self._git_cwd = None
+            if pending:
+                self.state["push_failed_repos"] = pending
+            else:
+                self.state.pop("push_failed_repos", None)
+            self._save()
+            return
         pf = self.state.get("push_failed")
         if not pf:
             return
@@ -1444,6 +1666,13 @@ class Orchestrator:
             extra += ("\n\n其他迭代已经写下的规格和决策，只读，不要修改这些文件：\n"
                       + "\n".join(f"- {p}" for p in prior)
                       + "\n若这次选择改变其中已经写下的决定，按决策定级契约提交。")
+        repos = [r for r in (self.state.get("repos") or []) if isinstance(r, dict)]
+        if repos:
+            lines = "\n".join(
+                f"- {r.get('name')}: worktrees/{r.get('name')}（分支 {r.get('branch')}，基线 {r.get('base')}）"
+                for r in repos)
+            extra += ("\n\n代码只改这些检出。goal.md、spec.md、plan.md 等文档写在任务目录根上，"
+                      "不要写进检出：\n" + lines + "\n")
         rev = self.state.get("revision") or {}
         if rev.get("active") and node.id in (rev.get("nodes") or []):
             extra += "\n\n" + revision_mod.rerun_for(files)
@@ -1466,9 +1695,55 @@ class Orchestrator:
                 return n
         return None
 
+    def _repo_records(self) -> List[dict]:
+        return [r for r in (self.state.get("repos") or [])
+                if isinstance(r, dict) and r.get("name") and r.get("worktree")]
+
+    def _active_repo(self) -> Optional[dict]:
+        cwd = getattr(self, "_git_cwd", None)
+        if not cwd:
+            return None
+        for repo in self._repo_records():
+            if os.path.realpath(repo["worktree"]) == os.path.realpath(cwd):
+                return repo
+        return None
+
+    def _repo_baseline(self, name: str, node_id: str) -> str:
+        per = self.state.get(f"baseline_commits:{node_id}")
+        if isinstance(per, dict):
+            return str(per.get(name) or "")
+        return ""
+
+    def _stray_task_files(self) -> List[str]:
+        """写在任务根、却不在 worktrees 里的代码。文档名单内的文件留在任务根。"""
+        allowed = {
+            "requirement.md", "survey.md", "goal.md", "spec.md", "plan.md",
+            "decisions.md", "acceptance.feature", "impl-ledger.md", "review.md",
+            "test-report.md", "verify.md", "delivery.md", "RELEASE-CHECKLIST.md",
+        }
+        found = []
+        root = self.root
+        for dirpath, dirnames, filenames in os.walk(root):
+            rel_dir = os.path.relpath(dirpath, root)
+            if rel_dir == ".":
+                dirnames[:] = [d for d in dirnames if d not in (".gdd", "worktrees")]
+            else:
+                top = rel_dir.split(os.sep)[0]
+                if top in (".gdd", "worktrees"):
+                    dirnames[:] = []
+                    continue
+            for name in filenames:
+                rel = name if rel_dir == "." else os.path.join(rel_dir, name)
+                if rel_dir == "." and name in allowed:
+                    continue
+                found.append(rel)
+        return found
+
     def _output_dir(self) -> str:
-        """本次迭代的产物目录：绑定命名迭代时取值，否则回退 docs/。"""
+        """本次迭代的产物目录。任务目录模式就是任务根本身，否则回退 docs/。"""
         it = self.state.get("iteration") or {}
+        if it.get("task_home"):
+            return ""
         out = str(it.get("output") or "").strip()
         return out or "docs"
 
@@ -1884,6 +2159,10 @@ class Orchestrator:
         impl = self._implement_node()
         if impl is None:
             return ""
+        per = self.state.get(f"baseline_commits:{impl.id}")
+        if isinstance(per, dict) and per and self._repo_records():
+            if all(self._repo_baseline(r["name"], impl.id) for r in self._repo_records()):
+                return "per-repo"
         return str(self.state.get(f"baseline_commit:{impl.id}") or "")
 
     def _review_change_summary(self, baseline: str) -> str:
@@ -1892,6 +2171,19 @@ class Orchestrator:
         评审会话只有 Read/Grep/Glob（无 Bash），跑不了 git；diff 由 harness
         附进 prompt。未跟踪文件在 status 里列出，评审可用 Read 自行核实。
         """
+        repos = self._repo_records()
+        impl = self._implement_node()
+        if repos and impl is not None and not getattr(self, "_git_cwd", None):
+            chunks = []
+            for repo in repos:
+                sha = self._repo_baseline(repo["name"], impl.id)
+                self._git_cwd = repo["worktree"]
+                try:
+                    text = self._review_change_summary(sha or baseline)
+                finally:
+                    self._git_cwd = None
+                chunks.append(f"[{repo.get('name')}]\n{text}")
+            return "\n\n".join(chunks)
         parts: List[str] = []
         stat = self._git("diff", "--stat", baseline)
         if stat:
@@ -2034,15 +2326,34 @@ class Orchestrator:
                     pns["entry_bounces"] = 0
             self._record("entry_pass", node=node.id, reason=verdict.reason)
             if node.baseline_marker:
-                # change_aware 基线按节点记（首个 change_aware 节点也要）：
-                # 全局单槽只记第一次基线，第二个 change_aware 节点的 diff 会含
-                # 前序节点已提交内容（代码自己注释警告过的多计失败模式）
-                head = self._git("rev-parse", "HEAD")
-                if head:
-                    key = f"baseline_commit:{node.id}"
+                repos = self._repo_records()
+                if repos:
+                    # 与单仓一样：第一次 entry 通过时记下，后面的 entry 不覆盖。
+                    # 覆盖会把评审范围缩到最近一次进入之后。
+                    key = f"baseline_commits:{node.id}"
                     if not self.state.get(key):
-                        self.state[key] = head
-                        self._record("baseline", node=node.id, commit=head[:10])
+                        saved = {}
+                        for repo in repos:
+                            self._git_cwd = repo["worktree"]
+                            try:
+                                head = self._git("rev-parse", "HEAD")
+                            finally:
+                                self._git_cwd = None
+                            if head:
+                                saved[repo["name"]] = head
+                        if len(saved) == len(repos):
+                            self.state[key] = saved
+                            shared = f"baseline_commit:{node.id}"
+                            if not self.state.get(shared):
+                                self.state[shared] = next(iter(saved.values()))
+                            self._record("baseline", node=node.id, commit="multi")
+                else:
+                    head = self._git("rev-parse", "HEAD")
+                    if head:
+                        key = f"baseline_commit:{node.id}"
+                        if not self.state.get(key):
+                            self.state[key] = head
+                            self._record("baseline", node=node.id, commit=head[:10])
             self._save()
             return True
         if verdict.gate_error:
@@ -3338,12 +3649,31 @@ class Orchestrator:
             # 不可复用 _refresh_branch_snapshot（只推交付 tip——给 push 用，
             # 防止误清真滞留）；此处人工已裁决滞留属本人/已处置，side tip
             # 必须纳入基线，否则下一交付立刻按旧快照再报同一 stray。
-            fer = self._git_proc("for-each-ref", "refs/heads/",
-                                 "--format=%(refname:short) %(objectname)")
-            if fer is not None and fer.returncode == 0:
-                self.state["git_branch_snapshot"] = dict(
-                    ln.strip().split() for ln in fer.stdout.splitlines()
-                    if len(ln.strip().split()) == 2)
+            repos = self._repo_records()
+            if repos:
+                snaps = self.state.get("git_branch_snapshots")
+                if not isinstance(snaps, dict):
+                    snaps = {}
+                for repo in repos:
+                    self._git_cwd = repo["worktree"]
+                    try:
+                        fer = self._git_proc(
+                            "for-each-ref", "refs/heads/",
+                            "--format=%(refname:short) %(objectname)")
+                    finally:
+                        self._git_cwd = None
+                    if fer is not None and fer.returncode == 0:
+                        snaps[repo["name"]] = dict(
+                            ln.strip().split() for ln in fer.stdout.splitlines()
+                            if len(ln.strip().split()) == 2)
+                self.state["git_branch_snapshots"] = snaps
+            else:
+                fer = self._git_proc("for-each-ref", "refs/heads/",
+                                     "--format=%(refname:short) %(objectname)")
+                if fer is not None and fer.returncode == 0:
+                    self.state["git_branch_snapshot"] = dict(
+                        ln.strip().split() for ln in fer.stdout.splitlines()
+                        if len(ln.strip().split()) == 2)
             self._record("stray_delivery_acknowledged",
                          reason="人工确认滞留警示已处置，快照刷新为新基线")
             self._save()

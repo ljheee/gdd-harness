@@ -56,6 +56,35 @@ _live: dict = {}  # task -> {seq, events, chars, cond}
 
 # ---------------------------------------------------------------- 工具
 
+def _parse_repos(raw):
+    """仓库文本或列表。每行「地址」或「地址 基线分支」。"""
+    if raw in (None, ""):
+        return []
+    if isinstance(raw, str):
+        specs = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) > 2:
+                raise ValueError(f"仓库行只能是地址和可选基线分支：{line}")
+            specs.append({"url": parts[0], "base": parts[1] if len(parts) == 2 else ""})
+        return specs
+    if isinstance(raw, list):
+        specs = []
+        for item in raw:
+            if isinstance(item, str):
+                specs.append({"url": item, "base": ""})
+            elif isinstance(item, dict):
+                specs.append({"url": str(item.get("url") or ""),
+                              "base": str(item.get("base") or "")})
+            else:
+                raise ValueError("仓库条目不可用")
+        return specs
+    raise ValueError("仓库必须是文本或列表")
+
+
 def _safe_name(name: str) -> bool:
     return bool(_NAME_RE.fullmatch(name or ""))
 
@@ -788,10 +817,11 @@ async function showNew(){
   const ov=await api('api/overview');
   const tpls=(ov.templates||[]).map(t=>`<option value="${esc(t.name)}">${esc(t.name)}${t.builtin?'（内置）':''}</option>`).join('');
   $('#main').innerHTML=`<h2>从模板启动新任务</h2><div class="card">
-    <div class="two"><div class="row"><label>任务名（项目目录）</label><input id="nName" placeholder="my-task"></div>
+    <div class="two"><div class="row"><label>任务名</label><input id="nName" placeholder="visualization-of-layout">
+    <span class="hint">一次迭代的简述。产物写在工作台/&lt;任务名&gt;/，代码检出在其中的 worktrees/。</span></div>
     <div class="row"><label>模板</label><select id="nTpl">${tpls}</select></div></div>
-    <div class="row"><label>迭代名（不能与任务名相同）</label><input id="nIter" placeholder="round-1">
-    <span class="hint">内置 delivery 必填。产物写入 iterations/&lt;迭代名&gt;/；同一项目下次换一个名字，已有目录保持不动。</span></div>
+    <div class="row"><label>仓库</label><textarea id="nRepos" placeholder="ssh://git@host/gdd-harness.git&#10;ssh://git@host/other.git develop"></textarea>
+    <span class="hint">内置 delivery 至少一行。每行一个地址，可选第二段基线分支。不填基线则用 master，没有再用 main。</span></div>
     <div class="row"><label>需求（一句话也行）</label><textarea id="nReq" placeholder="实现一个 TODO CLI，支持增删查，带 pytest 测试"></textarea></div>
     <div class="actions"><button class="pri" onclick="createTask()">创建并初始化</button>
     <span class="hint" style="align-self:center">创建后到任务页点「启动」</span></div>
@@ -799,8 +829,7 @@ async function showNew(){
 }
 async function createTask(){
   const name=$('#nName').value.trim();
-  const iteration=$('#nIter').value.trim();
-  const j=await api('api/tasks',{method:'POST',body:JSON.stringify({name,iteration,template:$('#nTpl').value,requirement:$('#nReq').value})});
+  const j=await api('api/tasks',{method:'POST',body:JSON.stringify({name,repos:$('#nRepos').value,template:$('#nTpl').value,requirement:$('#nReq').value})});
   if(!j.ok){$('#nErr').innerHTML=`<div class="alert err">${esc(j.error)}</div>`;return}
   showTask(enc(name));
 }
@@ -1755,6 +1784,7 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/api/tasks":
                 name = str(body.get("name", "")).strip()
                 iteration = str(body.get("iteration", "")).strip()
+                repos = _parse_repos(body.get("repos"))
                 tpl = str(body.get("template", "")).strip()
                 req = str(body.get("requirement", "")).strip()
                 if not _safe_name(name):
@@ -1771,29 +1801,34 @@ class Handler(BaseHTTPRequestHandler):
                         return self._json({"ok": False, "error": f"模板不存在: {tpl}"}, 404)
                     pipeline = _load_pipeline_file(tp)
                 d = os.path.join(self.root, name)
-                # 任务目录是项目。迭代名单独指定，不能再等于项目目录名。
                 bind_name = name
-                if needs_iteration(pipeline):
+                task_home = bool(repos)
+                if needs_iteration(pipeline) and not repos:
                     if not iteration:
                         return self._json({
                             "ok": False,
-                            "error": "这条流水线按迭代落产物，必须填写迭代名，且不能与任务名相同",
+                            "error": "请至少填写一个仓库地址",
                         }, 400)
                     bind_name = iteration
-                # 同名创建串行化（双击/双 tab 并发）：锁内重查已存在再初始化；
-                # 锁外首个检查仅作快速失败，不作为唯一防线
                 with _create_lock:
                     if os.path.exists(os.path.join(d, ".gdd", "state.json")):
                         return self._json({"ok": False, "error": f"任务 {name} 已存在；如需重跑请在任务页重置"}, 400)
-                    preexisting = os.path.exists(d)  # 目录已存在（用户同名目录）→ 失败时绝不删除
+                    preexisting = os.path.exists(d)
                     os.makedirs(d, exist_ok=True)
+                    records = []
                     try:
-                        pipeline = prepare_iteration(pipeline, d, name=bind_name)
+                        pipeline = prepare_iteration(
+                            pipeline, d, name=bind_name, task_home=task_home)
+                        if repos:
+                            from .repos import prepare_repos
+                            records = prepare_repos(
+                                getattr(self, "repos", None) or self.root, d, name, repos)
                         o = Orchestrator(d)
-                        o.init(pipeline, req)
+                        o.init(pipeline, req, repos=records)
                     except Exception:
-                        # init 失败不残留孤儿任务目录；但仅当目录是本请求新建时才清除，
-                        # 已存在目录（可能有用户数据）保持原样，避免误删
+                        if records:
+                            from .repos import release_repos
+                            release_repos(records)
                         if not preexisting:
                             shutil.rmtree(d, ignore_errors=True)
                         raise
@@ -1908,7 +1943,8 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     import argparse
     ap = argparse.ArgumentParser(prog="gdd-ui", description="GDD 本地控制台")
-    ap.add_argument("--root", default=".", help="任务工作台目录（其下每个子目录是一个任务）")
+    ap.add_argument("--root", default=".", help="工作台目录（其下每个子目录是一个任务）")
+    ap.add_argument("--repos", default="", help="代码仓库目录，默认与工作台相同")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--no-open", action="store_true", help="不自动打开浏览器")
     args = ap.parse_args()
@@ -1916,6 +1952,7 @@ def main():
     root = os.path.abspath(args.root)
     os.makedirs(root, exist_ok=True)
     Handler.root = root
+    Handler.repos = os.path.abspath(args.repos) if args.repos else root
 
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     url = f"http://127.0.0.1:{args.port}/"

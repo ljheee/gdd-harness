@@ -159,7 +159,7 @@ cargo tauri build --bundles app
 - **baseline_marker**：进入该节点主体工作时记录 git 基线 commit。
 - **exit.change_aware**：exit 门禁注入 `git diff --stat baseline`（含未提交工作区改动）与 `git status`，**AI 门禁据此补充验证项并实际执行**（内置 pipeline 的 test 节点开启）。
 - **补充验证项固化（模板/实例分离）**：全局模板只在 `gdd init` 时实例化为 `.gdd/pipeline.json`，绑定本次运行。change_aware 门禁基于本轮改动推导出的补充验证项通过 verdict 的 `supplements` 字段返回，harness **只增不减**地写回运行实例：可命令化项沉淀为机器检查 `commands`（下次重试不经 LLM）、产物检查追加/收紧 `artifacts.must_contain`、不可机器化的语义项追加到 `ai_check`；按内容去重防膨胀。全局模板不受影响。
-- **git_delivery**（pipeline 级，默认启用）：每节点 exit 通过后，harness 自动把产出（.md/代码）提交并推送到开发分支。未写 `branch` 时默认 `gdd/delivery`；内置 delivery 在 `gdd init --name <名字>` 时使用 `gdd/<名字>`，可用 `--branch` 改，用 `--base` 指定从哪条已有分支拉出。`.gdd` 状态目录不入库；无 remote 仅本地提交；push 失败仅记录事件不阻塞流水线。commit 信息形如 `gdd(<node_id>): <节点名> exit 通过`。**停用场景**：项目目录位于另一个 git 仓库的子目录（外层仓存在）时，harness 会自动停用 git 交付（防外层仓劫持/误提交），在 `gdd status` 与控制台显式警示 `git_delivery_disabled`，产物仅在项目目录内、不入任何分支——此时需自行把产物同步到外层仓。
+- **git_delivery**（pipeline 级，默认启用）：每节点 exit 通过后，harness 自动把产出（.md/代码）提交并推送到开发分支。未写 `branch` 时默认 `gdd/delivery`；内置 delivery 在 `gdd init --name <名字>` 时使用 `gdd/<名字>`，可用 `--branch` 改，用 `--base` 指定从哪条已有分支拉出。`.gdd` 状态目录不入库；无 remote 仅本地提交；push 失败仅记录事件不阻塞流水线。commit 信息形如 `gdd(<node_id>): <节点名> exit 通过`。开启 git 交付时，任务根必须就是 git 仓库顶层。落在另一个仓库的子目录里时，初始化直接拒绝，避免切到外层仓的分支。交付关闭的流水线可以放在子目录里。
 
 ### 门禁两层判定（判定权在 harness）
 

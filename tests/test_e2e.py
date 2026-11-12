@@ -2399,7 +2399,7 @@ def test_e2_readme_promises_pinned():
     print("[E2] README 承诺钉住")
     from gdd.runner import SessionResult, AgentRunner
 
-    # --- E2a: 外层仓子目录 → git_delivery_disabled 持久化 + 交付跳过
+    # --- E2a: 外层仓子目录 → 初始化直接拒绝，不切外层分支，不留下状态
     import subprocess as sp
     outer = tempfile.mkdtemp()
     sp.run(["git", "init", "-q"], cwd=outer, capture_output=True)
@@ -2425,14 +2425,12 @@ def test_e2_readme_promises_pinned():
 
     orch.AgentRunner = E2Runner
     o = Orchestrator(d)
-    o.init(pipeline, "req")
-    status = o.run()
-    check(status == "completed", f"E2a: 流水线完成（{status}）")
-    st = state_of(d)
-    check(st.get("git_delivery_disabled") is True,
-          f"E2a: 停用标志持久化（{st.get('git_delivery_disabled')}）")
-    evs = [e["event"] for e in st["history"]]
-    check("git_commit" not in evs, "E2a: 零交付提交（停用生效）")
+    try:
+        o.init(pipeline, "req")
+        raise AssertionError("E2a: 子目录初始化应拒绝")
+    except RuntimeError as e:
+        check("不能在这里初始化" in str(e), f"E2a: 子目录直接拒绝（{e}）")
+    check(not os.path.exists(os.path.join(d, ".gdd", "state.json")), "E2a: 拒绝时不留下状态")
     shutil.rmtree(outer)
 
     # --- E2b: push_failed 入 state；下次 run 自动补推成功清槽
@@ -2685,7 +2683,7 @@ def test_p2_pins_r6():
     # ---- P2-24: git_delivery_disabled 的 status 打印 ----
     d = _tf.mkdtemp()
     try:
-        # 任务根位于外层 git 仓的子目录 → git 交付停用 → status 必须警示
+        # 任务根位于外层 git 仓的子目录 → 初始化直接拒绝
         outer = os.path.join(d, "outer-repo")
         os.makedirs(outer)
         subprocess.run(["git", "init", "-q"], cwd=outer, check=True)
@@ -2694,10 +2692,8 @@ def test_p2_pins_r6():
         reqf = os.path.join(d, "req.txt")
         open(reqf, "w").write("x")
         r = run_gdd(proj, "init", "--name", "p2", "--requirement", reqf)
-        assert r.returncode == 0, r.stdout + r.stderr
-        r2 = run_gdd(proj, "status")
-        check("git 交付已停用" in r2.stdout,
-              f"P2-24: status 打印停用警示（stdout 片段：{r2.stdout[:200]}）")
+        check(r.returncode != 0 and "不能在这里初始化" in (r.stdout + r.stderr),
+              f"P2-24: 子目录初始化被拒绝（{r.stdout[:200]} {r.stderr[:200]}）")
     finally:
         shutil.rmtree(d)
     print("[P2] PASS\n")
