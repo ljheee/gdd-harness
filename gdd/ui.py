@@ -34,6 +34,7 @@ from .cli import _load_pipeline_file
 from .iteration import needs_iteration, prepare as prepare_iteration
 from .models import PipelineSpec
 from .orchestrator import Orchestrator
+from . import nodestats
 from . import pi_settings
 
 # 任务创建串行化：ThreadingHTTPServer 并发处理双击/双 tab 的同名创建请求时，
@@ -189,6 +190,8 @@ def _task_detail(workdir: str, name: str) -> dict:
             "entry_bounces": ns.get("entry_bounces", 0),
             "attempts": ns.get("attempts", 0),
             "needs_approval": n.approval.required,
+            # 三段统计只读视图；旧任务/未采集/损坏时为 None，前端隐藏不报错
+            "stats": nodestats.for_ui(st, n.id),
         })
     pa = st.get("pending_approval")
     prompt = ""
@@ -665,6 +668,18 @@ h2{font-size:18px;margin-bottom:14px}
 .node.done{border-color:#2b5c42} .node.done .ph{color:var(--green)}
 .node.blocked{border-color:var(--red)} .node.blocked .ph{color:var(--red)}
 .node .flag{position:absolute;top:-7px;left:8px;font-size:10px;background:var(--amber);color:#241a03;border-radius:4px;padding:0 5px}
+.node.has-total{padding-bottom:24px}
+.node .node-total{position:absolute;right:8px;bottom:7px;font-size:11px;font-weight:600;color:var(--green)}
+.node:hover{z-index:30}
+.node .node-pop{display:none;position:absolute;left:0;top:100%;width:max-content;max-width:min(460px,72vw);max-height:340px;overflow:auto;background:#10141c;border:1px solid var(--line);border-radius:10px;padding:10px 12px;box-shadow:0 12px 32px rgba(0,0,0,.45);z-index:60;font-size:12px;font-weight:400;color:var(--fg);text-align:left;white-space:normal;cursor:default}
+.node:hover .node-pop{display:block}
+.node-pop .np-t{color:var(--dim);font-size:11px;margin-bottom:2px}
+.node-pop .np-seg{padding:6px 0}
+.node-pop .np-seg+.np-seg{border-top:1px dashed var(--line)}
+.node-pop .np-h{display:flex;gap:10px;flex-wrap:wrap;align-items:baseline}
+.node-pop .np-h b{min-width:38px;color:#cfe0ff}
+.node-pop .np-s{display:flex;gap:10px;flex-wrap:wrap;color:var(--dim);padding:2px 0 0 12px}
+.node-pop .np-s .k{color:#aab4c8}
 @keyframes pulse{50%{opacity:.3}} @keyframes glow{50%{box-shadow:0 0 4px rgba(245,181,68,.2)}}
 .arrow{align-self:center;color:var(--dim)}
 textarea,input,select{background:#10141c;border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:8px;width:100%;font:13px/1.5 ui-monospace,Menlo,monospace}
@@ -746,6 +761,35 @@ async function refreshNav(){
 }
 
 function esc(s){return String(s??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}
+// ---- 节点三段统计展示（spec §5）：方块右下角整数分钟 + 悬浮明细 ----
+function statsMin1(s){return (Math.max(0,Number(s)||0)/60).toFixed(1)+'min'}
+function statsTotalMin(s){return Math.round(Math.max(0,Number(s)||0)/60)+'min'}
+function statsToken(total,status){
+  if(status==='unavailable'||(status!=='partial'&&total==null))return '不可得';
+  const n=Number(total)||0;
+  return status==='partial'?n+'（部分不可得）':String(n);
+}
+function statsSessionRow(s){
+  s=s||{};
+  const kind=String(s.kind||'');
+  const who=kind==='task'?(s.task_id?'task '+s.task_id:'task'):kind;
+  return `<div class="np-s" data-kind="${esc(kind)}" data-task="${esc(s.task_id||'')}"><span class="k">${esc(who||'会话')}</span><span>${statsMin1(s.duration_s)}</span><span>工具 ${esc(String(s.tool_calls||0))}</span><span>LLM ${esc(String(s.llm_calls||0))}</span><span>token ${esc(statsToken(s.token_total,s.token_status))}</span></div>`;
+}
+function statsSegment(name,label,seg){
+  seg=seg||{};
+  const rows=(Array.isArray(seg.sessions)?seg.sessions:[]).map(statsSessionRow).join('');
+  return `<div class="np-seg" data-seg="${esc(name)}"><div class="np-h"><b>${esc(label)}</b><span>${statsMin1(seg.duration_s)}</span><span>工具 ${esc(String(seg.tool_calls||0))}</span><span>LLM ${esc(String(seg.llm_calls||0))}</span><span>token ${esc(statsToken(seg.token_total,seg.token_status))}</span></div>${rows}</div>`;
+}
+function nodeStatsHtml(st){
+  if(!st||typeof st!=='object'||!st.segments||typeof st.segments!=='object')return '';
+  const order=[['entry','entry'],['subject','主体'],['exit','exit']];
+  return `<div class="node-pop"><div class="np-t">耗时合计 ${statsMin1(st.total_s)}（entry + 主体 + exit）</div>${order.map(([k,label])=>statsSegment(k,label,st.segments[k])).join('')}</div>`;
+}
+function nodeHasStats(n){return !!(n&&n.phase==='done'&&n.stats&&typeof n.stats==='object'&&typeof n.stats.total_s==='number'&&n.stats.segments&&typeof n.stats.segments==='object')}
+function nodeStatsBlock(n){
+  if(!nodeHasStats(n))return '';  // 未完成/旧任务无统计：不显示总耗时
+  return `<div class="node-total">${statsTotalMin(n.stats.total_s)}</div>${nodeStatsHtml(n.stats)}`;
+}
 function enc(s){return btoa(unescape(encodeURIComponent(String(s))))}  // onclick 安全传参（避开实体解码突破引号）
 function dec(s){return decodeURIComponent(escape(atob(s)))}
 function stopPoll(){if(pollTimer){clearInterval(pollTimer);pollTimer=null} closeLive()}
@@ -867,7 +911,8 @@ async function renderTask(name){
     const bd=[];
     if(n.bounces)bd.push(`打回${esc(String(n.bounces))}`);
     if(n.entry_bounces)bd.push(`entry打回${esc(String(n.entry_bounces))}`);
-    return `${flag?`<div class="flag">${flag}</div>`:''}<div class="node ${cls}"><div class="nm">${esc(n.name)}</div><div class="ph">${ph}</div>${bd.length?`<div class="bd">${bd.join(' · ')}</div>`:''}</div>${i<j.nodes.length-1?'<div class="arrow">→</div>':''}`;
+    const hasStats=nodeHasStats(n);
+    return `${flag?`<div class="flag">${flag}</div>`:''}<div class="node ${cls}${hasStats?' has-total':''}"><div class="nm">${esc(n.name)}</div><div class="ph">${ph}</div>${bd.length?`<div class="bd">${bd.join(' · ')}</div>`:''}${nodeStatsBlock(n)}</div>${i<j.nodes.length-1?'<div class="arrow">→</div>':''}`;
   }).join('');
   let alertHtml='';
   if(j.blocked_reason)alertHtml+=`<div class="alert err">⛔ ${esc(j.blocked_reason)}</div>`;

@@ -295,6 +295,59 @@ def main():
     t1 = [t for t in ov["tasks"] if t["name"] == "t1"][0]
     check(t1["status"] == "completed" and t1["awaiting"] is False, "任务列表显示完成")
 
+    # ---------- T5-stats 节点三段统计展示字段 ----------
+    print("[T5-stats] 节点统计展示字段")
+    check(all("stats" in n for n in d["nodes"]),
+          "任务详情每个节点都带 stats 字段（无统计时为 None）")
+    r = c.post("/api/tasks", {"name": "t-stats", "template": "mine", "requirement": "统计"})
+    check(r["ok"], "t-stats 创建")
+    sp_stats = os.path.join(workdir, "t-stats", ".gdd", "state.json")
+    with open(sp_stats, encoding="utf-8") as f:
+        st_stats = json.load(f)
+    st_stats["status"] = "completed"
+    for nid in ("first", "last"):
+        st_stats["node_states"][nid]["phase"] = "done"
+    st_stats["node_stats"] = {
+        "first": {
+            "segments": {
+                "entry": {"duration_s": 90.0, "sessions": [
+                    {"session_id": "s-entry", "kind": "entry", "task_id": "",
+                     "attempts": 1, "duration_s": 60.0, "tool_calls": 2, "llm_calls": 1,
+                     "token_total": None, "token_status": "unavailable"}]},
+                "subject": {"duration_s": 200.0, "sessions": [
+                    {"session_id": "s-t1", "kind": "task", "task_id": "T1",
+                     "attempts": 1, "duration_s": 100.0, "tool_calls": 3, "llm_calls": 2,
+                     "token_total": 150, "token_status": "available"},
+                    {"session_id": "s-t2", "kind": "task", "task_id": "T2",
+                     "attempts": 1, "duration_s": 60.0, "tool_calls": 1, "llm_calls": 1,
+                     "token_total": None, "token_status": "unavailable"}]},
+                "exit": {"duration_s": 40.0, "sessions": []},
+            },
+            "total_s": 330.0,
+        },
+    }
+    with open(sp_stats, "w", encoding="utf-8") as f:
+        json.dump(st_stats, f, ensure_ascii=False)
+    d = c.get("/api/task/t-stats")
+    check(d["ok"], "带统计任务详情可读")
+    ns_first = d["nodes"][0]["stats"]
+    check(ns_first and ns_first["total_s"] == 330.0, "first 节点 stats.total_s=330")
+    segs = ns_first["segments"]
+    check(segs["subject"]["token_status"] == "partial"
+          and segs["subject"]["token_total"] == 150,
+          "subject 段部分不可得：已知合计 + partial")
+    check(segs["entry"]["token_status"] == "unavailable"
+          and segs["entry"]["token_total"] is None,
+          "entry 段全部不可得：token 总数为空（不以 0 冒充）")
+    check([s["task_id"] for s in segs["subject"]["sessions"]] == ["T1", "T2"],
+          "并行 task 会话带 task_id 返回")
+    check(d["nodes"][1]["stats"] is None, "无统计节点 stats=None（旧任务兼容）")
+    st_stats["node_stats"]["first"] = {"segments": "broken"}
+    with open(sp_stats, "w", encoding="utf-8") as f:
+        json.dump(st_stats, f, ensure_ascii=False)
+    d = c.get("/api/task/t-stats")
+    check(d["ok"] and d["nodes"][0]["stats"] is None, "统计损坏时详情不报错、stats=None")
+
     # ---------- T4 防护杂项 ----------
     print("[T4] 防护")
     r = c.get("/api/task/" + urllib.parse.quote("不存在"))

@@ -144,6 +144,9 @@ class Verdict:
     feedback: str = ""  # 打回时给节点主体的修改指引
     gate_error: bool = False  # 门禁自身故障（会话失败/输出不可解析），非判定不通过
     supplements: List[dict] = field(default_factory=list)  # AI 建议固化到运行实例的补充验证项
+    # 本次门禁实际执行的 AI 会话结果（纯机器门禁/未配置 AI 判据时为 None）。
+    # 只用于编排器把门禁会话计入 entry/exit 段统计，不参与判定语义。
+    session: Optional[SessionResult] = None
 
     @property
     def feedback_text(self) -> str:
@@ -636,8 +639,11 @@ def run_gate(
         return Verdict(passed=False, gate_error=True,
                        reason=f"[{kind}] 门禁会话执行失败: {session.error}",
                        evidence=machine.evidence,
-                       feedback=f"门禁会话执行失败（非节点主体问题）: {session.error}")
-    return _verdict_from_text(session.text, f"[{kind}] 门禁会话输出不可解析（缺 GDD-VERDICT 哨兵行）")
+                       feedback=f"门禁会话执行失败（非节点主体问题）: {session.error}",
+                       session=session)
+    verdict = _verdict_from_text(session.text, f"[{kind}] 门禁会话输出不可解析（缺 GDD-VERDICT 哨兵行）")
+    verdict.session = session
+    return verdict
 
 
 def collect_upstream_artifacts(pipeline: PipelineSpec, node: NodeSpec, root: str) -> List[str]:

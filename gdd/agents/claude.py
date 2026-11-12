@@ -6,7 +6,13 @@ import os
 import shlex
 from typing import Any, Callable, Dict, List, Optional
 
-from ..runner import SessionResult, _auth_hint, _tool_summary
+from ..runner import (
+    SessionResult,
+    _auth_hint,
+    _token_status,
+    _tool_summary,
+    _usage_int,
+)
 from .base import AgentAdapter
 
 _CLAUDE_LOGIN_HINTS = (
@@ -48,6 +54,63 @@ def _result_text(data: dict) -> str:
     if isinstance(result, str):
         return result
     return ""
+
+
+_USAGE_KEYS = (
+    ("input_tokens", "token_input"),
+    ("output_tokens", "token_output"),
+    ("cache_creation_input_tokens", "token_cache_creation"),
+    ("cache_read_input_tokens", "token_cache_read"),
+)
+
+
+def _collect_metrics(events: List[dict]) -> Dict[str, int]:
+    """从完整 stream-json 事件流统计工具/LLM 次数与 message_delta usage。
+
+    - LLM 次数：唯一 assistant message id；无 id 时每次 assistant 事件各计 1。
+    - 工具调用：tool_use id 去重（重复流式事件只算一次）；无 id 时每次各计 1。
+    - usage 兜底：逐条 stream_event.message_delta.usage 四项累加。
+    """
+    seen_messages: set = set()
+    seen_tools: set = set()
+    metrics = {"tool_calls": 0, "llm_calls": 0,
+               "token_input": 0, "token_output": 0,
+               "token_cache_creation": 0, "token_cache_read": 0}
+    for parsed in events:
+        kind = parsed.get("type")
+        if kind == "assistant":
+            message = parsed.get("message")
+            if not isinstance(message, dict):
+                message = {}
+            mid = message.get("id")
+            if isinstance(mid, str) and mid:
+                if mid not in seen_messages:
+                    seen_messages.add(mid)
+                    metrics["llm_calls"] += 1
+            else:
+                metrics["llm_calls"] += 1
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                tid = block.get("id")
+                if isinstance(tid, str) and tid:
+                    if tid in seen_tools:
+                        continue
+                    seen_tools.add(tid)
+                metrics["tool_calls"] += 1
+        elif kind == "stream_event":
+            event = parsed.get("event")
+            if not isinstance(event, dict) or event.get("type") != "message_delta":
+                continue
+            usage = event.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            for key, attr in _USAGE_KEYS:
+                metrics[attr] += _usage_int(usage.get(key))
+    return metrics
 
 
 def _dispatch_claude_stream(obj: dict, state,
@@ -153,6 +216,7 @@ class ClaudeAgent(AgentAdapter):
 
     def parse(self, stdout: str, stderr: str, returncode: int, state, *,
               max_turns: int) -> SessionResult:
+        events: List[dict] = []
         candidates: List[dict] = []
         for line in (stdout or "").splitlines():
             line = line.strip()
@@ -164,15 +228,38 @@ class ClaudeAgent(AgentAdapter):
                 continue
             if not isinstance(parsed, dict):
                 continue
+            events.append(parsed)
             if _is_result(parsed):
                 candidates.append(parsed)
-        if not candidates:
+        if not events:
             try:
                 whole = json.loads(stdout or "")
             except json.JSONDecodeError:
                 whole = None
-            if isinstance(whole, dict) and _is_result(whole):
-                candidates.append(whole)
+            if isinstance(whole, dict):
+                events.append(whole)
+                if _is_result(whole):
+                    candidates.append(whole)
+        metrics = _collect_metrics(events)
+
+        def _apply(res: SessionResult, data: Optional[dict]) -> SessionResult:
+            """写入会话指标。token 优先 result.usage，缺失时用 message_delta 汇总。"""
+            usage = data.get("usage") if isinstance(data, dict) else None
+            if isinstance(usage, dict):
+                tokens = {attr: _usage_int(usage.get(key))
+                          for key, attr in _USAGE_KEYS}
+            else:
+                tokens = {attr: metrics[attr] for _, attr in _USAGE_KEYS}
+            res.tool_calls = metrics["tool_calls"]
+            res.llm_calls = metrics["llm_calls"]
+            res.token_input = tokens["token_input"]
+            res.token_output = tokens["token_output"]
+            res.token_cache_creation = tokens["token_cache_creation"]
+            res.token_cache_read = tokens["token_cache_read"]
+            res.token_status = _token_status(
+                sum(tokens.values()), metrics["llm_calls"] > 0)
+            return res
+
         err_tail = (stderr or "").strip()
         if candidates:
             data = candidates[-1]
@@ -210,19 +297,19 @@ class ClaudeAgent(AgentAdapter):
                     res.text, err_tail)
                 if hint:
                     res.error = _claude_auth_error(hint)
-            return res
+            return _apply(res, data)
         hint = ""
         if len(stdout or "") <= 300:
             hint = _claude_login_hint(stdout, err_tail) or _auth_hint(stdout, err_tail)
         if hint:
-            return SessionResult(
+            return _apply(SessionResult(
                 ok=False, error=_claude_auth_error(hint),
-                raw=(stdout or "") + "\n" + (stderr or ""))
-        return SessionResult(
+                raw=(stdout or "") + "\n" + (stderr or "")), None)
+        return _apply(SessionResult(
             ok=False,
             error=f"claude 输出不可解析（returncode={returncode}）stderr: {err_tail[:500]}",
             raw=(stdout or "") + "\n" + (stderr or ""),
-        )
+        ), None)
 
     def launch_hint(self) -> str:
         return "请确认本机 claude 可执行，或设置 GDD_AGENT_BIN"

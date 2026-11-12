@@ -66,6 +66,15 @@ class SessionResult:
     turns_exhausted: bool = False
     streamed: bool = False  # 本轮是否走流式呈现路径
     config_error: bool = False  # 节点 MCP/skill/设置加载失败：不是会话失效
+    # 会话指标：工具调用按调用 id 去重、LLM 次数按模型响应轮次、token 四项分量。
+    # token_status=unavailable 表示产生了模型响应但 usage 缺失或全 0（真实响应必有消耗）。
+    tool_calls: int = 0
+    llm_calls: int = 0
+    token_input: int = 0
+    token_output: int = 0
+    token_cache_creation: int = 0
+    token_cache_read: int = 0
+    token_status: str = "available"
 
 
 # 凭证失效特征（小写匹配）。pi/端点错误可能只出现在 stderr 或 assistant 错误消息里。
@@ -125,6 +134,21 @@ def _tool_summary(name: str, inp: Any) -> str:
     return ""
 
 
+def _usage_int(value: Any) -> int:
+    """usage 字段转整数；缺失/非法按 0。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _token_status(total: int, saw_model_response: bool) -> str:
+    """真实模型响应不可能零消耗：有响应但 usage 全 0/缺失时标不可得。"""
+    if saw_model_response and total <= 0:
+        return "unavailable"
+    return "available"
+
+
 class _SessionState:
     def __init__(self) -> None:
         self.session_id = ""
@@ -137,6 +161,13 @@ class _SessionState:
         self.saw_agent_end = False
         self.text_streamed = False
         self.seen_tools: set = set()
+        # T1 会话指标：工具调用、token 四分量、是否产生过模型响应
+        self.tool_calls = 0
+        self.token_input = 0
+        self.token_output = 0
+        self.token_cache_creation = 0
+        self.token_cache_read = 0
+        self.saw_model_response = False
 
 
 class AgentRunner:
@@ -452,9 +483,17 @@ class AgentRunner:
                 pass
         res = agent.apply_turn_cap(res, state, max_turns)
         if timed_out:
+            # 超时前已观测到的会话指标仍有效，随结果保留（不编造未观测数据）。
             res = SessionResult(ok=False, error=f"会话超时（>{self.timeout}s）",
                                 session_id=state.session_id,
-                                duration_s=time.time() - started, raw=out)
+                                duration_s=time.time() - started, raw=out,
+                                tool_calls=res.tool_calls,
+                                llm_calls=res.llm_calls,
+                                token_input=res.token_input,
+                                token_output=res.token_output,
+                                token_cache_creation=res.token_cache_creation,
+                                token_cache_read=res.token_cache_read,
+                                token_status=res.token_status)
         self._dump_log(log_path, prompt, cmd, out, res)
         return res
 
@@ -499,6 +538,14 @@ class AgentRunner:
             "cost_usd": res.cost_usd,
             "duration_s": res.duration_s,
             "streamed": res.streamed,
+            # T1 附加会话指标；既有字段语义不变。
+            "tool_calls": res.tool_calls,
+            "llm_calls": res.llm_calls,
+            "token_input": res.token_input,
+            "token_output": res.token_output,
+            "token_cache_creation": res.token_cache_creation,
+            "token_cache_read": res.token_cache_read,
+            "token_status": res.token_status,
         }
         try:
             with open(log_path, "w", encoding="utf-8") as f:

@@ -11,7 +11,9 @@ from ..runner import (
     SessionResult,
     _SessionState,
     _auth_hint,
+    _token_status,
     _tool_summary,
+    _usage_int,
 )
 from .base import AgentAdapter
 
@@ -76,10 +78,12 @@ def _message_text(message: Any) -> str:
     return "".join(parts)
 
 
-def _observe_message_end(state: _SessionState, message: Any) -> None:
+def _observe_message_end(state: _SessionState, message: Any, *,
+                         count_usage: bool = True) -> None:
     if not isinstance(message, dict):
         return
     if message.get("role") == "assistant":
+        state.saw_model_response = True
         text = _message_text(message)
         if text:
             state.last_text = text
@@ -96,6 +100,12 @@ def _observe_message_end(state: _SessionState, message: Any) -> None:
                     state.cost = float(cost.get("total") or 0.0)
                 except (TypeError, ValueError):
                     pass
+            # agent_end 的回退观察不重复累计 token：message_end 已累计过同一消息。
+            if count_usage:
+                state.token_input += _usage_int(usage.get("input"))
+                state.token_output += _usage_int(usage.get("output"))
+                state.token_cache_creation += _usage_int(usage.get("cacheWrite"))
+                state.token_cache_read += _usage_int(usage.get("cacheRead"))
 
 
 def _dispatch_event(obj: dict, state: _SessionState,
@@ -125,6 +135,8 @@ def _dispatch_event(obj: dict, state: _SessionState,
                 return
             if tid:
                 state.seen_tools.add(tid)
+            # 无 toolCallId 时无法去重：每次事件各计 1（规格第 3 节）。
+            state.tool_calls += 1
             summary = _tool_summary(name, obj.get("args"))
             if on_stream:
                 on_stream({"kind": "tool", "name": name, "summary": summary})
@@ -140,7 +152,7 @@ def _dispatch_event(obj: dict, state: _SessionState,
             if not state.last_text:
                 for message in reversed(obj.get("messages") or []):
                     if isinstance(message, dict) and message.get("role") == "assistant":
-                        _observe_message_end(state, message)
+                        _observe_message_end(state, message, count_usage=False)
                         if state.last_text:
                             break
             return
@@ -339,6 +351,16 @@ class PiAgent(AgentAdapter):
                 cost_usd=state.cost,
                 raw=stdout or "",
             )
+        total = (state.token_input + state.token_output
+                 + state.token_cache_creation + state.token_cache_read)
+        res.tool_calls = state.tool_calls
+        res.llm_calls = state.turns
+        res.token_input = state.token_input
+        res.token_output = state.token_output
+        res.token_cache_creation = state.token_cache_creation
+        res.token_cache_read = state.token_cache_read
+        res.token_status = _token_status(
+            total, state.saw_model_response or state.turns > 0)
         if not res.ok:
             hint = _auth_hint(res.error, err_tail) if len(res.error) <= 500 else ""
             if hint:

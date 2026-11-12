@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 from . import acceptance as acceptance_mod
 from . import approval as approval_mod
 from . import gates
+from . import nodestats
 from . import review as review_mod
 from . import revision as revision_mod
 from . import taskgraph
@@ -269,6 +270,7 @@ class Orchestrator:
             "push_failed": None,        # 交付分支推送失败信息（run 时自动重试补推；非 stray 型）
             "stray_delivery": None,    # 提交滞留他分支警示（独立槽：不被 push 成败覆盖/清除）
             "git_delivery_disabled": False,  # init 检出外层仓→永久停用 git 交付（持久化，_deliver_git 消费）
+            "node_stats": {},          # 节点三段统计（附加字段；旧 state 缺失时按空处理）
             "history": [],
             "updated_at": None,
         }
@@ -1998,6 +2000,9 @@ class Orchestrator:
         session = runner.run(
             prompt, allowed_tools=["Read", "Grep", "Glob"], max_turns=node.subject.max_turns,
             log_path=self._log_path(node, "adversarial"))
+        # 对抗会话属于主体段（含 adversarial_retry 重试；spec §2 归属规则）
+        self._stats_session(node.id, "subject", "adversarial", session,
+                            ended_at=self._stats_now())
         self._check_tamper("adversarial")
         parsed = revision_mod.parse_adversarial(session.text or "") if session.ok else None
         if not session.ok or not parsed:
@@ -2219,6 +2224,9 @@ class Orchestrator:
             prompt, allowed_tools=gates.REVIEW_TOOLS,
             max_turns=node.subject.max_turns,
             log_path=self._log_path(node, "review"))
+        # 评审会话属于主体段（spec §2 归属规则）
+        self._stats_session(node.id, "subject", "review", session,
+                            ended_at=self._stats_now())
         self._check_tamper("review")
         parsed = review_mod.parse_review(session.text or "") if session.ok else None
         if not session.ok or parsed is None:
@@ -2308,12 +2316,63 @@ class Orchestrator:
         return self._bounce_current(node, gates.Verdict(
             passed=False, reason="对抗测试未通过", feedback=text))
 
+    # ------------------------------------------------------------ 节点三段统计
+
+    def _stats_now(self) -> float:
+        """统计用墙钟秒；测试可覆盖为可控时钟。"""
+        return time.time()
+
+    def _stats_open(self, node_id: str, segment: str) -> None:
+        try:
+            nodestats.open_segment(self.state, node_id, segment, now=self._stats_now())
+        except Exception as e:  # 统计是可选观测，失败不得影响节点推进
+            self._record("node_stats_error", node=node_id, segment=segment,
+                         action="open", error=str(e)[:200])
+
+    def _stats_close(self, node_id: str, segment: str) -> None:
+        try:
+            nodestats.close_segment(self.state, node_id, segment, now=self._stats_now())
+        except Exception as e:
+            self._record("node_stats_error", node=node_id, segment=segment,
+                         action="close", error=str(e)[:200])
+
+    def _stats_session(self, node_id: str, segment: str, kind: str,
+                       session, ended_at: Optional[float] = None,
+                       started_at: Optional[float] = None, task_id: str = "") -> None:
+        if session is None:
+            return  # 纯机器门禁没有 AI 会话：段内无会话，工具/LLM/token 按真实 0 汇总
+        try:
+            nodestats.add_session(self.state, node_id, segment, kind=kind,
+                                  task_id=task_id, result=session,
+                                  started_at=started_at, ended_at=ended_at)
+        except Exception as e:
+            self._record("node_stats_error", node=node_id, segment=segment,
+                         action="session", error=str(e)[:200])
+
+    def _stats_save(self, node_id: str) -> None:
+        """落盘统计；失败只记事件，不让可选观测改变节点结果。"""
+        try:
+            self._save()
+        except Exception as e:
+            self._record("node_stats_error", node=node_id, action="save",
+                         error=str(e)[:200])
+
     # ------------------------------------------------------------ 相位处理
 
     def _phase_entry(self, node: NodeSpec, ns: Dict, runner: AgentRunner) -> bool:
         self._present("ui_phase", phase="entry", node=node.id, name=node.name)
-        verdict = gates.run_gate("entry", node, self.root, runner, log_path=self._log_path(node, "entry"))
+        # entry 段只覆盖门禁执行窗口：通过后的 baseline/状态写入不计入
+        self._stats_open(node.id, "entry")
+        try:
+            verdict = gates.run_gate("entry", node, self.root, runner,
+                                     log_path=self._log_path(node, "entry"))
+        finally:
+            entry_ended = self._stats_now()
+            self._stats_close(node.id, "entry")
+        # 会话记录先于任何落盘：保持 _check_tamper 对门禁篡改的检测基线（勿先 _save 覆盖磁盘）
+        self._stats_session(node.id, "entry", "entry", verdict.session, ended_at=entry_ended)
         self._check_tamper("entry_gate")  # 会话/机器命令可能篡改 .gdd，校验并恢复
+        self._stats_save(node.id)
         if verdict.passed:
             self._clear_gate_error_streak()
             ns["phase"] = "working"
@@ -2363,6 +2422,16 @@ class Orchestrator:
         return self._bounce_to_previous(node, verdict)
 
     def _phase_working(self, node: NodeSpec, ns: Dict, runner: AgentRunner) -> bool:
+        # 主体段外层包装：覆盖本相位全部返回路径（含主体失败、review、并行任务、exit 失败后重跑）。
+        # exit 门禁开始时由 _run_exit_gate 先关闭 subject，故 finally 的重复 close 幂等。
+        self._stats_open(node.id, "subject")
+        try:
+            return self._phase_working_inner(node, ns, runner)
+        finally:
+            self._stats_close(node.id, "subject")
+            self._stats_save(node.id)
+
+    def _phase_working_inner(self, node: NodeSpec, ns: Dict, runner: AgentRunner) -> bool:
         feedback = self.state["feedbacks"].get(node.id, "")
         fb_kind = self.state.get("feedback_kinds", {}).get(node.id, "")
         ns["attempts"] = ns.get("attempts", 0) + 1  # 极老 state 兼容
@@ -2597,8 +2666,9 @@ class Orchestrator:
                         ev["text"] = f"[{tid}] {ev.get('text') or ''}"
                     with stream_lock:
                         base_cb(ev)
+            started_at = self._stats_now()
             try:
-                return task_runner.run(
+                session = task_runner.run(
                     prompt, allowed_tools=gates.SUBJECT_TOOLS,
                     max_turns=node.subject.max_turns,
                     log_path=logs[task.id],
@@ -2606,7 +2676,8 @@ class Orchestrator:
                     on_stream=cb,
                 )
             except Exception as e:
-                return SessionResult(ok=False, error=str(e))
+                session = SessionResult(ok=False, error=str(e))
+            return session, started_at, self._stats_now()
 
         logs = {task.id: self._log_path(node, f"task-{task.id}") for task in ready}
         for task in ready:
@@ -2616,9 +2687,16 @@ class Orchestrator:
         try:
             with ThreadPoolExecutor(max_workers=len(ready)) as pool:
                 futures = [pool.submit(_one, task) for task in ready]
-                results = [future.result() for future in futures]
+                outcomes = [future.result() for future in futures]
         finally:
             steer_mod.mark_subject(self.root, False)
+        results = [outcome[0] for outcome in outcomes]
+        # 并行任务会话在主线程统一记录（避免多线程直接改 state）；每个任务一条
+        # kind=task 记录并带 task_id，同一任务 resume 由 session_id 合并。
+        for task, (session, started_at, ended_at) in zip(ready, outcomes):
+            self._stats_session(node.id, "subject", "task", session,
+                                started_at=started_at, ended_at=ended_at,
+                                task_id=task.id)
 
         failed = []
         continued = []
@@ -2801,35 +2879,51 @@ class Orchestrator:
             f.write("# 核销台账\n\n## 核销台账\n\n" + "\n".join(rows) + "\n")
 
     def _run_exit_gate(self, node: NodeSpec, ns: Dict, runner: AgentRunner) -> bool:
-        # 上轮打回项：随 exit 门禁逐项核验；**核验通过才消费**（pop 后移）——
-        # 门禁自身故障（exit_retry）或进程崩溃时反馈保留在 state，重试/重启后不丢失核验项
-        pending_fb = self.state["feedbacks"].get(node.id, "")
-        pending_kind = self.state.get("feedback_kinds", {}).get(node.id, "")
+        # 进入出口流程即结束主体段：exit 门禁（含机器检查/关联校验）不得计入主体；
+        # 后面的 exit 失败打回主体重跑会重新开 subject 区间，天然按多区间累计。
+        self._stats_close(node.id, "subject")
+        self._stats_open(node.id, "exit")
+        verdict = None
+        assoc_verdict = None
+        try:
+            # 上轮打回项：随 exit 门禁逐项核验；**核验通过才消费**（pop 后移）——
+            # 门禁自身故障（exit_retry）或进程崩溃时反馈保留在 state，重试/重启后不丢失核验项
+            pending_fb = self.state["feedbacks"].get(node.id, "")
+            pending_kind = self.state.get("feedback_kinds", {}).get(node.id, "")
 
-        # 方案与验收用例同批产出后，harness 侧核对每个 Scenario 的 @task 关联。
-        # 有任务附录才启用；失败直接打回 plan 主体，不启动 AI 门禁。
-        assoc_errors = self._plan_acceptance_errors(node)
-        if assoc_errors:
-            feedback = ("验收用例与任务的关联校验未通过，逐项修复：\n- "
-                        + "\n- ".join(assoc_errors))
-            self._record("acceptance_link_fail", node=node.id,
-                         errors=assoc_errors[:10])
-            self.state["last_exit_evidence"] = [
-                f"关联校验失败：{e}" for e in assoc_errors[:20]]
-            return self._bounce_current(node, gates.Verdict(
-                passed=False, reason="验收用例与任务关联校验未通过",
-                evidence=[f"关联校验失败：{e}" for e in assoc_errors[:20]],
-                feedback=feedback))
-
-        change_summary = self._change_summary(node.id) if node.exit.change_aware else ""
-        # 上轮打回项：交由 exit 门禁逐项核验（首轮跑 exit 时无打回，天然为空）
-        self._present("ui_phase", phase="exit", node=node.id, name=node.name)
-        verdict = gates.run_gate("exit", node, self.root, runner,
-                                 change_summary=change_summary,
-                                 log_path=self._log_path(node, "exit"),
-                                 pending_feedback=pending_fb,
-                                 pending_kind=pending_kind)
+            # 方案与验收用例同批产出后，harness 侧核对每个 Scenario 的 @task 关联。
+            # 有任务附录才启用；失败直接打回 plan 主体，不启动 AI 门禁。
+            assoc_errors = self._plan_acceptance_errors(node)
+            if assoc_errors:
+                feedback = ("验收用例与任务的关联校验未通过，逐项修复：\n- "
+                            + "\n- ".join(assoc_errors))
+                self._record("acceptance_link_fail", node=node.id,
+                             errors=assoc_errors[:10])
+                self.state["last_exit_evidence"] = [
+                    f"关联校验失败：{e}" for e in assoc_errors[:20]]
+                assoc_verdict = gates.Verdict(
+                    passed=False, reason="验收用例与任务关联校验未通过",
+                    evidence=[f"关联校验失败：{e}" for e in assoc_errors[:20]],
+                    feedback=feedback)
+            else:
+                change_summary = self._change_summary(node.id) if node.exit.change_aware else ""
+                # 上轮打回项：交由 exit 门禁逐项核验（首轮跑 exit 时无打回，天然为空）
+                self._present("ui_phase", phase="exit", node=node.id, name=node.name)
+                verdict = gates.run_gate("exit", node, self.root, runner,
+                                         change_summary=change_summary,
+                                         log_path=self._log_path(node, "exit"),
+                                         pending_feedback=pending_fb,
+                                         pending_kind=pending_kind)
+        finally:
+            exit_ended = self._stats_now()
+            self._stats_close(node.id, "exit")
+        if assoc_verdict is not None:
+            self._stats_save(node.id)
+            return self._bounce_current(node, assoc_verdict)
+        # 会话记录先于任何落盘：保持 _check_tamper 对门禁篡改的检测基线
         self._check_tamper("exit_gate")
+        self._stats_session(node.id, "exit", "exit", verdict.session, ended_at=exit_ended)
+        self._stats_save(node.id)
         self._apply_supplements(node, verdict)  # AI 补充验证项固化到运行实例（只增不减）
         if verdict.passed:
             self._clear_gate_error_streak()
@@ -2875,12 +2969,17 @@ class Orchestrator:
                 kw["resume_sid"] = resume_sid
             if stream_cb is not None:
                 kw["on_stream"] = stream_cb
-            return runner.run(
+            session = runner.run(
                 prompt, allowed_tools=gates.SUBJECT_TOOLS,
                 max_turns=node.subject.max_turns,
                 log_path=self._log_path(node, kind),
                 **kw,
             )
+            # 主体段会话（subject/subject_resume/subject_steer 由模块归一为 subject；
+            # 同一 session id 的续跑合并为一条记录）
+            self._stats_session(node.id, "subject", kind, session,
+                                ended_at=self._stats_now())
+            return session
         finally:
             runner.steer_subject = prev
             runner.node_extensions = None
@@ -2926,7 +3025,13 @@ class Orchestrator:
 
     def _phase_adversarial_retry(self, node: NodeSpec, ns: Dict, runner: AgentRunner) -> bool:
         """对抗会话自身不可解析时只重开会话，不重跑测试主体。通过后直接跑出口门禁。"""
-        routed = self._run_adversarial(node, ns, runner)
+        # 对抗重试会话属于主体段：单独开区间累计（该相位不经过 _phase_working 包装）
+        self._stats_open(node.id, "subject")
+        try:
+            routed = self._run_adversarial(node, ns, runner)
+        finally:
+            self._stats_close(node.id, "subject")
+            self._stats_save(node.id)
         if routed is not None:
             return routed
         ns["phase"] = "exit_retry"
@@ -2938,12 +3043,20 @@ class Orchestrator:
         change_summary = self._change_summary(node.id) if node.exit.change_aware else ""
         pending_fb = self.state["feedbacks"].get(node.id, "")  # 故障重试同样要核验上轮打回项
         pending_kind = self.state.get("feedback_kinds", {}).get(node.id, "")
-        verdict = gates.run_gate("exit", node, self.root, runner,
-                                 change_summary=change_summary,
-                                 log_path=self._log_path(node, "exit"),
-                                 pending_feedback=pending_fb,
-                                 pending_kind=pending_kind)
+        self._stats_open(node.id, "exit")
+        try:
+            verdict = gates.run_gate("exit", node, self.root, runner,
+                                     change_summary=change_summary,
+                                     log_path=self._log_path(node, "exit"),
+                                     pending_feedback=pending_fb,
+                                     pending_kind=pending_kind)
+        finally:
+            exit_ended = self._stats_now()
+            self._stats_close(node.id, "exit")
+        # 会话记录先于任何落盘：保持 _check_tamper 对门禁篡改的检测基线
         self._check_tamper("exit_gate_retry")
+        self._stats_session(node.id, "exit", "exit", verdict.session, ended_at=exit_ended)
+        self._stats_save(node.id)
         self._apply_supplements(node, verdict)
         if verdict.passed:
             self._clear_gate_error_streak()
