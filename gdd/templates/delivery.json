@@ -1,7 +1,7 @@
 {
   "id": "delivery",
   "name": "需求交付流水线（七阶段+）",
-  "description": "从需求目标到上线交付：项目初始化→调研→需求澄清→方案→实现→测试→交付→上线准备",
+  "description": "从需求目标到上线交付：项目初始化→调研→需求澄清→方案→实现→代码评审→测试→交付→上线准备",
   "session_preset": "clarify-design",
   "git_delivery": {
     "enabled": true,
@@ -113,8 +113,8 @@
       "name": "方案设计",
       "description": "产出实现计划与关键技术决定（ADR）",
       "subject": {
-        "goal": "基于 {{output}}/goal.md 与 {{output}}/spec.md 产出三份文档。{{output}}/plan.md：包含「## 实现步骤」（分步、每步可验证）、「## ADR」（关键决定的选项、取舍与原因）和「## 附录：任务依赖」。{{output}}/acceptance.feature：用 Gherkin（Feature / Scenario / Given / When / Then）写下验收用例。Scenario 标题在文件内唯一，这个标题就是用例 id。{{output}}/decisions.md：包含「## 决策记录」，只追加。方案须与 survey 的现状证据一致，克制过度设计。",
-        "instructions": "开工前先按决策定级契约扫描。只要出现 L0 或 L1，先提交定级并停止设计，不要把决定写进 {{output}}/decisions.md，也不要在本节点把修订做完。人确认之后的重跑里，决策记录只追加到 .gdd/revision-stage/{{output}}/decisions.md。本节点与调研、澄清共用同一段会话，以 {{output}}/survey.md 为基线，不另做全量调研。未在文档或代码中确认的结论不得作为设计前提。存量设计优先、最小改动优先；与 {{output}}/goal.md 里写明的技术目标或选型限制冲突时，以目标为准。发现目标未写明的相关功能，或必须扩大改动范围才能满足目标时，在 {{output}}/plan.md 里标成待确认并停止按该范围设计。不要自行打开澄清对话。实现步骤写完后，在 {{output}}/plan.md 末尾写「## 附录：任务依赖」，按依赖把工作拆成任务，思路与拓扑排序相同。每行一个任务：- 任务ID | 依赖ID（多个用逗号，没有则写 -） | 任务。任务 ID 用字母开头。依赖只能指向本附录里的任务，不得成环。没有依赖关系的任务要拆开，这样开发节点才能并行；同一批能并行的任务之间不能有依赖，也不要要求它们改同一个文件。实现步骤里的工作都要落到某个任务上。"
+        "goal": "基于 {{output}}/goal.md 与 {{output}}/spec.md 产出三份文档。{{output}}/plan.md：包含「## 实现步骤」（分步、每步可验证）、「## ADR」（关键决定的选项、取舍与原因）和「## 附录：任务依赖」。{{output}}/acceptance.feature：用 Gherkin（Feature / Scenario / Given / When / Then）写下验收用例。Scenario 标题在文件内唯一，这个标题就是用例 id；每个 Scenario 前必须写至少一个 `@task:<任务ID>` tag，任务 ID 必须来自 {{output}}/plan.md 附录「任务依赖」。{{output}}/decisions.md：包含「## 决策记录」，只追加。方案须与 survey 的现状证据一致，克制过度设计。",
+        "instructions": "开工前先按决策定级契约扫描。只要出现 L0 或 L1，先提交定级并停止设计，不要把决定写进 {{output}}/decisions.md，也不要在本节点把修订做完。人确认之后的重跑里，决策记录只追加到 .gdd/revision-stage/{{output}}/decisions.md。本节点与调研、澄清共用同一段会话，以 {{output}}/survey.md 为基线，不另做全量调研。未在文档或代码中确认的结论不得作为设计前提。存量设计优先、最小改动优先；与 {{output}}/goal.md 里写明的技术目标或选型限制冲突时，以目标为准。发现目标未写明的相关功能，或必须扩大改动范围才能满足目标时，在 {{output}}/plan.md 里标成待确认并停止按该范围设计。不要自行打开澄清对话。验收用例的 Scenario 标题保持唯一；tag 行写在 Scenario 前一行的连续 tag 行里，可写多个（如 `@smoke @task:T1 @task:T2`），其他 tag 会被忽略。一个用例可以关联多个任务，重复的同一任务 ID 按一个算；不要求附录里每个任务都被用例覆盖，但每个用例至少关联一个真实任务。实现步骤写完后，在 {{output}}/plan.md 末尾写「## 附录：任务依赖」，按依赖把工作拆成任务，思路与拓扑排序相同。每行一个任务：- 任务ID | 依赖ID（多个用逗号，没有则写 -） | 任务。任务 ID 用字母开头。依赖只能指向本附录里的任务，不得成环。没有依赖关系的任务要拆开，这样开发节点才能并行；同一批能并行的任务之间不能有依赖，也不要要求它们改同一个文件。实现步骤里的工作都要落到某个任务上。"
       },
       "entry": {
         "goal": "DoD 已确认就绪。",
@@ -149,7 +149,7 @@
             "must_contain": "## 决策记录"
           }
         ],
-        "ai_check": "检查实现步骤是否覆盖全部 DoD、每步是否有对应验证方式；ADR 是否说明了取舍原因。复核附录「任务依赖」：每行都是「任务ID | 依赖 | 任务」，依赖只指向附录中已有任务，没有环；按拓扑关系，没有依赖或依赖都已完成的任务可以同时做，这些任务之间不能有依赖，也不应改同一个文件；实现步骤中的工作都落在某个任务上。不合格按 fail，并指出哪一行。"
+        "ai_check": "检查实现步骤是否覆盖全部 DoD、每步是否有对应验证方式；ADR 是否说明了取舍原因。复核附录「任务依赖」：每行都是「任务ID | 依赖 | 任务」，依赖只指向附录中已有任务，没有环；按拓扑关系，没有依赖或依赖都已完成的任务可以同时做，这些任务之间不能有依赖，也不应改同一个文件；实现步骤中的工作都落在某个任务上。复核验收用例与任务的关联：acceptance.feature 至少有 1 个 Scenario；每个 Scenario 前的连续 tag 行里至少有 1 个 `@task:<ID>`；tag 的任务 ID 必须存在于同一 plan.md 的附录任务集合；重复 tag 已去重。任一条件不满足按 fail，并指出具体 Scenario 标题与缺失/非法的任务 ID。不合格按 fail，并指出哪一行。"
       },
       "approval": {
         "required": true,
@@ -189,6 +189,52 @@
           }
         ],
         "ai_check": "抽查台账中至少 3 项：代码位置是否真实存在（用 Read/Grep 核实）、证据是否可信；「待办」中不得混入本应完成的必做项。"
+      }
+    },
+    {
+      "id": "review",
+      "review": true,
+      "name": "代码评审",
+      "description": "独立只读评审本次实现是否满足已确认的目标、规格和方案",
+      "subject": {
+        "goal": "读取 {{output}}/goal.md、{{output}}/spec.md、{{output}}/plan.md、{{output}}/impl-ledger.md，并核对本次 implement 基线以来的 git diff/status；只读评审本次实现是否满足已确认的目标、规格和方案。不要修改任何文件，不要采信开发节点的自评或开发会话结论。评审报告由 harness 依据你最后一行 GDD-REVIEW 哨兵落盘。",
+        "instructions": "只读评审：不修改仓库文件，不写节点报告，不运行会改动工作区的命令。评审范围只限本次 implement 基线以来的改动；未改动的历史实现只作上下文，不作为新缺陷来源。每个问题写清 severity（blocker/major/minor）、文件、行号、对应的 goal/spec/plan 条款和问题描述。最后一行只输出一次哨兵：GDD-REVIEW: {\"verdict\":\"pass|fail\",\"issues\":[{\"severity\":\"blocker|major|minor\",\"file\":\"...\",\"line\":123,\"clause\":\"对应条款\",\"problem\":\"问题描述\"}]}。verdict=fail 或存在 blocker/major 即不通过；minor 可保留不阻塞。无法核实的事项写进问题清单，不得默认通过；找不到 implement 基线时按无法核实处理，不得判通过。",
+        "max_turns": 60
+      },
+      "entry": {
+        "goal": "实现台账与已确认的目标、规格、方案均已就绪。",
+        "artifacts": [
+          {
+            "path": "{{output}}/impl-ledger.md",
+            "must_contain": "## 核销台账"
+          },
+          {
+            "path": "{{output}}/plan.md",
+            "must_contain": "## 实现步骤"
+          },
+          {
+            "path": "{{output}}/goal.md",
+            "must_contain": "## 验收标准"
+          },
+          {
+            "path": "{{output}}/spec.md",
+            "must_contain": "## 规格"
+          }
+        ]
+      },
+      "exit": {
+        "goal": "评审结论与问题清单落盘，且与只读评审会话的裁决一致。",
+        "artifacts": [
+          {
+            "path": "{{output}}/review.md",
+            "must_contain": "## 评审结论"
+          },
+          {
+            "path": "{{output}}/review.md",
+            "must_contain": "## 问题清单"
+          }
+        ],
+        "ai_check": "核对 {{output}}/review.md 与本次实现的 git diff：1) 结论只有「通过/不通过」两种且与问题清单一致（verdict=fail 或存在 blocker/major 时必须写不通过）；2) 每个问题都有 severity、文件、行号或可核查位置、对应 goal/spec/plan 条款与问题描述；3) 结论为通过时，不得把无法核实项或找不到实现基线的项写成通过；4) 只评审本次 implement 基线以来的改动，不得把未改动的历史实现当作新缺陷来源。"
       }
     },
     {

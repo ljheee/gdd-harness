@@ -2,7 +2,7 @@
 
 节点编排 + entry/exit 双门禁 + 人工准入。
 可自定义节点流水线的GDD harness。
-MVP 执行端：**本地 Claude Code（headless）**。
+执行端默认是**本地 pi 进程 + 云端 OpenAI 兼容端点**（`@earendil-works/pi-coding-agent`，模型走设置页）。设 `GDD_AGENT=claude` 则改用本机 `claude -p`，使用本机登录态，不读设置页。两种协议不会自动互换。
 
 ## 核心设计
 
@@ -17,8 +17,10 @@ MVP 执行端：**本地 Claude Code（headless）**。
 ```bash
 cd /path/to/your/project
 export PYTHONPATH=/path/to/GDD        # 或 pip install -e /path/to/GDD
+(cd /path/to/GDD && npm ci)           # 在 GDD 仓库根安装 pi 执行端依赖（Node >= 22.19）
+# 启动控制台后在「设置」页配置端点 / API key / 模型；也可直接编辑 ~/.gdd/pi-settings.json
 
-# 用内置需求交付流水线初始化（七阶段+，8 节点，3 个人工确认点）
+# 用内置需求交付流水线初始化（七阶段+，9 节点，3 个人工确认点）
 gdd init --name my-change --requirement requirement.md
 
 gdd go           # 单命令交互：init→推进（主体流式）→审批→澄清（全文流式）→终态（推荐）
@@ -42,8 +44,13 @@ mkdir -p ~/gdd-workbench && cd ~/gdd-workbench
 PYTHONPATH=/path/to/GDD python3 -m gdd.ui --root .   # 打开 http://127.0.0.1:8765
 ```
 
-本地 Web 控制台：模板管理（内置 delivery + 自定义 YAML/JSON，fork 可编辑）、从模板启动任务、
+本地 Web 控制台：模板管理（内置 delivery + 自定义 YAML/JSON）、从模板启动任务、
 任务列表、节点流程图（当前节点/待审批高亮/门禁重试/完成态）、审批与重试一键操作、blocked 原因置顶。
+模板页默认「可视化」视图：按模板 `nodes` 顺序展示节点流程与详情；自定义 JSON 模板可直接用结构化表单
+编辑流水线级 `name`/`description`/`session_preset`/`git_delivery` 与节点多数字段（含 `subject`、`approval`、
+`entry`/`exit` 门禁），节点 `id` 只读，`mcp`/`skills` 与节点增删/重排走「源码」视图。源码视图保留原文
+查看/编辑；YAML 模板仅源码模式。内置模板（delivery）保持内置只读、不可删除，可 fork 为新模板后编辑；
+模板管理区提供「＋ 新建模板」（默认含一个节点，创建后即可用于新建任务）。
 仅监听 127.0.0.1；详见 USER_GUIDE.md 第 10 章。
 
 ### Mac app（Tauri 2 壳，`src-tauri/`）
@@ -84,8 +91,8 @@ cargo tauri build --bundles app
 
 - `gddHome` 必须包含 `gdd/ui.py`；`python` 必须是 ≥3.10 的绝对路径；`workbenchRoot`
   默认 `~/gdd-workbench`（不存在时自动创建），其下每个子目录是一个任务。
-- `path`/`env` 可选，用于让 GUI 启动的控制台找到 `claude`/`codex` 等 Agent CLI
-  （如 `GDD_AGENT_BIN`）。配置中的 `env` 值不会写入日志。
+- `path`/`env` 可选，用于让 GUI 启动的控制台找到 pi 执行端
+  （如 `GDD_AGENT_BIN` / `GDD_PI_SETTINGS`）。配置中的 `env` 值不会写入日志。
 
 行为与边界：
 
@@ -148,7 +155,7 @@ cargo tauri build --bundles app
 - **blocked / retry**：blocked 时记录责任节点 `blocked_owner`（entry 打回型指向上游节点）。`gdd retry` 把执行点指回责任节点并清零其计数：普通型重跑节点主体；门禁故障型（exit_retry/pending 相位）仅重跑门禁不重跑主体。
 - **approval.required**：exit 通过后是否需人工准入才进入下一阶段（request_approval）；默认 false（exit 通过即进入下一阶段）。交互终端内联 y/n/a；非交互（CI）挂起，由 `gdd approve` 异步裁决。
 - **clarify**：是否开放「要点澄清」交互（默认 false）。两类交互严格区分：**request_approval**（强门禁卡点，裁决性的，改变状态机、消耗打回预算，仅 approval.required 节点）vs **clarification**（信息对齐性的，不动状态机、不耗预算，防线靠 exit 门禁重验）。两个窗口可用：节点启动前预对齐（pending 相位，独立澄清会话）、审批挂起时对产出追问（resume 主体会话）；`gdd chat` / 控制台 💬 卡片对话，对话落盘 `.gdd/dialogs/<node>.jsonl`；结束澄清（`/done` 或结束按钮）后主体补产 + 全新 exit 门禁强制重验。设计详见 `docs/design-clarify-resume.md`。
-- **主体会话复用**：打回重跑时复用上一轮主体会话（`claude -p --resume <sid>`，反馈以「继续修改」注入而非重发全量上下文）；门禁会话永不复用（独立判定防带偏）。打回 ≥2 次后改全新会话（防上下文膨胀）；**两个豁免**：turns 打满自动续跑正交于打回预算（`auto_continues > 0` 时仍续会话）、审批挂起澄清后的收尾轮强制续会话（review 澄清对话发生在主体会话上，新会话不可见）；主体成功后 `auto_continues` 清零（防一次已解决事件永久解除防污染门）。resume 失效自动降级全新重试。`GDD_SUBJECT_RESUME=off` 可关闭。跨节点复用可配置（`session_group`/`session_preset` 预设 independent/clarify-design/shared，内置 delivery 为 clarify-design：澄清设计链共享会话、实现测试独立——设计详见 `docs/design-session-group.md`）。
+- **主体会话复用**：打回重跑时复用上一轮主体会话（`pi --session-id <sid>`，反馈以「继续修改」注入而非重发全量上下文）；门禁会话永不复用（独立判定防带偏）。打回 ≥2 次后改全新会话（防上下文膨胀）；**两个豁免**：turns 打满自动续跑正交于打回预算（`auto_continues > 0` 时仍续会话）、审批挂起澄清后的收尾轮强制续会话（review 澄清对话发生在主体会话上，新会话不可见）；主体成功后 `auto_continues` 清零（防一次已解决事件永久解除防污染门）。resume 失效自动降级全新重试。`GDD_SUBJECT_RESUME=off` 可关闭。跨节点复用可配置（`session_group`/`session_preset` 预设 independent/clarify-design/shared，内置 delivery 为 clarify-design：澄清设计链共享会话、实现测试独立——设计详见 `docs/design-session-group.md`）。
 - **baseline_marker**：进入该节点主体工作时记录 git 基线 commit。
 - **exit.change_aware**：exit 门禁注入 `git diff --stat baseline`（含未提交工作区改动）与 `git status`，**AI 门禁据此补充验证项并实际执行**（内置 pipeline 的 test 节点开启）。
 - **补充验证项固化（模板/实例分离）**：全局模板只在 `gdd init` 时实例化为 `.gdd/pipeline.json`，绑定本次运行。change_aware 门禁基于本轮改动推导出的补充验证项通过 verdict 的 `supplements` 字段返回，harness **只增不减**地写回运行实例：可命令化项沉淀为机器检查 `commands`（下次重试不经 LLM）、产物检查追加/收紧 `artifacts.must_contain`、不可机器化的语义项追加到 `ai_check`；按内容去重防膨胀。全局模板不受影响。
@@ -161,28 +168,42 @@ cargo tauri build --bundles app
 
 ## 内置 pipeline：delivery（需求交付，七阶段+）
 
-`project_init → survey → clarify → plan → implement → test → delivery → release_checklist`
+`project_init → survey → clarify → plan → implement → review → test → delivery → release_checklist`
 
 - 人工确认 3 节点：**clarify**（DoD）、**plan**（方案）、**test**（上线前测试结论）。
 - 每个节点内置基础 entry（上游产物机器检查 + AI 门禁语义验证——注意：内置模板每个 entry 都带 goal，即每节点最多 3 个 AI 会话：entry 门禁 + 主体 + exit 门禁）与 exit（本节点产物 + AI 判据）。
-- implement 为 baseline_marker 节点；test 的 exit 为 change_aware（AI 基于改动补充验证）。
-- 各节点产物都在 `iterations/<名字>/`：`requirement.md`、`survey.md`、`goal.md`（DoD）、`spec.md`、`plan.md`（ADR）、`acceptance.feature`、`decisions.md`、`impl-ledger.md`（核销台账）、`test-report.md`、`verify.md`、`delivery.md`、`RELEASE-CHECKLIST.md`。不写项目的 `docs/`，也不写仓库根目录。已有迭代的 `spec.md` 和 `decisions.md` 在下次初始化时列为只读基线。同名目录已有文件则拒绝再初始化。
+- implement 为 baseline_marker 节点；**review** 是独立只读代码评审节点：每次进入新建会话、工具仅 Read/Grep/Glob，核对本次 implement 基线以来的改动是否满足 goal/spec/plan；不通过打回 implement（计入 implement 的 bounces），通过才进入 test；不新增人工审批，报告由 harness 落盘为 `review.md`。
+- test 的 exit 为 change_aware（AI 基于改动补充验证）。
+- 各节点产物都在 `iterations/<名字>/`：`requirement.md`、`survey.md`、`goal.md`（DoD）、`spec.md`、`plan.md`（ADR）、`acceptance.feature`、`decisions.md`、`impl-ledger.md`（核销台账）、`review.md`（评审结论 + 问题清单）、`test-report.md`、`verify.md`、`delivery.md`、`RELEASE-CHECKLIST.md`。不写项目的 `docs/`，也不写仓库根目录。迭代名不能与项目目录同名。同一项目的下一次迭代换一个名字，新产物写入新目录，已有 `iterations/<名字>/` 保持不动。已有迭代的 `spec.md` 和 `decisions.md` 在下次初始化时列为只读基线。同名目录已有文件则拒绝再初始化。
 
 ## Agent 执行端配置（环境变量）
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `GDD_AGENT_BIN` | `claude` | 任一兼容 CLI（headless 读 stdin、输出 result JSON） |
-| `GDD_AGENT_PRE_ARGS` | - | 插在 bin 之后、`-p` 之前的参数（shlex 切分） |
-| `GDD_AGENT_MODEL` | - | 传给 `--model` |
+| `GDD_AGENT` | `pi` | 执行端家族：`pi` 或 `claude`。未设置时看 `GDD_AGENT_BIN` 的文件名：以 `claude` 开头则是 `claude`，否则是 `pi`。显式值优先于文件名。两种协议不自动回退 |
+| `GDD_AGENT_BIN` | 随家族 | 该执行端的可执行文件。`pi` 未设置时依次找 `<项目根>/node_modules/.bin/pi`、PATH 上的 `pi`。`claude` 未设置时用 PATH 上的 `claude` |
+| `GDD_AGENT_PRE_ARGS` | - | 插在可执行文件之后、协议参数之前（shlex 切分） |
+| `GDD_AGENT_MODEL` | - | `pi`：覆盖设置页模型。`claude`：传给 `--model` |
 | `GDD_AGENT_EXTRA_ARGS` | - | 附加参数（shlex） |
 | `GDD_AGENT_TIMEOUT` | 7200 | 单会话超时秒数（默认 2 小时；重主体节点如 plan/implement 实跑可能超 900s，勿设太短） |
-| `GDD_AGENT_MAX_TURNS_GATE` | 40 | 门禁会话 max-turns（实跑调优：15 不够复核大量 DoD 证据，40 一次通过；门禁复查型会话一般 30-50 足够） |
+| `GDD_AGENT_MAX_TURNS_GATE` | 40 | 门禁会话 turn 预算。pi 统计 `turn_end` 后终止；claude 传给 `--max-turns`。实跑调优：15 不够复核大量 DoD 证据，40 一次通过 |
 | `GDD_CHECK_TIMEOUT` | 600 | 机器检查命令超时秒数 |
-| `GDD_SUBJECT_RESUME` | on | 打回重跑是否复用主体会话（`--resume`）；`off` 强制全新会话 |
-| `GDD_SUBJECT_AUTO_CONTINUES_MAX` | 4 | 主体会话 turns 打满（error_max_turns）后自动 `--resume` 续跑的轮数上限（每轮继续配满 max_turns；超限转 gate_error → blocked 人工裁决） |
-| `GDD_STEER` | on | working 期间补充信息。`off` 不挂 PostToolUse、会话结束也不补送 |
-| `GDD_STEER_HOME` | `~/.gdd/steer` | 补充队列与 hook 配置目录（在项目仓库外） |
+| `GDD_SUBJECT_RESUME` | on | 打回重跑是否复用主体会话（pi 用 `--session-id`，claude 用 `--resume`）；`off` 强制全新会话 |
+| `GDD_SUBJECT_AUTO_CONTINUES_MAX` | 4 | 主体会话 turn 预算打满后自动续跑的轮数上限（pi 用 `--session-id`，claude 用 `--resume`；超限转 gate_error → blocked 人工裁决） |
+| `GDD_PI_SETTINGS` | `~/.gdd/pi-settings.json` | 设置文件路径覆盖（测试/多环境用） |
+| `GDD_PI_AGENT_DIR` | `~/.gdd/pi-agent/<项目键>` | pi 隔离 agent 目录覆盖（models.json/auth.json/mcp.json） |
+| `GDD_PI_SESSION_DIR` | `~/.gdd/pi-sessions/<项目键>` | pi 会话存储目录覆盖 |
+| `GDD_STEER` | on | working 期间补充信息。`off` 不加载 pi steer 扩展、会话结束也不补送 |
+| `GDD_STEER_HOME` | `~/.gdd/steer` | 补充队列与扩展配置目录（在项目仓库外） |
+
+pi 执行端依赖与设置：
+
+- 仓库根 `package.json` 锁定 `@earendil-works/pi-coding-agent@1.4.0`、`pi-subagents@0.88.0`，Node `>=22.19.0`；提交 `package-lock.json`，缺失时执行 `npm ci`。
+- 主体会话加载 `pi-subagents` 扩展（具备 subagent 工具）；entry/exit 门禁、对抗会话不加载。GDD 自身的按任务并行仍由 harness 调度。
+- 端点、API key、模型在 Web UI「设置」页配置；API key 只写入 `~/.gdd/pi-settings.json`（0600）与隔离 agent 目录的 `auth.json`（0600），不进入 argv。优先级：`GDD_AGENT_MODEL` > 设置页模型；baseUrl/apiKey 只来自设置文件。
+- 节点声明的 MCP 写入隔离 agent 目录 `mcp.json`；`SKILL.md` 目录通过 `--skill` 加载。用户给出的 `.claude-plugin` 目录不直接挂载，遇到会明确报配置错误。
+- 缺少 pi 依赖、缺少设置或端点 401/403 时会话失败并给出「`npm ci` / 设置页」处置提示，不静默改走 claude。
+- `GDD_AGENT=claude` 走本机 `claude -p --output-format stream-json --verbose --include-partial-messages`（引入 pi 之前的流式 headless）。有界面回调时按 `text_delta` / 工具事件推送；没有回调也仍用这套命令，结论取末行 `type=result`。不读设置页，不写 `auth.json`。headless 默认加 `--dangerously-skip-permissions`，避免无人应答权限提示；已在 `GDD_AGENT_EXTRA_ARGS` 里写过则不重复。未登录时错误指向本机 `claude` 登录。同一份节点声明：MCP 用 `--mcp-config`；skill 列表打成仓库外的临时插件，用 `--plugin-dir` 挂上。不使用 `--skill`，也不传 `--strict-mcp-config`。用户给出的 `.claude-plugin` 目录仍然拒绝。
 
 > 存量实例兼容：升级后 NodeSpec 新增字段（如 `clarify`）会改变流水线指纹，`run` 时自动识别 legacy 实例（剔除新增键后指纹匹配）并重写实例刷新指纹；其他任何指纹不一致仍 fail-closed blocked。
 
@@ -212,6 +233,11 @@ python3 tests/test_clarify.py # 主体会话 resume / 要点澄清通道 / legac
 python3 tests/test_steer.py   # working 补充：hook 消费 / 不占锁 / 结束补送一次
 python3 tests/test_node_ext.py # 节点多个 MCP/skill：只挂主体，门禁不继承
 
+# 模板可视化/结构化编辑/新建模板（本迭代新增）
+python3.12 tests/test_template_ui_api.py    # 保存逐字段相等与非法拒绝、编辑后建任务、内置只读/fork、YAML 源码兼容、实例隔离
+python3.12 tests/test_template_ui_static.py # 表单字段覆盖与零前端依赖/文档关键词静态检查
+python3.12 tests/test_template_ui_e2e.py    # 浏览器 e2e：可视化视图、表单编辑、新建模板、未展示字段保留
+
 # Mac app（Tauri 2 壳）
 cd src-tauri && cargo test          # 配置校验 / 探测 / 进程监管单元与集成测试
 bash scripts/verify_app.sh          # D1/D14 静态检查（Tauri 配置、资源、ATS、文档）
@@ -222,21 +248,29 @@ python3.12 scripts/verify_gui.py --check-error-dialogs  # D9/D11 错误对话框
 python3.12 scripts/verify_gui.py --check-8765-reuse     # 8765 有控制台时做只读复用验证
 ```
 
+> `tests/test_template_ui_e2e.py` 需要可 `import playwright` 的 Python 解释器，并使用系统 Chrome
+> （`chromium.launch(channel="chrome", headless=True)`）。**Playwright 仅用于测试阶段的 e2e 自动化，
+> 不是产品运行时依赖**：`gdd/ui.py`、Tauri 壳与用户浏览器均不需要安装，控制台仍为零依赖内嵌单页。
+> 其余模板测试用 `python3.12`（YAML 用例需本机可用 PyYAML）。
+
 > 8765 被用户正在使用的控制台占用时，应用级脚本用测试钩子 `GDD_CONSOLE_TEST_PORT`
 > 选择空闲端口做隔离验证；生产端口固定 8765 由 `supervisor::DEFAULT_PORT` 单元测试守护。
 > `verify_gui.py` 在本机缺少「屏幕录制」权限时无法截屏，会以 WKWebView 实际 URL 与
 > DOM 文本作为窗口内容证据。
 
-stub agent（`tests/stub_agent.py` + `GDD_STUB_SCRIPT`）可无模型跑全链路。
+pi stub（`tests/pi_stub.py` + `GDD_PI_STUB_SCRIPT`）可无模型跑全链路；`tests/test_pi_integration.py` 用本地 mock OpenAI 端点跑真实 pi 最小会话。
 
 ## 代码结构
 
 ```
 gdd/
   models.py        # Pipeline/Node/Gate/Approval/Subject 数据模型（零依赖 JSON）
-  runner.py        # 本地 Agent 适配器（claude -p headless，会话级隔离）
-  node_ext.py      # 节点 MCP/skill：生成仓库外配置，只挂主体会话
-  steer.py         # working 补充队列与 PostToolUse hook（仓库外，不占 .gdd/lock）
+  runner.py        # pi 执行端适配器（JSONL 事件、会话续跑、turn 预算、隔离 agent 目录）
+  pi_settings.py   # 设置页持久化（端点/API key/模型，脱敏与 0600）
+  acceptance.py    # acceptance.feature 的 Scenario 与 @task 关联解析/校验
+  taskgraph.py     # 任务依赖附录解析、就绪任务与下游闭包
+  node_ext.py      # 节点 MCP/skill 暂存：pi 用 mcp.json 与 --skill，claude 用 --mcp-config 与临时插件
+  steer.py         # working 补充队列（仓库外，不占 .gdd/lock）；steer_pi_extension.mjs 负责 pi 侧送达
   gates.py         # entry/exit 门禁：机器检查 + 独立 AI 验证 + verdict 解析（fail-closed）
   approval.py      # request_approval：交互确认 / 非交互挂起
   orchestrator.py  # 编排引擎：相位状态机、打回、审批、澄清、blocked/retry、状态持久化
@@ -257,7 +291,8 @@ assets/            # app 图标源文件（icons 由 cargo tauri icon 生成）
 
 ## 边界（MVP 已知限制）
 
-- 顺序流水线（无并行/分支 DAG）；打回只能回退到相邻节点。
+- 节点之间是顺序流水线（无分支 DAG），打回只能回退到相邻节点；implement 节点内部按方案附录「任务依赖」并行执行就绪任务，验收失败的 `code` 用例按 `@task:` 关联只失效相关任务及其下游。
+- 执行端是 `GDD_AGENT` 选定的一种：默认 pi（本地子进程 + 云端 OpenAI 兼容端点），或本机 claude headless。pi 命令不带 `--output-format/--max-turns/--allowedTools/--settings/--mcp-config/--plugin-dir/--resume`；这些参数只出现在 claude 命令里。`.claude-plugin` 目录不加载。
 - 主体会话上下文不跨节点共享，只通过产物文件传递（设计使然，非缺陷）。
 - AI 门禁仍依赖 LLM 输出 verdict——但机器检查层不依赖；关键判据应尽量放进 artifacts/commands。
 - **门禁 AI 会话带 Bash 工具**：prompt 约束「禁止修改文件」是软约束，理论上门禁可用 bash 写文件伪造产物再放行；机器检查层（must_contain 正则）可部分拦截，语义判据仍可能被自造证据欺骗。

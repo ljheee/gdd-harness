@@ -40,6 +40,12 @@ def test_bind_and_refuse():
             raise AssertionError("缺名字应拒绝")
         except ValueError as e:
             check("--name" in str(e), "缺名字被拒绝")
+        project = os.path.basename(root)
+        try:
+            prepare(PIPE, root, name=project)
+            raise AssertionError("与项目目录同名应拒绝")
+        except ValueError as e:
+            check("项目目录" in str(e), "迭代名不能等于项目目录名")
         os.makedirs(os.path.join(root, "iterations", "old"))
         with open(os.path.join(root, "iterations", "old", "spec.md"), "w") as f:
             f.write("# 旧规格\n")
@@ -58,7 +64,9 @@ def test_bind_and_refuse():
             prepare(PIPE, root, name="new-1")
             raise AssertionError("同名已有文件应拒绝")
         except ValueError as e:
-            check("已有文件" in str(e), "同名目录被拒绝")
+            check("已有文件" in str(e) and "删掉" not in str(e), "同名目录被拒绝且不建议删目录")
+        check(os.path.isfile(os.path.join(root, "iterations", "new-1", "goal.md")),
+              "拒绝同名时已有产物还在")
         custom = {"id": "c", "nodes": [{"id": "n", "subject": {"goal": "写 a.md"},
                                         "exit": {"artifacts": [{"path": "a.md"}]}}]}
         kept = prepare(custom, root, name="other")

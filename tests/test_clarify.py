@@ -21,11 +21,13 @@ import tempfile
 import urllib.error
 import urllib.request
 
+os.environ["GDD_AGENT"] = "pi"
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ.setdefault("PYTHONPATH", ROOT)
 
-STUB = os.path.join(ROOT, "tests", "stub_agent.py")
+STUB = os.path.join(ROOT, "tests", "pi_stub.py")
 PASS = 'GDD-VERDICT: {"verdict": "pass", "reason": "stub通过", "evidence": ["e1"], "feedback": ""}'
 
 
@@ -123,8 +125,16 @@ def main():
     with open(script, "w", encoding="utf-8") as f:
         json.dump([{"patterns": ["GDD-ROLE"], "text": PASS}], f, ensure_ascii=False)
     os.environ["GDD_AGENT_BIN"] = sys.executable
-    os.environ["GDD_AGENT_PRE_ARGS"] = STUB  # cmd = python3 stub_agent.py -p ...
-    os.environ["GDD_STUB_SCRIPT"] = script
+    os.environ["GDD_AGENT_PRE_ARGS"] = STUB  # cmd = python3 pi_stub.py --print ...
+    os.environ["GDD_PI_STUB_SCRIPT"] = script
+    pi_home = tempfile.mkdtemp(prefix="gdd-clarify-pi-")
+    settings = os.path.join(pi_home, "settings.json")
+    with open(settings, "w", encoding="utf-8") as f:
+        json.dump({"version": 1, "baseUrl": "https://api.example.com/v1",
+                   "apiKey": "k", "model": "m"}, f)
+    os.environ["GDD_PI_SETTINGS"] = settings
+    os.environ["GDD_PI_AGENT_DIR"] = os.path.join(pi_home, "agent")
+    os.environ["GDD_PI_SESSION_DIR"] = os.path.join(pi_home, "sessions")
 
     gdd_ui.Handler.root = workdir
     srv = gdd_ui.ThreadingHTTPServer(("127.0.0.1", 0), gdd_ui.Handler)
@@ -160,8 +170,8 @@ def main():
     check(r["ok"] and r.get("started"), "第二轮 chat")
     wait_for(c, "t1", lambda x: not x["running"], desc="第二轮对话结束")
     cl_logs = logs_for(workdir, "t1", "clarify_pending")
-    check(any("--resume" in (lg.get("cmd") or []) for lg in cl_logs[1:]),
-          "第二轮澄清会话带 --resume（首轮为全新会话）")
+    check(any("--session-id" in (lg.get("cmd") or []) for lg in cl_logs[1:]),
+          "第二轮澄清会话带 --session-id（首轮为全新会话）")
     st = json.load(open(os.path.join(workdir, "t1", ".gdd", "state.json"), encoding="utf-8"))
     check(st["node_states"]["plan"]["sessions"].get("clarify"), "澄清会话 sid 稳定复用")
 
@@ -182,7 +192,7 @@ def main():
     st = json.load(open(os.path.join(workdir, "t1", ".gdd", "state.json"), encoding="utf-8"))
     check(st["node_states"]["plan"]["sessions"].get("subject") == sid1, "主体 sid 跨打回一致（复用）")
     sr = logs_for(workdir, "t1", "subject_resume")
-    check(any("--resume" in (lg.get("cmd") or []) for lg in sr), "resume 会话 cmd 带 --resume")
+    check(any("--session-id" in (lg.get("cmd") or []) for lg in sr), "resume 会话 cmd 带 --session-id")
     check(d["nodes"][0]["bounces"] == 1, "驳回计入 bounces=1")
 
     # ---------- C4 clarify review：审批挂起时对话 + 强制重验（此时 bounces=1，resume 生效） ----------
@@ -195,7 +205,7 @@ def main():
     d = c.get("/api/task/t1")
     check(d["status"] == "awaiting_approval", "对话后仍停在审批挂起（状态机不变）")
     cl_logs = logs_for(workdir, "t1", "clarify_review")
-    check(any("--resume" in (lg.get("cmd") or []) for lg in cl_logs), "review 对话 resume 主体会话")
+    check(any("--session-id" in (lg.get("cmd") or []) for lg in cl_logs), "review 对话 resume 主体会话")
     st = json.load(open(os.path.join(workdir, "t1", ".gdd", "state.json"), encoding="utf-8"))
     check(st["node_states"]["plan"]["bounces"] == 1, "澄清不计入打回预算")
     r = c.post("/api/task/t1/action", {"op": "clarify_done", "node": "plan"})
@@ -209,7 +219,7 @@ def main():
     exit_prompts = [(lg.get("prompt") or "") for lg in exit_logs[n_exit_before:]]
     check(any("明显偏离则 fail" in p and "打回修改项：逐项核实" not in p for p in exit_prompts),
           "澄清纪要按 kind 识别为非强制判据 lead（且非打回 lead）")
-    check(not any("--resume" in (lg.get("cmd") or []) for lg in exit_logs[n_exit_before:]),
+    check(not any("--session-id" in (lg.get("cmd") or []) for lg in exit_logs[n_exit_before:]),
           "重验的 exit 门禁为全新会话（永不 resume）")
     st = json.load(open(os.path.join(workdir, "t1", ".gdd", "state.json"), encoding="utf-8"))
     check(st["node_states"]["plan"]["bounces"] == 1, "重验路径不消耗打回预算")
@@ -219,13 +229,13 @@ def main():
     # ---------- C2 打回≥2 次后不再 resume ----------
     print("[C2] 打回 2 次后停止复用")
     sr = logs_for(workdir, "t1", "subject_resume")
-    n_resume_before = len([lg for lg in sr if "--resume" in (lg.get("cmd") or [])])
+    n_resume_before = len([lg for lg in sr if "--session-id" in (lg.get("cmd") or [])])
     c.post("/api/task/t1/action", {"op": "reject", "feedback": "第二次"})
     d = wait_for(c, "t1", lambda x: x["status"] == "awaiting_approval", desc="第二次驳回后挂起")
     st = json.load(open(os.path.join(workdir, "t1", ".gdd", "state.json"), encoding="utf-8"))
     check(st["node_states"]["plan"]["bounces"] == 2, "bounces=2")
     sr2 = logs_for(workdir, "t1", "subject_resume")
-    n_resume_after = len([lg for lg in sr2 if "--resume" in (lg.get("cmd") or [])])
+    n_resume_after = len([lg for lg in sr2 if "--session-id" in (lg.get("cmd") or [])])
     check(n_resume_after == n_resume_before, "bounces>=2 后新尝试为全新会话（不再 resume）")
 
     # 收尾：批准 → 完成
@@ -498,8 +508,8 @@ nodes:
     # 同组 n2 主体轮应带 --resume；异组 n3 主体轮应全新（不带）
     subj_logs = logs_for(workdir, "t-sg", "subject")
     sg_logs = logs_for(workdir, "t-sg", "subject_resume")
-    check(any("--resume" in (lg.get("cmd") or []) for lg in sg_logs),
-          "同组 n2 主体轮 cmd 带 --resume（复用 n1 会话）")
+    check(any("--session-id" in (lg.get("cmd") or []) for lg in sg_logs),
+          "同组 n2 主体轮 cmd 带 --session-id（复用 n1 会话）")
     # 跨节点继承会话的 resume 轮必须是完整任务书（节点角色/目标/原始需求齐备），
     # 而非「上轮会话中断」空指令——会话里只有上游节点的任务书，本节点目标必须重述
     _n2 = [lg for lg in sg_logs if "[[GDD-ROLE:subject node:n2]]" in (lg.get("prompt") or "")]

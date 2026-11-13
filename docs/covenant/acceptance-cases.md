@@ -12,17 +12,50 @@ DoD 的分层验证结果写在 `test-report.md` 的 `## 验证结果`。那份�
 
 文件至少有一行 `Feature:`。一条用例是一行 `Scenario:`。用例 id 是 `Scenario:` 后面去掉首尾空白的标题。同一文件里标题唯一。
 
+每个 Scenario 前必须写至少一个 `@task:<任务ID>` tag，关联同一 `plan.md` 附录「任务依赖」里的任务。tag 行要紧挨着 `Scenario:`（中间不能有空行或其他语句），可写多行或多个 tag；其他 tag（如 `@smoke`）允许存在并被忽略。
+
 ```gherkin
 Feature: 验收
+  @smoke @task:A1 @task:B1
   Scenario: 主路径
     Given 就绪
     When 执行
     Then 通过
 ```
 
-上例的用例 id 是 `主路径`。
+上例的用例 id 是 `主路径`（tag 不改变 id），关联任务 `A1`、`B1`。
 
-内置交付模板的出口检查只要求文件里出现 `Feature:`。harness 不解析 Gherkin；标题是否唯一、步骤是否完整，由写作者和对抗会话对照本契约。
+关联规则：
+
+- 任务 ID 语法同附录：字母开头，仅字母数字 `_` `-`，最长 32；`@task:` 后为空或语法非法按失败处理。
+- 同一 Scenario 重复写同一个任务 ID 时去重，按一个算；一个 Scenario 可以关联多个任务。
+- 只要求每个用例至少关联一个真实任务，不要求附录里每个任务都被用例覆盖。
+- `plan.md` 含「## 附录：任务依赖」时，plan 节点出口由 harness 解析本文件并校验：至少一个 Scenario、每个 Scenario 至少一个 `@task:`、每个任务 ID 存在于该附录、tag 合法。任一不满足 → plan 出口 fail，反馈列出具体 Scenario 标题与缺失/非法任务 ID。
+- `plan.md` 没有任务附录时（仅自定义流水线）跳过关联校验，保留单会话开发行为。
+- 解析器只做行级解析（tag 行 + `Scenario:` 行），不实现完整 Gherkin；只识别 `Scenario:`，不识别 `Scenario Outline:`。
+
+无效示例（以下都会被方案出口拒绝）：
+
+```gherkin
+# 1. 没有 tag
+Scenario: 未关联
+  Given 就绪
+
+# 2. tag 为空
+@task:
+Scenario: 空 ID
+
+# 3. tag 指向附录里不存在的任务
+@task:T999
+Scenario: 未知任务
+
+# 4. tag 行与 Scenario 之间有空行（不构成关联）
+@task:T1
+
+Scenario: 断开的 tag
+```
+
+内置交付模板的出口机器检查只要求文件里出现 `Feature:`；关联完整性与标题唯一由 harness 的关联校验和写作者/对抗会话共同保证。harness 不解析 `Given/When/Then` 步骤内容。
 
 ## 2. verify.md
 
@@ -74,4 +107,4 @@ GDD-ADVERSARIAL: {"cases":"每条用例的 id、result、cause、reason"}
 
 `cause` 为 `env` 且 `result` 为 `pass` 时，harness 改记为 `fail`。`cases` 为空不能当成全部通过。
 
-失败的去向：`spec` 进入决策定级；`code` 退回实现，并带上同一轮全部失败用例；其余失败留在测试。定级规则见 `docs/covenant/decision-grade.md`。
+失败的去向：`spec` 进入决策定级；`code` 退回实现——按失败用例的 `@task:` 关联取任务并集，再叠加依赖图上的传递下游任务，只让这些任务失效重跑，未关联且不受影响的任务保持完成；一条 `code` 失败用例找不到关联时整轮回退为整体打回实现，并记录 `task_route_fallback`。其余失败留在测试。定级规则见 `docs/covenant/decision-grade.md`。

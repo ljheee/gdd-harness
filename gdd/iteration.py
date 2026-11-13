@@ -1,8 +1,9 @@
 """一次迭代的产物目录和交付分支。
 
 内置交付流水线用 {{output}}、{{name}} 占位。出现 {{output}} 时，产物目录绑定成
-iterations/<名字>/。{{name}} 换成这次的名字，交付分支默认 gdd/<名字>。
-只出现 {{name}} 时不改产物路径。
+iterations/<名字>/。这个名字是迭代名，不能与项目目录同名；同一项目的下一次
+迭代换一个名字，已有目录保持不动。{{name}} 换成这次的名字，交付分支默认
+gdd/<名字>。只出现 {{name}} 时不改产物路径。
 同一次任务中断后靠已有 .gdd 续跑；目录里已经有文件则拒绝同名再初始化。
 """
 from __future__ import annotations
@@ -38,6 +39,11 @@ def validate_branch(branch: str) -> str:
 
 def output_dir(name: str) -> str:
     return f"iterations/{name}"
+
+
+def project_dirname(root: str) -> str:
+    """项目目录名。迭代目录不能再用这个名字。"""
+    return os.path.basename(os.path.abspath(root))
 
 
 def default_branch(name: str) -> str:
@@ -98,10 +104,14 @@ def prepare(pipeline: Dict, root: str, name: str = "", branch: str = "",
     if not name:
         raise ValueError("这条流水线按迭代落产物，初始化必须提供 --name")
     bind_output = "{{output}}" in json.dumps(data, ensure_ascii=False)
+    if bind_output and name == project_dirname(root):
+        raise ValueError(
+            f"迭代名不能与项目目录同名（{name}）。"
+            f"换一个迭代名，产物写入 iterations/<迭代名>/，已有目录保持不动")
     if bind_output and directory_occupied(root, name):
         raise ValueError(
             f"iterations/{name} 已有文件，这个名字属于已有迭代。"
-            f"换一个名字，或删掉该目录后再初始化")
+            f"换一个迭代名，已有目录保持不动")
     out = output_dir(name) if bind_output else ""
     resolved = branch or default_branch(name)
     validate_branch(resolved)

@@ -24,8 +24,9 @@ import urllib.request
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ.setdefault("PYTHONPATH", ROOT)
+os.environ["GDD_AGENT"] = "pi"
 
-STUB = os.path.join(ROOT, "tests", "stub_agent.py")
+STUB = os.path.join(ROOT, "tests", "pi_stub.py")
 OK_TEXT = "stub 主体工作完成"
 
 PIPELINE_YAML = """\
@@ -147,10 +148,18 @@ def main():
     with open(script, "w", encoding="utf-8") as f:
         json.dump([{"patterns": ["GDD-ROLE"], "text": PASS}], f, ensure_ascii=False)
     os.environ["GDD_AGENT_BIN"] = sys.executable
-    # stub 走 PRE_ARGS：cmd = python3 stub_agent.py -p ...（stub 忽略 argv）；
-    # 若走 EXTRA_ARGS，-p 会插在脚本路径前，python3 直接报 Unknown option。
+    # stub 走 PRE_ARGS：cmd = python3 pi_stub.py --print ...
     os.environ["GDD_AGENT_PRE_ARGS"] = STUB
-    os.environ["GDD_STUB_SCRIPT"] = script
+    os.environ["GDD_PI_STUB_SCRIPT"] = script
+    pi_home = tempfile.mkdtemp(prefix="gdd-ui-pi-")
+    settings = os.path.join(pi_home, "settings.json")
+    with open(settings, "w", encoding="utf-8") as f:
+        json.dump({"version": 1, "baseUrl": "https://api.example.com/v1",
+                   "apiKey": "k", "model": "m"}, f)
+    os.environ["GDD_PI_SETTINGS"] = settings
+    os.environ["GDD_PI_AGENT_DIR"] = os.path.join(pi_home, "agent")
+    os.environ["GDD_PI_SESSION_DIR"] = os.path.join(pi_home, "sessions")
+    os.environ.pop("GDD_STEER", None)
 
     gdd_ui.Handler.root = workdir
     srv = gdd_ui.ThreadingHTTPServer(("127.0.0.1", 0), gdd_ui.Handler)
@@ -215,6 +224,35 @@ def main():
           f"非法 YAML 创建任务返回 JSON（{r.get('error')}）")
     r = c.post("/api/tasks", {"name": "t1", "template": "mine", "requirement": "做个小工具"})
     check(r["ok"], "任务创建成功")
+    r = c.post("/api/tasks", {"name": "proj-a", "template": "delivery",
+                              "requirement": "x", "iteration": "proj-a"})
+    check(not r["ok"] and "项目目录" in r.get("error", ""),
+          f"迭代名与任务名相同被拒绝（{r.get('error')}）")
+    r = c.post("/api/tasks", {"name": "proj-a", "template": "delivery", "requirement": "x"})
+    check(not r["ok"] and "迭代名" in r.get("error", ""),
+          f"delivery 缺迭代名被拒绝（{r.get('error')}）")
+    r = c.post("/api/tasks", {"name": "proj-a", "template": "delivery",
+                              "requirement": "做评审", "iteration": "round-1"})
+    check(r["ok"], f"迭代名与任务名不同可以创建（{r.get('error')}）")
+    with open(os.path.join(workdir, "proj-a", ".gdd", "pipeline.json"), encoding="utf-8") as f:
+        pipe_text = f.read()
+    check("iterations/round-1/" in pipe_text and "iterations/proj-a/" not in pipe_text,
+          "产物目录用迭代名，不用项目名")
+    kept = os.path.join(workdir, "proj-a", "iterations", "round-1", "goal.md")
+    os.makedirs(os.path.dirname(kept), exist_ok=True)
+    with open(kept, "w", encoding="utf-8") as f:
+        f.write("上一轮\n")
+    r = c.post("/api/task/proj-a/action", {"op": "reset"})
+    check(r["ok"], "重置后可以再初始化")
+    r = c.post("/api/tasks", {"name": "proj-a", "template": "delivery",
+                              "requirement": "下一轮", "iteration": "round-1"})
+    check(not r["ok"] and "已有文件" in r.get("error", ""),
+          f"同名迭代目录拒绝覆盖（{r.get('error')}）")
+    check(open(kept, encoding="utf-8").read() == "上一轮\n", "已有迭代文件保持不动")
+    r = c.post("/api/tasks", {"name": "proj-a", "template": "delivery",
+                              "requirement": "下一轮", "iteration": "round-2"})
+    check(r["ok"], f"同一项目换迭代名可以再初始化（{r.get('error')}）")
+    check(open(kept, encoding="utf-8").read() == "上一轮\n", "新迭代不改上一轮目录")
     check(os.path.exists(os.path.join(workdir, "t1", ".gdd", "state.json")), "state.json 已生成")
     d = c.get("/api/task/t1")
     check(d["ok"] and d["status"] == "running" and d["nodes"][0]["phase"] == "pending",
@@ -423,7 +461,7 @@ def main():
         json.dump([{
             "patterns": ["GDD-ROLE"],
             "text": PASS,
-            "stream_tools": [{"name": "Write", "path": "docs/out.md"}],
+            "tools": [{"name": "write", "args": {"path": "docs/out.md"}}],
         }], f, ensure_ascii=False)
     live_body = json.dumps({
         "id": "live", "name": "滚动",

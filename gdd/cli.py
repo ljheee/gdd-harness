@@ -611,7 +611,7 @@ def _go_guide_init(o: Orchestrator) -> bool:
         requirement = req
     name = ""
     if needs_iteration(pipeline):
-        print("迭代名（本次产物写入 iterations/<名字>/，分支默认 gdd/<名字>）：")
+        print("迭代名（不能与项目目录同名；产物写入 iterations/<名字>/，分支默认 gdd/<名字>）：")
         try:
             name = input("> ").strip()
         except EOFError:
@@ -955,7 +955,7 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("init", help="初始化流水线")
     p.add_argument("--pipeline", default="delivery", help="内置名（delivery）或 pipeline JSON 文件路径")
-    p.add_argument("--name", default="", help="迭代名。内置 delivery 必填，产物写入 iterations/<名字>/")
+    p.add_argument("--name", default="", help="迭代名。内置 delivery 必填，不能与项目目录同名，产物写入 iterations/<名字>/")
     p.add_argument("--branch", default="", help="交付分支，默认 gdd/<名字>")
     p.add_argument("--base", default="", help="从这条已有分支拉出交付分支，默认当前分支")
     p.add_argument("--requirement", default=None, help="需求文本文件路径，- 表示 stdin")

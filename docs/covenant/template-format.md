@@ -49,6 +49,8 @@ gdd init --pipeline my-delivery.yaml                    # 不含占位符的自�
 | `exit` | object | 空 | 出口门禁：成功的机器判据 + AI 判据（§3.3） |
 | `approval` | object | 空 | 人工准入：exit 通过后是否等人（§3.4） |
 | `clarify` | bool | `false` | 允许要点澄清：pending 或审批挂起时的人工对话窗口（§4.1） |
+| `adversarial` | bool | `false` | 主体成功后另开只读会话，按 `GDD-ADVERSARIAL` 裁决 code/test/spec/env 分流 |
+| `review` | bool | `false` | 代码评审节点：每次进入新建只读会话（Read/Grep/Glob），输出 `GDD-REVIEW` 哨兵；harness 落盘 `review.md`，不通过打回 implement |
 | `session_group` | string | `""` | 主体会话复用组（§4.2；空 = 独立） |
 | `max_bounces` | int | `3` | 打回上限：exit/审批打回计入本节点，entry 打回计入**前**节点 |
 | `baseline_marker` | bool | `false` | 进入主体工作时记录 git 基线，供 `change_aware` exit 使用 |
@@ -67,7 +69,7 @@ gdd init --pipeline my-delivery.yaml                    # 不含占位符的自�
 | `instructions` | `""` | 补充约束/方法（如"禁止自行假设"） |
 | `max_turns` | `80` | 主体会话轮次预算 |
 
-主体由 headless Agent（默认 `claude -p`）执行，产物写文件、报告写 `.gdd/logs/`。同组会话可跨节点 resume（§4.2）。
+主体由 pi 执行端（本地 `pi` 子进程 + 云端 OpenAI 兼容端点）执行，产物写文件、报告写 `.gdd/logs/`。同组会话可跨节点 resume（§4.2）。`review: true` 的节点例外：每次进入都新建只读会话，不复用任何旧会话。
 
 ### 3.2 entry（前置门禁）
 
@@ -114,7 +116,7 @@ gdd init --pipeline my-delivery.yaml                    # 不含占位符的自�
 | `branch` | `"gdd/delivery"` | 开发交付分支。内置 delivery 写成 `gdd/{{name}}`，初始化时换成 `gdd/<名字>` |
 | `remote` | `""` | 空 = 自动探测首个 remote；无 remote 则仅本地提交 |
 
-内置 delivery 的产物路径写成 `{{output}}/<文件名>`。`gdd init --name <名字>` 把 `{{output}}` 换成 `iterations/<名字>`，把 `{{name}}` 换成这个名字，并记下已有 `iterations/*/spec.md` 与 `decisions.md` 作为只读基线。只要模板里出现 `{{output}}` 或 `{{name}}`，交付分支都会换成 `gdd/<名字>`；写成 `feature/{{name}}` 也会被换成这个默认分支，要保留别的分支名就传 `--branch`。`--base` 指定从哪条已有分支拉出。只有出现 `{{output}}` 才占用 `iterations/<名字>/` 并拒绝该目录里已有文件；只出现 `{{name}}` 时产物路径保持模板原样。两个占位符都没有时，路径保持模板原样。
+内置 delivery 的产物路径写成 `{{output}}/<文件名>`。`gdd init --name <名字>` 把 `{{output}}` 换成 `iterations/<名字>`，把 `{{name}}` 换成这个名字，并记下已有 `iterations/*/spec.md` 与 `decisions.md` 作为只读基线。只要模板里出现 `{{output}}` 或 `{{name}}`，交付分支都会换成 `gdd/<名字>`；写成 `feature/{{name}}` 也会被换成这个默认分支，要保留别的分支名就传 `--branch`。`--base` 指定从哪条已有分支拉出。只有出现 `{{output}}` 才占用 `iterations/<名字>/` 并拒绝该目录里已有文件。这个名字不能与项目目录同名；同一项目的下一次迭代换一个名字，已有目录保持不动。只出现 `{{name}}` 时产物路径保持模板原样。两个占位符都没有时，路径保持模板原样。
 
 ### 3.7 mcp / skills（仅主体会话）
 
@@ -136,15 +138,15 @@ skills:
   - skills/review           # 目录里要有 SKILL.md
   - path: skills/test
     name: tester            # 可选；缺省用目录名
-  - /abs/path/to/plugin     # 含 .claude-plugin/plugin.json 时按插件目录原样加载
+  - /abs/path/to/skill     # 绝对路径可指向仓库外的共用 skill
 ```
 
 - 相对路径的每一段都不能是 `..`。解析符号链接之后也必须留在项目根里。绝对路径可以，用来指向仓库外的共用 skill。
 - 名字字母或数字开头，只含字母数字、`_`、`-`。同一节点里 MCP 名字不能重复。mcp 文件里的 server 走同一套规则：`command` 与 `url` 两种都检查 `args` / `env` / `headers` 里的换行；只保留这些字段和 `timeout`。`url` 必须带 `type`（`http` 或 `sse`），缺了这一轮主体会话失败。
-- 主体进程启动时，gdd 在仓库外生成一份仅所有者可读的 `mcp.json`，并给 Claude 追加 `--mcp-config`。多个 skill 目录打进一个临时插件，追加 `--plugin-dir`。这是**追加**：用户自己已经配的 MCP / skill 仍然在。节点删掉声明后，仓库外的旧配置会清掉。skill 目录里的符号链接如果指向该目录之外，这一轮主体会话失败，避免把目录外的文件拷进插件。
+- 主体进程启动时，gdd 在仓库外生成一份仅所有者可读的 `mcp.json`。pi 把它复制进隔离 agent 目录（`PI_CODING_AGENT_DIR`），从 `mcpServers` 读取；claude 用 `--mcp-config` 指向同一份文件。这是**追加**：用户自己已经配的 MCP 仍然在。节点删掉声明后，仓库外的旧配置会清掉。
+- skill 目录暂存到仓库外。pi 对每个目录加 `--skill`；claude 在同一暂存根写 `.claude-plugin/plugin.json`（`"skills": "./skills"`），用 `--plugin-dir` 挂这个临时插件。skill 目录里的符号链接如果指向该目录之外，这一轮主体会话失败，避免把目录外的文件拷进暂存副本。
 - 目录不存在或 skill 缺少 `SKILL.md` 时，这一轮主体会话失败，不静默跳过，也不把已保存的主体会话当成失效。
-- `skills[].name` 会写进暂存副本的 `SKILL.md`，Claude 按这个名字调用。
-- Codex 执行端不使用这两条 Claude 参数。
+- `.claude-plugin` 形式的插件目录不再支持；遇到时明确报配置错误，不静默忽略。
 - 没声明 mcp/skills 的节点不写这两个键，已有流水线的指纹不变。
 
 ## 4. 两个横切配置

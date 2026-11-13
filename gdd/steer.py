@@ -13,6 +13,7 @@ import json
 import os
 import shlex
 import sys
+import threading
 import time
 from typing import List
 
@@ -104,10 +105,17 @@ def prepare(root: str) -> None:
     os.makedirs(_dir(root), exist_ok=True)
     doc = json.dumps(_hooks_document(root), ensure_ascii=False, indent=2)
     for path in (claude_settings_path(root), codex_hooks_path(root)):
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(doc)
-        os.replace(tmp, path)
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(doc)
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
 
 
 def _lock(path: str):
@@ -323,11 +331,25 @@ def hook_main(queue_file: str) -> int:
     return 0
 
 
+def take_main(root: str) -> int:
+    """pi 扩展入口：取出一条补充的格式化上下文；空队列无输出。"""
+    try:
+        body = drain(root)
+    except Exception:
+        return 0
+    if body:
+        sys.stdout.write(format_context(body))
+        sys.stdout.write("\n")
+    return 0
+
+
 def main(argv=None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if len(args) >= 2 and args[0] == "hook":
         return hook_main(args[1])
-    print("usage: steer.py hook <queue>", file=sys.stderr)
+    if len(args) >= 2 and args[0] == "take":
+        return take_main(args[1])
+    print("usage: steer.py hook <queue> | take <root>", file=sys.stderr)
     return 2
 
 

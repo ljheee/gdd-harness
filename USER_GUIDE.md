@@ -7,7 +7,7 @@
 
 ## 1. GDD 是什么
 
-GDD 是一个**本地节点流水线编排引擎**：你定义节点（做什么、成功判据是什么），harness 驱动本地 Claude Code 会话干活，并用独立门禁验证每个节点是否真正完成。
+GDD 是一个**本地节点流水线编排引擎**：你定义节点（做什么、成功判据是什么），harness 驱动本地 pi 会话干活（模型推理走云端 OpenAI 兼容端点），并用独立门禁验证每个节点是否真正完成。
 
 它解决的核心问题：**LLM 自报"已完成"不可信**。GDD 中：
 
@@ -16,13 +16,15 @@ GDD 是一个**本地节点流水线编排引擎**：你定义节点（做什么
 - 流转、打回、审批、git 交付全部由 harness 代码决定
 - 会话篡改 `.gdd/` 状态会被内存权威副本自动恢复
 
-内置一条 8 节点需求交付流水线（ 七阶段+）：一句需求 → 文档 → 实现 → 测试 → 上线检查单。
+内置一条 9 节点需求交付流水线（七阶段+）：一句需求 → 文档 → 实现 → 代码评审 → 测试 → 上线检查单。
 
 ---
 
 ## 2. 安装与环境
 
-**依赖**：Python 3.10+、git、本地 Claude Code CLI（或兼容代理）。
+**依赖**：Python 3.10+、git、Node.js >= 22.19（在 GDD 仓库根执行 `npm ci` 安装 pi 执行端）。
+
+**模型配置**：默认执行端是 pi。启动 `python3 -m gdd.ui` 后，在左侧「设置」页填写端点（OpenAI 兼容 Base URL）、API key、模型，保存后对新建会话生效。改用本机 Claude 时，启动前设置 `GDD_AGENT=claude`（可执行文件可用 `GDD_AGENT_BIN` 覆盖，默认 `claude`），并先完成本机 `claude` 登录；这条路径不读设置页。
 
 **无第三方 Python 依赖**；YAML 模板可选装 PyYAML（`pip3 install pyyaml`）。
 
@@ -31,15 +33,19 @@ GDD 是一个**本地节点流水线编排引擎**：你定义节点（做什么
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `GDD_AGENT_BIN` | `claude` | Agent 可执行文件 |
-| `GDD_AGENT_PRE_ARGS` | - | 插在 bin 后、`-p` 前的参数（shlex 切分） |
-| `GDD_AGENT_MODEL` | - | 传给 `--model` |
+| `GDD_AGENT` | `pi` | `pi` 或 `claude`。未设置时，可执行文件名以 `claude` 开头则是 `claude`。显式值优先。不在两种协议之间自动回退 |
+| `GDD_AGENT_BIN` | 随家族 | 该执行端的可执行文件。pi 未设置时找 `<项目根>/node_modules/.bin/pi` 或 PATH 上的 `pi`；claude 未设置时用 PATH 上的 `claude` |
+| `GDD_AGENT_PRE_ARGS` | - | 插在可执行文件后、协议参数前（shlex 切分） |
+| `GDD_AGENT_MODEL` | - | pi：覆盖设置页模型。claude：传给 `--model` |
 | `GDD_AGENT_EXTRA_ARGS` | - | 附加参数（shlex 切分） |
 | `GDD_AGENT_TIMEOUT` | 7200 | 单会话超时秒（默认 2h；plan/implement 重节点勿设短） |
-| `GDD_SUBJECT_RESUME` | on | 打回重跑/组内后续节点是否复用主体会话（`--resume`）；`off` 强制全新会话（全局逃生舱） |
-| `GDD_AGENT_MAX_TURNS_GATE` | 40 | 门禁会话 max-turns（实跑调优：15 不够复核大量 DoD 证据，40 一次通过） |
+| `GDD_SUBJECT_RESUME` | on | 打回重跑/组内后续节点是否复用主体会话（pi：`--session-id`，claude：`--resume`）；`off` 强制全新会话 |
+| `GDD_AGENT_MAX_TURNS_GATE` | 40 | 门禁会话 turn 预算。pi 统计 `turn_end`；claude 传给 `--max-turns` |
 | `GDD_CHECK_TIMEOUT` | 600 | 机器检查命令超时秒 |
-| `GDD_SUBJECT_AUTO_CONTINUES_MAX` | 4 | 主体会话 turns 打满（error_max_turns）后自动 `--resume` 续跑轮数上限；打满即自动续跑接续干活（产物已落盘部分零丢失），超限才 blocked |
+| `GDD_SUBJECT_AUTO_CONTINUES_MAX` | 4 | 主体会话 turn 预算打满后自动续跑轮数上限（pi：`--session-id`，claude：`--resume`）；超限才 blocked |
+| `GDD_PI_SETTINGS` | `~/.gdd/pi-settings.json` | 设置文件覆盖（端点/API key/模型） |
+| `GDD_PI_AGENT_DIR` | `~/.gdd/pi-agent/<项目键>` | pi 隔离 agent 目录覆盖 |
+| `GDD_PI_SESSION_DIR` | `~/.gdd/pi-sessions/<项目键>` | pi 会话目录覆盖 |
 | `GDD_VERBOSE` | - | set 后 status 打印完整 history |
 
 ### 会话复用配置（session_group，详见 docs/design-session-group.md）
@@ -64,7 +70,7 @@ GDD 是一个**本地节点流水线编排引擎**：你定义节点（做什么
 # 1. 写需求（一句话也行）
 echo "实现一个 TODO CLI，支持增删查，带 pytest 测试" > req.md
 
-# 2. 初始化（delivery = 内置 8 节点流水线）
+# 2. 初始化（delivery = 内置 9 节点流水线，含 implement→review→test）
 python3 -m gdd.cli init --root ./myproj --name my-change --pipeline delivery --requirement req.md
 
 # 3. 开跑（会自动推进，停在人工审批点）
@@ -194,7 +200,7 @@ python3 -m gdd.cli chat --root ./proj --node plan
 gdd steer "不要引入 Redis，状态写本地文件"
 ```
 
-补充写在仓库外的队列里。Claude Code 主体会话挂着 PostToolUse：下一次工具返回后，模型能看到这段话。若本轮不再调用工具，会话结束时用 `--resume` 补送一次。不消耗打回预算，也不注入门禁会话。细节见 `docs/design-steer.md`。
+补充写在仓库外的队列里。pi 主体会话加载 steer 扩展：下一次工具返回后，模型能看到这段话。若本轮不再调用工具，会话结束时用 `--session-id` 补送一次。不消耗打回预算，也不注入门禁会话。细节见 `docs/design-steer.md`。
 
 **重来**：`gdd reset` 删除 `.gdd/`（重新实例化模板；已产出的工作区文件保留）。
 
@@ -266,12 +272,13 @@ harness 会检出滞留提交并显式报 `git_commit_fail`（非静默丢失）
 
 ## 9. 已知边界
 
-- 顺序流水线（无 DAG 并行）
+- 节点之间顺序执行；implement 内部按方案附录「任务依赖」并行，失败的 `code` 用例按 `@task:` 关联只重跑相关任务及下游。
+- 执行端由 `GDD_AGENT` 选择，默认 pi；`claude` 使用本机 `claude -p`。同一份节点声明两边都会挂上：pi 把 MCP 写入隔离目录的 `mcp.json`，每个 `SKILL.md` 目录加 `--skill`；claude 用 `--mcp-config`，并把 skill 列表打成临时插件后加 `--plugin-dir`。用户给出的 `.claude-plugin` 目录不直接挂载。
 - 门禁会话带 Bash（软约束），语义判据可能被自造证据欺骗——关键判据尽量写成机器检查（artifacts/commands）
 - 本地单人场景：无签名密钥，同时篡改 pipeline.json 与 state.json 指纹可绕过校验
 - 真实远端 push/分叉恢复未实测（本地无 remote 环境为正确 push_skip）
 
-详见 README.md「设计边界」章节；自定义流水线示例可参考内置模板 `gdd/templates/delivery.json`——复制为副本（如 `my-delivery.json`）后修改，`gdd init --name <名字> --pipeline my-delivery.json` 即可使用。内置模板文件本身是唯一权威源（`--pipeline delivery` 与直接传该文件路径等价）。内置 delivery 必须带 `--name`，过程文档写入 `iterations/<名字>/`。
+详见 README.md「设计边界」章节；自定义流水线示例可参考内置模板 `gdd/templates/delivery.json`——复制为副本（如 `my-delivery.json`）后修改，`gdd init --name <名字> --pipeline my-delivery.json` 即可使用。内置模板文件本身是唯一权威源（`--pipeline delivery` 与直接传该文件路径等价）。内置 delivery 必须带 `--name`。这个名字不能与项目目录同名，过程文档写入 `iterations/<名字>/`；同一项目的下一次迭代换一个名字，已有目录保持不动。
 
 ---
 
@@ -299,8 +306,8 @@ Agent 环境变量（`GDD_AGENT_BIN` / `GDD_AGENT_PRE_ARGS` 等）在启动 UI �
 
 | 能力 | 说明 |
 |---|---|
-| 模板管理 | 内置 `delivery` 只读可复制（fork）为新模板；自定义模板新建/编辑（YAML/JSON，保存即校验）/删除 |
-| 新建任务 | 选模板 + 一句话需求 → 创建并初始化；任务页点「启动」即跑 |
+| 模板管理 | 内置 `delivery` 保持内置只读（不可删除），可 fork 为新模板后编辑；自定义模板新建/可视化编辑/源码编辑/删除（YAML/JSON，保存即校验）。模板页默认「可视化」：按 `nodes` 顺序展示节点流程与详情，自定义 JSON 模板可用结构化表单编辑流水线级字段与节点多数字段；`id`/`mcp`/`skills` 与节点增删/重排走「源码」模式；YAML 仅源码模式；「＋ 新建模板」默认生成一个节点 |
+| 新建任务 | 选模板 + 任务名（项目目录）+ 迭代名 + 一句话需求 → 创建并初始化。迭代名不能与任务名相同，产物写入 `iterations/<迭代名>/`；任务页点「启动」即跑 |
 | 任务监控 | 侧边栏任务列表实时刷新状态（运行中/待审批/阻塞/完成）；任务页展示节点流程图——当前节点蓝色脉冲、**待审批节点琥珀色高亮 +「需人工」旗标**、门禁重试橙色、完成绿色；blocked 原因与 push 失败置顶警示 |
 
 ### 10.3 操作
@@ -313,9 +320,19 @@ Agent 环境变量（`GDD_AGENT_BIN` / `GDD_AGENT_PRE_ARGS` 等）在启动 UI �
 - **随时**：「▶ 启动/继续推进」「中止」「重置（删 .gdd）」
 - 页面 2 秒轮询自动刷新，无需手动刷新
 
+模板页操作：
+
+- **可视化查看**：打开模板默认进入「可视化」视图，按模板 `nodes` 顺序展示节点卡片（名称/ID、需人工审批、澄清/评审/对抗/git 基线等标记与描述摘要）和箭头；点击节点在下方查看详情。模板页只展示模板静态结构，任务运行态仍在任务页
+- **结构化编辑**（自定义 JSON 模板）：可修改流水线 `name`/`description`/`session_preset`/`git_delivery`，以及节点 `name`/`description`/`subject`/`approval`/`clarify`/`max_bounces`/`baseline_marker`/`adversarial`/`review`/`session_group` 与 `entry`/`exit` 门禁（含 artifacts/commands 增删行）。节点 `id` 只读；`mcp`/`skills` 与节点增删/重排请切到「源码」模式。保存前按表单收集、只覆盖表单字段，未展示字段与未知键原样保留；服务端校验失败会显示错误且不改动文件。模板修改只对之后新建的任务生效，已初始化任务不受影响
+- **源码模式 / YAML**：模板页「源码」页签可查看、编辑并保存原文；YAML 模板（或无法解析为 JSON 的内容）自动回落到源码视图，仅支持源码查看/编辑
+- **新建模板**：模板侧栏「＋ 新建模板」→ 输入模板名（可选展示名）→ 创建后默认含一个节点，立即出现在列表，可打开编辑或用于新建任务。名称支持中英文/数字/`_`/`-`（1–64 字，不能以 `-` 开头）；`delivery` 为保留名，重名会被拒绝
+- **内置模板 / fork**：内置 `delivery` 只读、不可删除、不提供保存；点「复制为新模板」得到可编辑副本（编辑能力见上）
+
 ### 10.4 安全
 
 仅监听 `127.0.0.1`（不对外）；任务名/模板名白名单校验，杜绝路径穿越；内置模板只读不可删。
+模板页与任务页仍为零依赖内嵌单页（不引入第三方前端运行时库、CDN 或前端构建链），不需要安装任何
+额外前端依赖；Playwright 仅用于测试阶段的 e2e 自动化，不是运行时依赖，使用控制台无需安装。
 
 ---
 
