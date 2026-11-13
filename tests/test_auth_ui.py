@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import http.client
 import http.cookiejar
+import io
 import json
 import os
 import socket
@@ -35,7 +36,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -51,6 +52,7 @@ DEFAULT_USER = "admin"
 DEFAULT_PASSWORD = "gdd2026"
 UNAUTH_ERROR = "未登录或登录已失效"
 BAD_LOGIN_ERROR = "用户名或密码错误"
+AUTH_CONFIG_ERROR = "鉴权配置不可用，请联系管理员"
 
 ENV_KEYS = (
     "GDD_CONSOLE_AUTH", "GDD_UI_LOCAL", "GDD_UI_SESSION_TTL", "GDD_UI_SECURE_COOKIE",
@@ -1022,6 +1024,163 @@ def run_in_process_mode(tmp, secrets):
         mock.server_close()
 
 
+# ---------------------------------------------------------------- 评审回归：登录格式非法与凭据损坏
+
+
+def raw_login(port, raw_body, content_type="application/json"):
+    """原始请求体 POST /api/login。连接被关闭等异常直接抛出，由调用方判失败。"""
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    headers = {"X-GDD-Request": "auth-test"}
+    if content_type is not None:
+        headers["Content-Type"] = content_type
+    try:
+        conn.request("POST", "/api/login", body=raw_body, headers=headers)
+        resp = conn.getresponse()
+        return resp.status, {k.lower(): v for k, v in resp.getheaders()}, resp.read()
+    finally:
+        conn.close()
+
+
+def assert_malformed_login_rejected(result, label):
+    status, hdrs, raw = result
+    check(not (200 <= status < 300), f"{label}：返回非 2xx（实际 {status}）")
+    obj = json.loads(raw.decode("utf-8", "replace"))
+    check(isinstance(obj, dict) and obj.get("ok") is False,
+          f"{label}：统一失败 JSON（{raw[:120]!r}）")
+    check(gdd_ui.SESSION_COOKIE + "=" not in hdrs.get("set-cookie", ""),
+          f"{label}：不下发会话 Cookie")
+
+
+def run_login_hardening(tmp):
+    """评审两项缺陷的回归：①格式非法登录必须有统一非 2xx 响应（不得断连）；
+    ②运行期凭据文件损坏/不可读时对外通用错误，路径与 OS 详情仅写服务端日志。"""
+    work = os.path.join(tmp, "hardening-work")
+    os.makedirs(work, exist_ok=True)
+    creds = os.path.join(tmp, "hardening-creds", "console-auth.json")
+    old_auth = os.environ.get("GDD_CONSOLE_AUTH")
+    os.environ["GDD_CONSOLE_AUTH"] = creds
+    try:
+        with running(InProcessConsole(work, creds, iterations=1000)) as console:
+            section("评审回归：登录请求格式非法统一非 2xx（不得无响应断连）")
+            malformed = [
+                ("顶层数组", b"[]"),
+                ("顶层 null", b"null"),
+                ("顶层字符串", b'"abc"'),
+                ("顶层数字", b"123"),
+                ("顶层布尔", b"true"),
+                ("空对象", b"{}"),
+                ("username 非字符串", b'{"username":["admin"],"password":"gdd2026"}'),
+                ("password 非字符串", b'{"username":"admin","password":{"x":1}}'),
+                ("password 孤立代理项",
+                 br'{"username":"admin","password":"\ud800"}'),
+                ("username 孤立代理项",
+                 br'{"username":"\ud800","password":"gdd2026"}'),
+                ("请求体非法 UTF-8", b'{"username":"\xff\xfe"}'),
+                ("超过 1MB", b"{" + b" " * 1_000_001 + b"}"),
+            ]
+            for label, raw_body in malformed:
+                try:
+                    result = raw_login(console.port, raw_body)
+                except Exception as e:
+                    raise AssertionError(
+                        f"{label}：连接被关闭而非返回 HTTP 响应"
+                        f"（{type(e).__name__}: {e}）") from e
+                assert_malformed_login_rejected(result, label)
+
+            # 同一畸形请求反复触发：每次都应有响应，服务不得崩溃。
+            for i in range(3):
+                status, hdrs, raw = raw_login(console.port, b"[]")
+                check(status == 401 and gdd_ui.SESSION_COOKIE + "="
+                      not in hdrs.get("set-cookie", ""),
+                      f"顶层数组重复请求第 {i + 1} 次：仍有统一 401 响应")
+
+            # 畸形请求之后，正常登录与会话仍工作。
+            owner = Client(console.base)
+            status, obj, _, _ = login(owner)
+            check(status == 200 and obj.get("ok"), "格式非法请求之后正常登录仍成功")
+            status, obj, _, _ = owner.get("/api/overview")
+            check(status == 200 and obj.get("ok"), "格式非法请求之后已登录 API 正常")
+
+            section("评审回归：凭据文件运行期损坏/不可读不泄露详情")
+            doc = json.loads(read_text(creds))
+            salt, digest = doc["password"]["salt"], doc["password"]["hash"]
+
+            with open(creds, "w", encoding="utf-8") as f:
+                f.write("{not-json")
+            captured = io.StringIO()
+            with redirect_stderr(captured):
+                status, hdrs, raw_bad = raw_login(
+                    console.port,
+                    json.dumps({"username": DEFAULT_USER,
+                                "password": DEFAULT_PASSWORD}).encode())
+            text = raw_bad.decode("utf-8", "replace")
+            check(status == 500, f"凭据损坏：返回 500（实际 {status}）")
+            check(json.loads(text).get("error") == AUTH_CONFIG_ERROR,
+                  f"凭据损坏：对外通用错误（{text[:120]!r}）")
+            check(creds not in text, "凭据损坏：响应不含凭据文件路径")
+            check("无法读取" not in text and "JSONDecodeError" not in text
+                  and "Expecting" not in text,
+                  "凭据损坏：响应不含底层解析/OS 详情")
+            check(DEFAULT_PASSWORD not in text and salt not in text
+                  and digest not in text, "凭据损坏：响应不含明文/盐/哈希")
+            check(gdd_ui.SESSION_COOKIE + "=" not in hdrs.get("set-cookie", ""),
+                  "凭据损坏：不下发会话 Cookie")
+            log_text = captured.getvalue()
+            check("ConsoleAuthError" in log_text and creds in log_text,
+                  "凭据损坏：可处置详情（含路径）写入服务端日志")
+            check(DEFAULT_PASSWORD not in log_text and salt not in log_text
+                  and digest not in log_text,
+                  "凭据损坏：服务端日志不含明文/盐/哈希")
+
+            # 已建立的会话不受凭据文件运行期损坏影响（会话在内存中）。
+            status, obj, _, _ = owner.get("/api/overview")
+            check(status == 200 and obj.get("ok"),
+                  "凭据损坏期间已登录会话仍可用（不影响存量会话）")
+
+            # 恢复凭据文件（删除后按默认账号重新初始化）→ 登录恢复。
+            os.remove(creds)
+            ConsoleAuth(creds, iterations=1000).ensure_initialized()
+            status, obj, _, _ = login(Client(console.base))
+            check(status == 200 and obj.get("ok"), "凭据文件恢复后可重新登录")
+
+            # 文件不可读（chmod 000）：root 环境下跳过，普通用户下验证通用错误。
+            os.chmod(creds, 0)
+            readable = True
+            try:
+                with open(creds, encoding="utf-8"):
+                    pass
+            except OSError:
+                readable = False
+            if readable:
+                print("  skip: 当前用户可读 000 权限文件（疑似 root），跳过不可读场景")
+            else:
+                captured = io.StringIO()
+                with redirect_stderr(captured):
+                    status, hdrs, raw_bad = raw_login(
+                        console.port,
+                        json.dumps({"username": DEFAULT_USER,
+                                    "password": DEFAULT_PASSWORD}).encode())
+                text = raw_bad.decode("utf-8", "replace")
+                check(status == 500, f"凭据不可读：返回 500（实际 {status}）")
+                check(json.loads(text).get("error") == AUTH_CONFIG_ERROR,
+                      "凭据不可读：对外通用错误")
+                check(creds not in text, "凭据不可读：响应不含凭据文件路径")
+                check("Permission denied" not in text and "Errno" not in text,
+                      "凭据不可读：响应不含底层 OS 详情")
+                check("ConsoleAuthError" in captured.getvalue(),
+                      "凭据不可读：可处置详情写入服务端日志")
+            os.chmod(creds, 0o600)
+
+            # 登出仍在鉴权入口兜底范围内正常工作。
+            status, obj, _, _ = owner.post("/api/logout", {})
+            check(status == 200 and obj.get("ok"), "登出接口正常返回 ok")
+    finally:
+        if old_auth is None:
+            os.environ.pop("GDD_CONSOLE_AUTH", None)
+        else:
+            os.environ["GDD_CONSOLE_AUTH"] = old_auth
+
+
 def main():
     env_before = save_env()
     tmp = tempfile.mkdtemp(prefix="gdd-auth-ui-")
@@ -1032,6 +1191,7 @@ def main():
         configure_stub_env(tmp, os.path.join(tmp, "sub-pi-settings.json"))
         run_subprocess_default_mode(tmp, secrets)
         run_in_process_mode(tmp, secrets)
+        run_login_hardening(tmp)
 
         section("D12 汇总：登录/页面/日志不含明文、哈希或盐")
         sensitive = [DEFAULT_PASSWORD, secrets["salt"], secrets["hash"],

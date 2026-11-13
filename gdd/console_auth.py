@@ -130,9 +130,13 @@ def verify_password(password: str, record: object) -> bool:
     if not isinstance(password, str):
         return False
     checked = _check_record(record)
+    try:
+        encoded = password.encode("utf-8")
+    except UnicodeError:
+        # 孤立代理项等无法编码为 UTF-8 的输入不可能匹配任何按 UTF-8 派生的哈希。
+        return False
     computed = hashlib.pbkdf2_hmac(
-        "sha256", password.encode("utf-8"),
-        bytes.fromhex(checked["salt"]), checked["iterations"])
+        "sha256", encoded, bytes.fromhex(checked["salt"]), checked["iterations"])
     return hmac.compare_digest(computed.hex(), checked["hash"])
 
 
@@ -207,8 +211,11 @@ class ConsoleAuth:
         expected_user = document["username"]
         # 无论用户名是否匹配都执行一次哈希，避免用响应时间区分「用户不存在」。
         password_ok = verify_password(password, document["password"])
-        user_ok = hmac.compare_digest(
-            str(username or "").encode("utf-8"), expected_user.encode("utf-8"))
+        try:
+            given_user = str(username or "").encode("utf-8")
+        except UnicodeError:
+            return False
+        user_ok = hmac.compare_digest(given_user, expected_user.encode("utf-8"))
         return bool(user_ok and password_ok)
 
 

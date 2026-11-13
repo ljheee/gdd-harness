@@ -1793,16 +1793,42 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _log_auth_error(self, exc: BaseException) -> None:
+        """鉴权配置/校验异常详情只写服务端日志；HTTP 响应不得含凭据文件路径等内容。"""
+        try:
+            sys.stderr.write(f"[gdd-ui] 登录鉴权失败：{type(exc).__name__}: {exc}\n")
+            sys.stderr.flush()
+        except (OSError, UnicodeError):
+            pass
+
+    def _auth_endpoint(self, handler) -> None:
+        """登录/登出入口兜底：任何异常都转成统一 JSON 非 2xx，绝不无响应地断开连接。"""
+        try:
+            return handler()
+        except Exception as e:  # noqa: BLE001 - HTTP 入口必须在任何输入下都有响应
+            self._log_auth_error(e)
+            try:
+                return self._json({"ok": False, "error": "服务器内部错误"}, 500,
+                                  headers=[("Cache-Control", "no-store")])
+            except OSError:
+                return None
+
     def _do_login(self) -> None:
         """POST /api/login：校验用户名/密码，成功建立会话并 Set-Cookie。"""
         no_store = ("Cache-Control", "no-store")
+        if self.local_mode:
+            return self._json({"ok": True, "localMode": True, "message": "本地模式无需登录"},
+                              headers=[no_store])
+        # 请求体必须是 JSON 对象（_body 对顶层非对象抛 ValueError）：格式非法按凭据错误
+        # 统一拒绝。若直接 body.get() 会抛 AttributeError 逃逸出 do_POST
+        # （BaseHTTPRequestHandler 只兜 TimeoutError），连接会被静默关闭、无任何 HTTP 响应。
         try:
             body = self._body()
         except (ValueError, OSError):
             return self._json({"ok": False, "error": "用户名或密码错误"}, 401,
                               headers=[no_store])
-        if self.local_mode:
-            return self._json({"ok": True, "localMode": True, "message": "本地模式无需登录"},
+        if not isinstance(body, dict):  # 防御：_body 已保证 dict，契约变化时仍按格式非法拒绝
+            return self._json({"ok": False, "error": "用户名或密码错误"}, 401,
                               headers=[no_store])
         username = body.get("username")
         password = body.get("password")
@@ -1821,7 +1847,14 @@ class Handler(BaseHTTPRequestHandler):
         try:
             ok = auth.verify(username, password)
         except ConsoleAuthError as e:
-            return self._json({"ok": False, "error": f"鉴权配置不可用：{e}"}, 500,
+            # 凭据文件不可读/损坏：对外只返回通用错误（不含路径、OS 错误等可处置详情，
+            # 避免泄露给匿名请求方），详情仅写服务端日志。
+            self._log_auth_error(e)
+            return self._json({"ok": False, "error": "鉴权配置不可用，请联系管理员"}, 500,
+                              headers=[no_store])
+        except UnicodeError:
+            # 孤立代理项（如 "\ud800"）无法编码为 UTF-8，不可能匹配任何已存凭据。
+            return self._json({"ok": False, "error": "用户名或密码错误"}, 401,
                               headers=[no_store])
         if not ok:
             return self._json({"ok": False, "error": "用户名或密码错误"}, 401,
@@ -1879,6 +1912,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _body(self) -> dict:
+        """解析 JSON 请求体：空体/非法 JSON 返回 {}；顶层必须是 JSON 对象，
+        数组/null/字符串等顶层非对象一律抛 ValueError（由各路由按格式非法拒绝），
+        保证调用方拿到的要么是 dict、要么立即进入既有错误分支，绝不因类型逃逸。"""
         n = int(self.headers.get("Content-Length") or 0)
         if n <= 0:
             return {}
@@ -1891,9 +1927,12 @@ class Handler(BaseHTTPRequestHandler):
                 n -= len(chunk)
             raise ValueError("请求体过大（>1MB）")
         try:
-            return json.loads(self.rfile.read(n).decode("utf-8"))
+            parsed = json.loads(self.rfile.read(n).decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
             return {}
+        if not isinstance(parsed, dict):
+            raise ValueError("请求体必须是 JSON 对象")
+        return parsed
 
     def _allowed_hosts(self) -> tuple:
         """同源白名单：本机回环 + GDD_UI_EXTRA_HOSTS（逗号分隔，用于 IDE 代理等反向链路，
@@ -2000,10 +2039,11 @@ class Handler(BaseHTTPRequestHandler):
         if not self._guard_mutating():
             return self._json({"ok": False, "error": "拒绝：缺少同源校验头（X-GDD-Request）或 Host 非法"}, 403)
         # 登录/登出属于鉴权自身接口：不要求已有会话，但仍受同源/CSRF 守卫保护。
+        # 这两个分支位于下方业务 try 之外，用 _auth_endpoint 兜底，防止异常逃逸成无响应断连。
         if p == "/api/login":
-            return self._do_login()
+            return self._auth_endpoint(self._do_login)
         if p == "/api/logout":
-            return self._do_logout()
+            return self._auth_endpoint(self._do_logout)
         if not self._is_authenticated():
             return self._unauthorized()
         try:
