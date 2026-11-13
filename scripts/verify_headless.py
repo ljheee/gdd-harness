@@ -156,8 +156,11 @@ def get_text(port: int, path: str) -> str:
 
 
 def create_task(port: int, name: str) -> None:
+    # delivery 模板含 {{output}}/{{name}} 占位，服务端要求 repos 或 iteration 之一；
+    # 本验收只需要一个可见任务（不执行交付），用「任务名-it」作为迭代名绑定（迭代名不能与任务目录同名），避免外部仓库依赖。
     body = json.dumps(
-        {"name": name, "template": "delivery", "requirement": f"验收测试任务 {name}"}
+        {"name": name, "template": "delivery", "iteration": name + "-it",
+         "requirement": f"验收测试任务 {name}"}
     ).encode("utf-8")
     request = Request(
         f"http://127.0.0.1:{port}/api/tasks",

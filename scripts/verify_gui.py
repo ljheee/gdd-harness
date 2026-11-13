@@ -114,8 +114,11 @@ def wait_gdd(port: int, timeout: float = 20.0) -> None:
 
 
 def create_task(port: int, name: str) -> None:
+    # delivery 模板含 {{output}}/{{name}} 占位，服务端要求 repos 或 iteration 之一；
+    # GUI 验收只需要一个可见任务（不执行交付），用「任务名-it」作为迭代名绑定（迭代名不能与任务目录同名）。
     body = json.dumps(
-        {"name": name, "template": "delivery", "requirement": "GUI 验收任务"}
+        {"name": name, "template": "delivery", "iteration": name + "-it",
+         "requirement": "GUI 验收任务"}
     ).encode()
     request = Request(
         f"http://127.0.0.1:{port}/api/tasks",
@@ -356,10 +359,15 @@ def listener_pid(port: int) -> int | None:
     return pids[0] if pids else None
 
 
-def check_8765_reuse(bundle: Path, python: str) -> int:
-    """生产端口 8765 只读复用验证：不启动、不终止任何控制台。"""
+def check_8765_reuse(bundle: Path, python: str, host: str = "127.0.0.1") -> int:
+    """生产端口 8765 只读复用验证：不启动、不终止任何控制台。
+
+    host 默认 127.0.0.1；测试可在 8765 被占用时用回环别名（如 `::1`）验证同一
+    端口上的鉴权模式 SKIP 行为，生产调用不传该参数。
+    """
+    authority = f"[{host}]" if ":" in host else host
     try:
-        with urlopen("http://127.0.0.1:8765/api/overview", timeout=2) as response:
+        with urlopen(f"http://{authority}:8765/api/overview", timeout=2) as response:
             overview = json.load(response)
         if overview.get("ok") is not True:
             raise RuntimeError("8765 响应不是 GDD 控制台")
@@ -564,6 +572,11 @@ def main() -> int:
         help="验证 D9/D11 的原生错误对话框可见性",
     )
     parser.add_argument(
+        "--check-host",
+        default="127.0.0.1",
+        help="--check-8765-reuse 使用的回环主机（默认 127.0.0.1；8765 被占用时可用 ::1）",
+    )
+    parser.add_argument(
         "--port",
         type=int,
         default=None,
@@ -580,7 +593,7 @@ def main() -> int:
     evidence = Path(args.evidence)
     evidence.mkdir(parents=True, exist_ok=True)
     if args.check_8765_reuse:
-        return check_8765_reuse(bundle, python)
+        return check_8765_reuse(bundle, python, args.check_host)
     if args.check_error_dialogs:
         return check_error_dialogs(bundle, python, evidence, args.port)
 
