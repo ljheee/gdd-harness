@@ -69,6 +69,7 @@ fn start_external_console(env: &TestEnv, port: u16) -> std::process::Child {
         .arg("--port")
         .arg(port.to_string())
         .arg("--no-open")
+        .arg("--local")
         .current_dir(&env.config.workbench_root)
         .env("PYTHONPATH", &env.config.gdd_home)
         .stdin(Stdio::null())
@@ -107,6 +108,10 @@ fn cold_start_spawns_console_with_expected_argv() {
         "argv: {cmdline}"
     );
     assert!(cmdline.contains("--no-open"), "argv: {cmdline}");
+    assert!(
+        cmdline.contains("--local"),
+        "桌面壳必须以本地模式启动控制台，argv: {cmdline}"
+    );
     assert!(handle.log_path.is_file(), "应创建控制台日志文件");
 
     kill_pid(pid);
@@ -144,9 +149,11 @@ fn running_console_is_reused_without_second_process() {
     wait_port_free(port);
 }
 
-#[test]
-fn non_gdd_service_on_port_is_rejected_without_spawn() {
-    let env = setup();
+/// 起一个固定状态码/响应体的假 HTTP 服务，返回端口、停止信号与线程句柄。
+fn spawn_stub_http(
+    status_line: &'static str,
+    body: &'static [u8],
+) -> (u16, mpsc::Sender<()>, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind dummy");
     let port = listener.local_addr().unwrap().port();
     listener.set_nonblocking(true).unwrap();
@@ -160,9 +167,8 @@ fn non_gdd_service_on_port_is_rejected_without_spawn() {
             Ok((mut socket, _)) => {
                 let mut buf = [0u8; 2048];
                 let _ = socket.read(&mut buf);
-                let body = br#"{"hello":"not gdd"}"#;
                 let head = format!(
-                    "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    "HTTP/1.0 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
                     body.len()
                 );
                 let _ = socket.write_all(head.as_bytes());
@@ -174,6 +180,13 @@ fn non_gdd_service_on_port_is_rejected_without_spawn() {
             Err(_) => break,
         }
     });
+    (port, stop_tx, server)
+}
+
+#[test]
+fn non_gdd_service_on_port_is_rejected_without_spawn() {
+    let env = setup();
+    let (port, stop_tx, server) = spawn_stub_http("200 OK", br#"{"hello":"not gdd"}"#);
 
     let error = supervisor::ensure_console(&env.config, &env.paths, port).unwrap_err();
     assert!(
@@ -185,6 +198,42 @@ fn non_gdd_service_on_port_is_rejected_without_spawn() {
         common::console_process_count(&env.config.workbench_root),
         0,
         "端口被占用时不得启动控制台"
+    );
+
+    drop(stop_tx);
+    server.join().unwrap();
+}
+
+#[test]
+fn auth_required_console_is_rejected_without_spawn() {
+    let env = setup();
+    let (port, stop_tx, server) = spawn_stub_http(
+        "401 Unauthorized",
+        "{\"ok\":false,\"error\":\"未登录或登录已失效\"}".as_bytes(),
+    );
+
+    let error = supervisor::ensure_console(&env.config, &env.paths, port).unwrap_err();
+    assert!(
+        matches!(error, SupervisorError::ConsoleAuthRequired { .. }),
+        "鉴权模式控制台应报需要登录而非端口占用：{error}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains(&port.to_string()),
+        "错误应包含端口：{message}"
+    );
+    assert!(
+        message.contains("需要登录"),
+        "错误应提示控制台需要登录：{message}"
+    );
+    assert!(
+        message.contains("仅支持本地模式"),
+        "错误应提示桌面 app 仅支持本地模式：{message}"
+    );
+    assert_eq!(
+        common::console_process_count(&env.config.workbench_root),
+        0,
+        "鉴权模式控制台存在时不得启动第二个控制台"
     );
 
     drop(stop_tx);

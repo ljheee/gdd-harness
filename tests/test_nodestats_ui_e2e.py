@@ -241,7 +241,7 @@ class Console:
         self._log = open(self.log_path, "w", encoding="utf-8")
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "gdd.ui", "--root", workdir,
-             "--port", str(self.port), "--no-open"],
+             "--port", str(self.port), "--no-open", "--local"],
             cwd=ROOT, env=env, stdout=self._log, stderr=subprocess.STDOUT)
         self._wait_ready()
 

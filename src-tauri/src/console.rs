@@ -1,5 +1,8 @@
 //! 以 argv 数组（不经过 shell）拉起 `python -m gdd.ui`。
 //!
+//! 桌面 app 只支持本地运行，因此始终追加 `--local`（免登录，仅回环）；
+//! 控制台默认是鉴权模式，缺少该参数会让桌面探针收到 401。
+//!
 //! 子进程与 app 生命周期解耦：stdin 为 null，stdout/stderr 追加写入日志文件，
 //! app 退出时不发送终止信号，控制台继续运行并由下次启动复用。
 
@@ -33,6 +36,7 @@ pub fn spawn_console(
         .arg("--port")
         .arg(port.to_string())
         .arg("--no-open")
+        .arg("--local")
         .current_dir(&config.workbench_root)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))

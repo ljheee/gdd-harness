@@ -322,6 +322,7 @@ def start_external_console(python: str, gdd_home: Path, workbench: Path, port: i
             "--port",
             str(port),
             "--no-open",
+            "--local",
         ],
         cwd=str(workbench),
         env=env,

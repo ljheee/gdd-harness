@@ -41,7 +41,7 @@ gdd abort / gdd reset --yes
 
 ```bash
 mkdir -p ~/gdd-workbench && cd ~/gdd-workbench
-PYTHONPATH=/path/to/GDD python3 -m gdd.ui --root .   # 打开 http://127.0.0.1:8765
+PYTHONPATH=/path/to/GDD python3 -m gdd.ui --root .   # 打开 http://127.0.0.1:8765（默认鉴权模式，需登录）
 ```
 
 本地 Web 控制台：模板管理（内置 delivery + 自定义 YAML/JSON）、从模板启动任务、
@@ -51,7 +51,7 @@ PYTHONPATH=/path/to/GDD python3 -m gdd.ui --root .   # 打开 http://127.0.0.1:8
 `entry`/`exit` 门禁），节点 `id` 只读，`mcp`/`skills` 与节点增删/重排走「源码」视图。源码视图保留原文
 查看/编辑；YAML 模板仅源码模式。内置模板（delivery）保持内置只读、不可删除，可 fork 为新模板后编辑；
 模板管理区提供「＋ 新建模板」（默认含一个节点，创建后即可用于新建任务）。
-仅监听 127.0.0.1；详见 USER_GUIDE.md 第 10 章。
+控制台**默认鉴权模式**：首次启动自动初始化默认账号 `admin` / `gdd2026`，打开页面先看到登录页，登录后才能进入控制台；未登录访问存量全部 HTTP API 与 SSE 一律 401。桌面 app 与本地测试用 `--local` 或 `GDD_UI_LOCAL=1` 显式启用免登录的**本地模式**；本地模式仅回环、仅供桌面/本地使用，不得对外暴露。两种模式都只监听 `127.0.0.1`。详见下文「控制台登录鉴权与运行模式」与 USER_GUIDE.md 第 10 章。
 
 ### Mac app（Tauri 2 壳，`src-tauri/`）
 
@@ -96,8 +96,10 @@ cargo tauri build --bundles app
 
 行为与边界：
 
-- 启动时只读探测 `GET /api/overview`：已有 GDD 控制台则直接复用（不产生第二个进程）；
-  8765 无监听才用 `<python> -m gdd.ui --root <workbench> --port 8765 --no-open` 拉起。
+- 桌面 app 只支持本地运行、不实现登录，拉起控制台时始终追加 `--local`（本地模式，免登录，仅回环）。
+- 启动时只读探测 `GET /api/overview`：已有**本地模式** GDD 控制台则直接复用（不产生第二个进程）；
+  8765 无监听才用 `<python> -m gdd.ui --root <workbench> --port 8765 --no-open --local` 拉起。
+- 若 8765 上是**鉴权模式**控制台（需要登录），探针收到 401：app 明确提示「控制台需要登录（鉴权模式）……桌面 app 仅支持本地模式」并停止，不报端口被非 GDD 服务占用，也不启动第二个控制台。
 - 只支持默认端口 8765；8765 被非 GDD 服务占用时报错，不退让到其他端口。
 - 关闭窗口只隐藏，app 继续运行；点 Dock 重新打开会重新探测并显示窗口。
   退出 app（Cmd+Q）不会终止控制台；下次启动通过 8765 复用。
@@ -112,6 +114,43 @@ cargo tauri build --bundles app
 `GDD_CONSOLE_TEST_HEADLESS`、`GDD_CONSOLE_TEST_NO_DIALOG`、`GDD_CONSOLE_TEST_PORT`、
 `GDD_CONSOLE_TEST_EXIT_AFTER_READY`、`GDD_CONSOLE_TEST_DUMP_PAGE`、
 `GDD_CONSOLE_TEST_CLOSE_AFTER_READY`。
+
+## 控制台登录鉴权与运行模式
+
+控制台（`python -m gdd.ui`）有两种**显式**运行模式，不按 `Host`、端口或来源 IP 自动判定：
+
+| 模式 | 启用方式 | 行为 | 适用 |
+|---|---|---|---|
+| 鉴权模式（默认） | 不传任何开关 | 存量全部 HTTP API 与 SSE 要求登录；未登录 `GET /` 返回登录页，其余请求 401；登录/登出为 `POST /api/login`、`POST /api/logout` | 云端/对外部署 |
+| 本地模式 | `--local` 或 `GDD_UI_LOCAL=1`（也接受 true/yes/on） | 免登录，保持原有控制台与 API 行为；登录/登出接口返回「本地模式无需登录」 | 桌面 app、本地测试/验收 |
+
+- 两种模式都只监听 `127.0.0.1`（当前没有非回环监听参数）。**本地模式仅供桌面/本地使用，不得对外暴露**，不得用于云端、反向代理后端或任何对外部署。
+- **默认账号**：鉴权模式首次启动且凭据文件不存在时，自动初始化 `admin` / `gdd2026`。默认口令是公开弱口令，部署方需自行评估风险；本次不提供修改密码/强制改密/找回密码。
+- **凭据存储**：默认 `~/.gdd/console-auth.json`（目录 0700、文件 0600、原子写入），`GDD_CONSOLE_AUTH` 可覆盖完整路径。密码只以 PBKDF2-HMAC-SHA256 加盐哈希（16 字节随机盐、600,000 次迭代）保存，不存明文；凭据文件不进入 git，不出现在页面、登录响应、错误响应或运行日志中。启动时凭据文件损坏/不可读，控制台以非 0 退出并给出可处置错误，不会静默退回无鉴权模式。
+- **登录与会话**：`POST /api/login`（JSON `username`/`password`）成功后写入 `gdd_session` Cookie（`HttpOnly`、`SameSite=Lax`、`Path=/`）；同源 `fetch` 与 `EventSource` SSE 均携带该会话。会话保存在服务端进程内存，默认 8 小时绝对过期（`GDD_UI_SESSION_TTL` 秒可覆盖）；**服务重启后所有会话失效，需要重新登录**。退出登录撤销当前会话并清 Cookie。
+- **未登录行为**：受保护 API（含 SSE）返回 401 `{"ok": false, "error": "未登录或登录已失效"}`，不执行业务逻辑、不推送任何事件；页面请求返回登录页。登录失败一律返回通用 401「用户名或密码错误」，不区分用户不存在与密码错误。
+- **HTTPS**：`GDD_UI_SECURE_COOKIE=1` 时会话 Cookie 追加 `Secure`；本地直连 HTTP 不要开启。
+
+### 云端部署前置
+
+- 云端**必须使用鉴权模式**（默认启动即鉴权），并由外部反向代理/负载均衡终止 TLS；本控制台不管理 TLS 证书，也不内置反向代理。
+- 云端域名必须加入 `GDD_UI_EXTRA_HOSTS`（逗号分隔）。现有 Host 白名单默认只接受 `127.0.0.1`/`localhost`，未加入的域名会被 403 拒绝。
+- 反向代理需把 `Host` 原样传回，并转发 Cookie/SSE（不要缓冲事件流）；HTTPS 部署设置 `GDD_UI_SECURE_COOKIE=1`。
+- 会话是单进程内存态，多副本/多实例会话共享不在本次范围；容器化部署需持久化凭据（挂载 `~/.gdd` 或设置 `GDD_CONSOLE_AUTH` 指向持久卷），否则每次启动都会重新初始化默认账号。
+
+### 控制台鉴权相关环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `GDD_UI_LOCAL` | - | 设为 `1`（或 true/yes/on）启用本地模式（免登录，仅回环）；不设置即鉴权模式。不按 Host/端口自动判定 |
+| `GDD_CONSOLE_AUTH` | `~/.gdd/console-auth.json` | 凭据文件完整路径覆盖（测试/容器/多环境） |
+| `GDD_UI_SESSION_TTL` | 28800 | 登录会话有效期（秒，绝对过期）；服务重启后会话全部失效 |
+| `GDD_UI_SECURE_COOKIE` | - | 设为 `1` 时会话 Cookie 追加 `Secure`（HTTPS/反向代理部署） |
+| `GDD_UI_EXTRA_HOSTS` | - | 额外允许的 Host（逗号分隔）；云端域名必须加入，否则 403 |
+
+### 本次不包含
+
+多用户/RBAC、强制改密/修改密码/找回密码、登录审计/失败锁定/限流/验证码、TLS 证书管理、域名与反向代理配置、多实例/会话共享、CLI 与 pi 执行端鉴权、外部调用方迁移适配。这些需要时另立需求，见 USER_GUIDE.md 第 10 章。
 
 ## 自定义编排（pipeline JSON）
 
@@ -267,6 +306,7 @@ gdd/
   models.py        # Pipeline/Node/Gate/Approval/Subject 数据模型（零依赖 JSON）
   runner.py        # pi 执行端适配器（JSONL 事件、会话续跑、turn 预算、隔离 agent 目录）
   pi_settings.py   # 设置页持久化（端点/API key/模型，脱敏与 0600）
+  console_auth.py  # 控制台登录凭据（PBKDF2 加盐哈希、0600/0700）与进程内会话
   acceptance.py    # acceptance.feature 的 Scenario 与 @task 关联解析/校验
   taskgraph.py     # 任务依赖附录解析、就绪任务与下游闭包
   node_ext.py      # 节点 MCP/skill 暂存：pi 用 mcp.json 与 --skill，claude 用 --mcp-config 与临时插件
@@ -277,7 +317,7 @@ gdd/
   stream_ui.py     # tty 流式呈现（clarify 全文 / subject 工具+截断文本）
   templates/      # 内置 pipeline 模板（delivery.json——唯一权威源，可复制修改自用）
   cli.py           # gdd init/run/status/chat/approve/retry/abort/reset
-  ui.py            # 本地图形控制台（127.0.0.1 HTTP + 内嵌页面）
+  ui.py            # 本地图形控制台（默认鉴权模式 / --local 本地模式，127.0.0.1 HTTP + 内嵌页面）
 src-tauri/         # macOS 桌面壳（Tauri 2 + 系统 WKWebView，加载 127.0.0.1:8765）
   src/config.rs    # 配置模型/校验/首启生成（0600）
   src/http_probe.rs# 只读 GET /api/overview 识别控制台
@@ -309,4 +349,4 @@ assets/            # app 图标源文件（icons 由 cargo tauri icon 生成）
 - **日志序号独立递增**（`log_seq`），不受 history 裁剪影响；`.gdd/lock` 文件不入库。
 - **init 时固化基线**：init 前已存在的未提交内容提交为 `gdd(init): baseline`，避免被首个节点 exit 提交扫入。
 - 状态文件原子写入（tmp + rename），进程中断不会损坏 state.json。
-- 审批有三种形态：CLI 交互 / CLI 异步（gdd approve）/ Web 控制台一键批准驳回（`gdd.ui`，仅 127.0.0.1）。
+- 审批有三种形态：CLI 交互 / CLI 异步（gdd approve）/ Web 控制台一键批准驳回（`gdd.ui`，仅 127.0.0.1；默认需登录，桌面 app 走本地模式）。

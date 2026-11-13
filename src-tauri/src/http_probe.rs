@@ -15,6 +15,8 @@ const MAX_RESPONSE: usize = 1 << 20;
 pub enum ProbeOutcome {
     /// 200 且响应为 GDD 控制台的 `/api/overview` 形状。
     Gdd,
+    /// 401：GDD 控制台处于鉴权模式，需要登录（桌面 app 只支持本地模式）。
+    AuthRequired,
     /// 端口无监听（连接被拒绝）。
     NoListener,
     /// 端口有响应但不是可识别的 GDD 控制台。
@@ -77,6 +79,11 @@ fn classify(raw: &[u8]) -> ProbeOutcome {
         Ok(parts) => parts,
         Err(detail) => return ProbeOutcome::NonGdd(detail),
     };
+    // 鉴权模式控制台的未登录响应是 401；这与「端口被其他服务占用」是两回事，
+    // 桌面壳据此提示需要登录，而不是报 NonGdd/PortOccupied。
+    if status == 401 {
+        return ProbeOutcome::AuthRequired;
+    }
     if status != 200 {
         return ProbeOutcome::NonGdd(format!("HTTP 状态码 {status}"));
     }
@@ -166,6 +173,20 @@ mod tests {
     }
 
     #[test]
+    fn classifies_401_as_auth_required() {
+        // 鉴权模式控制台未登录时的真实响应形状。
+        let raw = response(
+            "401 Unauthorized",
+            r#"{"ok": false, "error": "未登录或登录已失效"}"#,
+        );
+        assert_eq!(classify(&raw), ProbeOutcome::AuthRequired);
+
+        // 401 不依赖响应体形状：关键信息在状态码。
+        let raw = response("401 Unauthorized", "");
+        assert_eq!(classify(&raw), ProbeOutcome::AuthRequired);
+    }
+
+    #[test]
     fn rejects_non_gdd_json() {
         let raw = response("200 OK", r#"{"ok": true}"#);
         assert!(matches!(classify(&raw), ProbeOutcome::NonGdd(_)));
@@ -183,6 +204,10 @@ mod tests {
             "500 Internal Server Error",
             r#"{"ok": true, "templates": [], "tasks": []}"#,
         );
+        assert!(matches!(classify(&raw), ProbeOutcome::NonGdd(_)));
+
+        // 其他非 200（例如 Host 校验的 403）仍不是「需要登录」。
+        let raw = response("403 Forbidden", r#"{"ok": false, "error": "forbidden"}"#);
         assert!(matches!(classify(&raw), ProbeOutcome::NonGdd(_)));
 
         let raw = response("200 OK", "not json");

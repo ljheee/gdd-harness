@@ -1,7 +1,8 @@
 //! 控制台探测、复用与拉起。
 //!
-//! 启动前只做只读探测：已是 GDD 控制台则复用；端口无监听才拉起；
-//! 端口被其他服务占用则报错且绝不启动第二个实例。
+//! 启动前只做只读探测：已是本地模式 GDD 控制台则复用；端口无监听才拉起；
+//! 端口被其他服务占用则报错且绝不启动第二个实例。若端口上是鉴权模式控制台
+//! （探测返回 401），返回明确的「需要登录」错误，同样不启动第二个实例。
 
 use crate::config::{RuntimePaths, ValidatedConfig};
 use crate::console::{self, SpawnedConsole};
@@ -25,6 +26,8 @@ pub struct ConsoleHandle {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SupervisorError {
+    #[error("127.0.0.1:{port} 上的 GDD 控制台需要登录（鉴权模式）。桌面 app 仅支持本地模式，不会复用也不会启动第二个控制台；请停止该控制台后重试，或以 --local 启动本地模式控制台")]
+    ConsoleAuthRequired { port: u16 },
     #[error("127.0.0.1:{port} 已被非 GDD 服务占用（{detail}）。为避免启动第二个控制台，已停止；请先停止该服务或确认其为 GDD 控制台")]
     PortOccupied { port: u16, detail: String },
     #[error("无法确认 127.0.0.1:{port} 的端口状态：{detail}。为避免误启第二个控制台，已停止；请检查端口占用情况")]
@@ -70,6 +73,10 @@ pub fn ensure_console(
                 log_path: paths.console_log(),
             });
         }
+        ProbeOutcome::AuthRequired => {
+            log::event(format!("event=probe port={port} result=auth_required"));
+            return Err(SupervisorError::ConsoleAuthRequired { port });
+        }
         ProbeOutcome::NoListener => {}
         ProbeOutcome::NonGdd(detail) => {
             log::event(format!(
@@ -104,16 +111,26 @@ pub fn ensure_console(
         match child.try_wait() {
             Ok(Some(status)) => {
                 // 子进程提前退出：再探测一次，处理“并发启动竞态”。
-                if let ProbeOutcome::Gdd = http_probe::probe(port, PROBE_TIMEOUT) {
-                    log::event(format!(
-                        "event=probe port={port} result=reuse_after_child_exit"
-                    ));
-                    return Ok(ConsoleHandle {
-                        url: url_for(port),
-                        started: false,
-                        pid: None,
-                        log_path,
-                    });
+                match http_probe::probe(port, PROBE_TIMEOUT) {
+                    ProbeOutcome::Gdd => {
+                        log::event(format!(
+                            "event=probe port={port} result=reuse_after_child_exit"
+                        ));
+                        return Ok(ConsoleHandle {
+                            url: url_for(port),
+                            started: false,
+                            pid: None,
+                            log_path,
+                        });
+                    }
+                    ProbeOutcome::AuthRequired => {
+                        // 竞态期间端口上出现了鉴权模式控制台（本进程拉起的子进程已退出）。
+                        log::event(format!(
+                            "event=probe port={port} result=auth_required_after_child_exit pid={pid}"
+                        ));
+                        return Err(SupervisorError::ConsoleAuthRequired { port });
+                    }
+                    _ => {}
                 }
                 let detail = format!("退出状态 {status}");
                 log::event(format!(
@@ -151,6 +168,17 @@ pub fn ensure_console(
                     pid: Some(pid),
                     log_path,
                 });
+            }
+            ProbeOutcome::AuthRequired => {
+                // 桌面壳始终以 --local 拉起；本次拉起的控制台若需要登录，说明配置
+                // 或环境异常，终止本次拉起的子进程并给出明确错误。
+                let _ = child.kill();
+                let _ = child.wait();
+                log::event(format!(
+                    "event=console_auth_required pid={pid} port={port} log={}",
+                    log_path.display()
+                ));
+                return Err(SupervisorError::ConsoleAuthRequired { port });
             }
             ProbeOutcome::NoListener => {
                 last_detail = String::from("端口尚无监听");

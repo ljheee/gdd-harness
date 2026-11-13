@@ -67,6 +67,8 @@ class MockEndpoint(BaseHTTPRequestHandler):
 
 
 def start_ui(workdir):
+    # 控制台默认是鉴权模式；本测试直连 HTTP、不实现登录，显式启用本地模式（免登录）。
+    ui.Handler.local_mode = True
     ui.Handler.root = workdir
     srv = ThreadingHTTPServer(("127.0.0.1", 0), ui.Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()

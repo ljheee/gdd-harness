@@ -15,7 +15,10 @@
   4. run 在后台线程执行。页面 2s 轮询状态；运行进度用 SSE 滚动显示
      （澄清全文、主体的工具行和助手文本、门禁只显示阶段行）。
 
-安全：仅监听 127.0.0.1；任务名/模板名白名单校验，禁止路径穿越。
+安全：仅监听 127.0.0.1。默认**鉴权模式**：存量全部 API 与 SSE 均要求登录，
+未登录只提供登录页；`--local` 或 `GDD_UI_LOCAL=1` 显式启用免登录的本地模式
+（仅回环，供桌面 app 与本地测试；不按 Host/端口自动判定）。任务名/模板名
+白名单校验，禁止路径穿越。
 """
 from __future__ import annotations
 
@@ -23,6 +26,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import threading
 import time
 import webbrowser
@@ -36,12 +40,17 @@ from .models import PipelineSpec
 from .orchestrator import Orchestrator
 from . import nodestats
 from . import pi_settings
+from .console_auth import ConsoleAuth, ConsoleAuthError, SessionStore
 
 # 任务创建串行化：ThreadingHTTPServer 并发处理双击/双 tab 的同名创建请求时，
 # 两个请求都过存在性检查后才建目录，败者的失败清理会删掉胜者初始化好的任务
 _create_lock = threading.Lock()
 
 BUILTINS = {"delivery": DELIVERY_PIPELINE}
+
+SESSION_COOKIE = "gdd_session"
+LOGIN_USERNAME_MAX = 128
+LOGIN_PASSWORD_MAX = 1024
 
 _NAME_RE = re.compile(
     r"^[A-Za-z0-9_\u4e00-\u9fff][A-Za-z0-9_\-\u4e00-\u9fff]{0,63}$")
@@ -733,17 +742,25 @@ pre{white-space:pre-wrap;font:12px/1.5 ui-monospace,Menlo,monospace;color:#c9d3e
   <div class="sec"><div class="t">执行端</div>
     <button class="item" id="navSettings" onclick="showSettings()">⚙ 设置</button>
   </div>
+  <div class="sec"><div class="t">账号</div>
+    <button class="item" id="navLogout" data-action="logout" onclick="logout()">⎋ 退出登录</button>
+  </div>
 </aside>
 <main id="main"><div class="empty">加载中…</div></main>
 <script>
 const $=s=>document.querySelector(s);
 let view={mode:'home'}, pollTimer=null, lastDetail=null;
 let liveTask='', liveEs=null, liveEvents=[], liveStick=true, liveScrollTop=0;
+let authRedirecting=false;  // 401 只跳转一次，避免轮询/SSE 并发请求重复写 location
 
 async function api(path,opts){
   opts=opts||{};
   opts.headers=Object.assign({'Content-Type':'application/json','X-GDD-Request':'1'},opts.headers||{});
   const r=await fetch(path,opts);
+  if(r.status===401){  // 会话失效：回登录页（登录页自身不用 api()，不会循环）
+    if(!authRedirecting){authRedirecting=true;stopPoll();location.href='/';}
+    return {ok:false,error:'未登录或登录已失效'};
+  }
   const j=await r.json().catch(()=>({ok:false,error:r.statusText}));
   if(!r.ok&&!j.error)j.error='HTTP '+r.status; return j;}
 
@@ -806,6 +823,23 @@ function bindLive(name){
     liveEvents.push(ev);
     paintLive(false);
   };
+  es.onerror=()=>{
+    if(liveEs!==es)return;
+    // EventSource 不暴露 HTTP 状态：探测一次区分「会话失效」与「网络抖动」。
+    // 401 → 关闭连接并回登录页；其余情况交给 EventSource 自动重连，
+    // 任务轮询仍由 api() 的 401 兜底。
+    fetch('api/overview',{credentials:'same-origin',headers:{'X-GDD-Request':'1'}})
+      .then(r=>{
+        if(r.status!==401)return;
+        if(liveEs===es){es.close();liveEs=null;liveTask='';liveEvents=[];}
+        if(!authRedirecting){authRedirecting=true;stopPoll();location.href='/';}
+      }).catch(()=>{});
+  };
+}
+async function logout(){
+  // 退出入口：无论请求成功与否都回登录页；成功后 Cookie 已被服务端清除。
+  try{await api('api/logout',{method:'POST'});}catch(e){}
+  location.href='/';
 }
 function onLiveScroll(){
   const box=document.getElementById('liveLog');
@@ -1637,15 +1671,175 @@ refreshNav();showNew();setInterval(refreshNav,5000);
 </script></body></html>"""
 
 
+LOGIN_HTML = r"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GDD 控制台登录</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+     background:#0f172a;color:#e2e8f0;
+     font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif}
+.login{width:min(360px,92vw);background:#1e293b;border:1px solid #334155;border-radius:12px;
+       padding:28px 26px;box-shadow:0 16px 48px rgba(0,0,0,.35)}
+h1{margin:0 0 18px;font-size:18px;font-weight:600;letter-spacing:.5px}
+label{display:block;margin:12px 0 4px;color:#94a3b8;font-size:13px}
+input{width:100%;padding:9px 11px;border-radius:8px;border:1px solid #475569;background:#0f172a;
+      color:#e2e8f0;font-size:14px;outline:none}
+input:focus{border-color:#38bdf8}
+button{width:100%;margin-top:18px;padding:10px;border:0;border-radius:8px;background:#0284c7;
+       color:#fff;font-size:15px;cursor:pointer}
+button:disabled{opacity:.6;cursor:not-allowed}
+#msg{min-height:20px;margin:12px 0 0;color:#f87171;font-size:13px}
+</style></head>
+<body>
+<main class="login">
+<h1>GDD 控制台</h1>
+<form id="loginForm">
+  <label for="username">用户名</label>
+  <input id="username" name="username" autocomplete="username" autocapitalize="off" required>
+  <label for="password">密码</label>
+  <input id="password" name="password" type="password" autocomplete="current-password" required>
+  <button id="submit" type="submit">登录</button>
+  <p id="msg" role="alert"></p>
+</form>
+</main>
+<script>
+(function(){
+  var form=document.getElementById('loginForm');
+  var msg=document.getElementById('msg');
+  var btn=document.getElementById('submit');
+  form.addEventListener('submit',function(ev){
+    ev.preventDefault();
+    var username=document.getElementById('username').value;
+    var password=document.getElementById('password').value;
+    msg.textContent='';
+    btn.disabled=true;
+    fetch('/api/login',{
+      method:'POST',
+      credentials:'same-origin',
+      headers:{'Content-Type':'application/json','X-GDD-Request':'1'},
+      body:JSON.stringify({username:username,password:password})
+    }).then(function(resp){
+      return resp.json().catch(function(){return {};}).then(function(data){
+        if(resp.ok&&data&&data.ok){location.href='/';return;}
+        msg.textContent=(data&&data.error)||'登录失败';
+      });
+    }).catch(function(){
+      msg.textContent='网络错误，请重试';
+    }).then(function(){btn.disabled=false;});
+  });
+})();
+</script>
+</body></html>"""
+
+
 # ---------------------------------------------------------------- HTTP
 
 class Handler(BaseHTTPRequestHandler):
     root = "."
     quiet = True
+    # 运行模式与鉴权对象由 main()（或测试）在启动服务前注入；类属性即进程级配置。
+    local_mode = False   # True：本地模式（免登录，仅回环；桌面 app / 本地测试）
+    auth = None          # ConsoleAuth：鉴权模式启动时注入
+    sessions = None      # SessionStore：鉴权模式启动时注入
 
     def log_message(self, fmt, *args):
         if not self.quiet:
             super().log_message(fmt, *args)
+
+    # ---- 鉴权
+    def _cookie_token(self) -> str:
+        """从 Cookie 头取会话 token；无则空串。"""
+        raw = self.headers.get("Cookie") or ""
+        for part in raw.split(";"):
+            name, sep, value = part.strip().partition("=")
+            if sep and name == SESSION_COOKIE:
+                return value.strip()
+        return ""
+
+    def _is_authenticated(self) -> bool:
+        """本地模式恒通过；鉴权模式校验 Cookie 会话。sessions 未注入时 fail-closed。"""
+        if self.local_mode:
+            return True
+        sessions = self.sessions
+        return bool(sessions is not None and sessions.valid(self._cookie_token()))
+
+    def _unauthorized(self) -> None:
+        self._json({"ok": False, "error": "未登录或登录已失效"}, 401)
+
+    def _set_session_cookie(self, token: str) -> str:
+        """登录成功的 Set-Cookie 头值：HttpOnly + SameSite=Lax，HTTPS 部署可加 Secure。"""
+        ttl = self.sessions.ttl if self.sessions is not None else 0
+        return self._cookie_header(token, ttl)
+
+    def _clear_session_cookie(self) -> str:
+        """退出登录的 Set-Cookie 头值：立即过期。"""
+        return self._cookie_header("", 0)
+
+    def _cookie_header(self, token: str, max_age: int) -> str:
+        parts = [f"{SESSION_COOKIE}={token}", "Path=/", "HttpOnly", "SameSite=Lax",
+                 f"Max-Age={max_age}"]
+        if (os.environ.get("GDD_UI_SECURE_COOKIE") or "").strip() == "1":
+            parts.append("Secure")
+        return "; ".join(parts)
+
+    def _send_login_page(self) -> None:
+        body = LOGIN_HTML.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _do_login(self) -> None:
+        """POST /api/login：校验用户名/密码，成功建立会话并 Set-Cookie。"""
+        no_store = ("Cache-Control", "no-store")
+        try:
+            body = self._body()
+        except (ValueError, OSError):
+            return self._json({"ok": False, "error": "用户名或密码错误"}, 401,
+                              headers=[no_store])
+        if self.local_mode:
+            return self._json({"ok": True, "localMode": True, "message": "本地模式无需登录"},
+                              headers=[no_store])
+        username = body.get("username")
+        password = body.get("password")
+        # 格式/长度非法与凭据错误使用同一个通用响应，不区分「用户不存在」与「密码错误」。
+        if (not isinstance(username, str) or not isinstance(password, str)
+                or not username or not password
+                or len(username) > LOGIN_USERNAME_MAX
+                or len(password) > LOGIN_PASSWORD_MAX):
+            return self._json({"ok": False, "error": "用户名或密码错误"}, 401,
+                              headers=[no_store])
+        auth = self.auth
+        sessions = self.sessions
+        if auth is None or sessions is None:
+            return self._json({"ok": False, "error": "鉴权配置不可用"}, 500,
+                              headers=[no_store])
+        try:
+            ok = auth.verify(username, password)
+        except ConsoleAuthError as e:
+            return self._json({"ok": False, "error": f"鉴权配置不可用：{e}"}, 500,
+                              headers=[no_store])
+        if not ok:
+            return self._json({"ok": False, "error": "用户名或密码错误"}, 401,
+                              headers=[no_store])
+        token = sessions.create(username)
+        return self._json({"ok": True}, headers=[
+            ("Set-Cookie", self._set_session_cookie(token)), no_store])
+
+    def _do_logout(self) -> None:
+        """POST /api/logout：撤销当前会话并清 Cookie（未登录时幂等返回 ok）。"""
+        no_store = ("Cache-Control", "no-store")
+        if self.local_mode:
+            return self._json({"ok": True, "localMode": True, "message": "本地模式无需登录"},
+                              headers=[no_store])
+        if self.sessions is not None:
+            self.sessions.revoke(self._cookie_token())
+        return self._json({"ok": True}, headers=[
+            ("Set-Cookie", self._clear_session_cookie()), no_store])
 
     def _stream_live(self, name: str) -> None:
         """SSE：先推环形缓冲里已有的事件，再等新事件。断开时结束。"""
@@ -1674,11 +1868,13 @@ class Handler(BaseHTTPRequestHandler):
             return
 
     # ---- helpers
-    def _json(self, obj, code=200):
+    def _json(self, obj, code=200, headers=None):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (headers or ()):
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -1732,6 +1928,12 @@ class Handler(BaseHTTPRequestHandler):
         host = (self.headers.get("Host") or "").split(":")[0]
         if host not in self._allowed_hosts():
             return self._json({"ok": False, "error": "拒绝：Host 非法"}, 403)
+        p = urlparse(self.path).path
+        if not self._is_authenticated():
+            # 登录页可匿名访问；其余 GET（含 SSE）在进入业务处理前统一拒绝。
+            if p in ("/", "/index.html"):
+                return self._send_login_page()
+            return self._unauthorized()
         try:
             self._route_get()
         except Exception as e:  # 兑底：绝不让请求无响应（前端轮询静默失败）
@@ -1797,6 +1999,13 @@ class Handler(BaseHTTPRequestHandler):
         p = urlparse(self.path).path
         if not self._guard_mutating():
             return self._json({"ok": False, "error": "拒绝：缺少同源校验头（X-GDD-Request）或 Host 非法"}, 403)
+        # 登录/登出属于鉴权自身接口：不要求已有会话，但仍受同源/CSRF 守卫保护。
+        if p == "/api/login":
+            return self._do_login()
+        if p == "/api/logout":
+            return self._do_logout()
+        if not self._is_authenticated():
+            return self._unauthorized()
         try:
             body = self._body()
         except (ValueError, OSError) as e:
@@ -1895,6 +2104,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_PUT(self):
         if not self._guard_mutating():
             return self._json({"ok": False, "error": "拒绝：缺少同源校验头（X-GDD-Request）或 Host 非法"}, 403)
+        if not self._is_authenticated():
+            return self._unauthorized()
         try:
             return self._do_put()
         except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, ImportError, json.JSONDecodeError) as e:
@@ -1969,6 +2180,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         if not self._guard_mutating():
             return self._json({"ok": False, "error": "拒绝：缺少同源校验头（X-GDD-Request）或 Host 非法"}, 403)
+        if not self._is_authenticated():
+            return self._unauthorized()
         p = urlparse(self.path).path
         m = re.match(r"^/api/template/([^/]+)$", p)
         if not m:
@@ -1985,6 +2198,14 @@ class Handler(BaseHTTPRequestHandler):
         return self._json({"ok": False, "error": "模板不存在"}, 404)
 
 
+def _local_mode_requested(cli_flag: bool) -> bool:
+    """本地模式必须显式启用：--local 或 GDD_UI_LOCAL=1；不按 Host/端口自动判定。"""
+    if cli_flag:
+        return True
+    raw = (os.environ.get("GDD_UI_LOCAL") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser(prog="gdd-ui", description="GDD 本地控制台")
@@ -1992,23 +2213,43 @@ def main():
     ap.add_argument("--repos", default="", help="代码仓库目录，默认与工作台相同")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--no-open", action="store_true", help="不自动打开浏览器")
+    ap.add_argument("--local", action="store_true",
+                    help="本地模式：免登录，仅限回环地址（桌面 app/本地测试）；默认鉴权模式")
     args = ap.parse_args()
 
     root = os.path.abspath(args.root)
     os.makedirs(root, exist_ok=True)
     Handler.root = root
     Handler.repos = os.path.abspath(args.repos) if args.repos else root
+    Handler.local_mode = _local_mode_requested(args.local)
+    if Handler.local_mode:
+        Handler.auth = None
+        Handler.sessions = None
+    else:
+        # 鉴权模式：凭据文件不存在则初始化默认账号；失败给出可处置错误并拒绝启动，
+        # 绝不静默退回无鉴权模式。
+        try:
+            auth = ConsoleAuth()
+            auth.ensure_initialized()
+            sessions = SessionStore()
+        except ConsoleAuthError as e:
+            print(f"GDD 控制台无法以鉴权模式启动：{e}", file=sys.stderr)
+            return 1
+        Handler.auth = auth
+        Handler.sessions = sessions
 
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     url = f"http://127.0.0.1:{args.port}/"
-    print(f"GDD 控制台: {url}（工作台目录 {root}）")
+    mode = "本地模式（免登录，仅回环）" if Handler.local_mode else "鉴权模式（需要登录）"
+    print(f"GDD 控制台: {url}（工作台目录 {root}；{mode}）")
     if not args.no_open:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\nbye")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

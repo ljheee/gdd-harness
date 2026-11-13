@@ -25,6 +25,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -362,6 +363,13 @@ def check_8765_reuse(bundle: Path, python: str) -> int:
             overview = json.load(response)
         if overview.get("ok") is not True:
             raise RuntimeError("8765 响应不是 GDD 控制台")
+    except HTTPError as exc:
+        if exc.code == 401:
+            # 控制台默认是鉴权模式；桌面壳复用只适用于本地模式，鉴权模式需登录、不适用。
+            print("SKIP: 8765 是鉴权模式控制台（需要登录），本地复用检查不适用")
+            return 0
+        print(f"SKIP: 8765 当前没有 GDD 控制台（{exc}）")
+        return 0
     except Exception as exc:  # noqa: BLE001
         print(f"SKIP: 8765 当前没有 GDD 控制台（{exc}）")
         return 0
@@ -601,6 +609,7 @@ def main() -> int:
             "--port",
             str(port),
             "--no-open",
+            "--local",
         ],
         cwd=str(workbench),
         env=env,

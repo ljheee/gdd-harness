@@ -676,6 +676,8 @@ def main():
 
     workdir = tempfile.mkdtemp(prefix="gdd-tpl-api-")
     configure_stub_env(workdir)
+    # 控制台默认是鉴权模式；本测试直连 HTTP、不实现登录，显式启用本地模式（免登录）。
+    gdd_ui.Handler.local_mode = True
     gdd_ui.Handler.root = workdir
     srv = gdd_ui.ThreadingHTTPServer(("127.0.0.1", 0), gdd_ui.Handler)
     port = srv.server_address[1]
